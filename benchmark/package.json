@@ -1,0 +1,25 @@
+{
+  "name": "benchmark",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "Ivan Kotlaja",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "benchmark": "^2.1.4",
+    "create-cert": "^1.0.6",
+    "got": "^14.4.1",
+    "node-fetch": "^3.3.2",
+    "request": "^2.88.2"
+  },
+  "devDependencies": {
+    "@types/benchmark": "^2.1.5",
+    "@types/request": "^2.48.12"
+  }
+}
