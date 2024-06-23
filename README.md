@@ -3,22 +3,28 @@
 Barebones [got](https://github.com/sindresorhus/got)-like [undici](https://github.com/nodejs/undici)-based not-as-safe
 commonjs-compatible http client for node.js.
 
-Includes a nock-like mocking system (since nock doesn't work with undici).
+Includes a basic nock-like mocking system (since nock doesn't work with undici).
 
-The idea is to be able to replace got and nock with gotlike in most cases, while being faster.
+The idea is to be able to replace got and nock with gotlike in most cases, while being more performant.
 At the moment only the features I use are implemented.
 
 Supports:
 - [x] Extendable client
 - [x] Handlers
 - [x] Hooks (single function per hook)
-- [ ] DNS Cache
-- [ ] Retries
+- [x] Retries (partial support - uses undici's RetryAgent)
 - [x] Streams *(no progress or timings)*
 - [x] Timings *(only total request)*
-- [ ] Response body in error
+- [x] Response body in json parse error
+- [x] Nock-like mocking
+- [x] DNS Cache
+- [x] HTTP2
+- [x] Pipelining
 - [ ] Options validation
-- [ ] Nock-like mocking
+
+## Differences
+
+- `retry`, `http2`, `pipelining`, `dnsCache`, `dnsLookup` and `agent` can be set only on instance create/extend
 
 ## Benchmark
 
@@ -32,4 +38,29 @@ native fetch - promise x 16,702 ops/sec ±2.53% (81 runs sampled)
 gotlike - promise x 23,230 ops/sec ±0.66% (85 runs sampled)
 
 Fastest is gotlike - promise
+```
+
+## Usage
+
+```ts
+import { Gotlike } from 'gotlike'
+
+// these work as well
+// const {gotlike} = require('gotlike')
+// const {got} = require('gotlike')
+// import got from 'gotlike'
+// import {Got} from 'gotlike'
+// import {gotlike} from 'gotlike'
+
+const gotlike = new Gotlike({ // or gotlike.extend({ ... })
+  prefixUrl: 'https://example.com/api/v1',
+  headers: {
+    'authorization': 'Basic test:test',
+  },
+  responseType: 'json',
+})
+
+const response = await gotlike.get('/test')
+
+console.log(response.body)
 ```

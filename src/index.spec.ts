@@ -3,7 +3,15 @@ import assert from 'node:assert';
 import http from 'node:http';
 import {clearInterval} from 'node:timers';
 import {Duplex} from 'node:stream';
+import {randomUUID} from 'node:crypto';
+import nock from './nock';
 import client from './index';
+
+const serverState: { retryCounts: Record<string, number> } = {
+  retryCounts: {
+    default: 0,
+  }
+};
 
 const server = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
   // req.on('data', (...data) => {
@@ -69,6 +77,21 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  if (req.url === '/retry') {
+    const testId = req.headers['test-id']?.toString() ?? 'default';
+
+    serverState.retryCounts[testId] = serverState.retryCounts[testId] ? serverState.retryCounts[testId] + 1 : 1;
+
+    if (serverState.retryCounts[testId] < 3) {
+      res.statusCode = 429;
+      res.statusMessage = 'Too Many Requests';
+    }
+
+    res.end();
+
+    return;
+  }
+
   res.write('hello\n');
   res.end();
 });
@@ -90,14 +113,22 @@ test('returns valid json when responseType is json', async () => {
   assert.strictEqual(response.body.test, 'value');
 });
 
-test('returns error on parse failure', () => {
-  assert.rejects(async () => {
+test('returns error on parse failure', async () => {
+  await assert.rejects(async () => {
     await client.get('http://localhost:3000/text', {
       responseType: 'json',
     });
   }, {
     code: 'ERR_BODY_PARSE_FAILURE'
   })
+});
+
+test('body is available as string on parse failure', async () => {
+  const err = await client.get('http://localhost:3000/text', {
+    responseType: 'json',
+  }).catch(err => err);
+
+  assert.strictEqual(err.response.body, 'hello\n');
 });
 
 test('throws error on timeout', () => {
@@ -307,4 +338,56 @@ test('readable get stream', async () => {
       resolve();
     });
   });
+});
+
+
+test('retries on 429', async () => {
+  const extClient = client.extend({
+    headers: {
+      'test-id': randomUUID(),
+    },
+    retry: {
+      limit: 3,
+      backoffLimit: 10,
+    }
+  });
+
+  const response = await extClient.get('http://localhost:3000/retry');
+
+  assert.strictEqual(response.statusCode, 200);
+});
+
+test('failed retries return error', async () => {
+  const extClient = client.extend({
+    headers: {
+      'test-id': randomUUID(),
+    },
+    retry: {
+      limit: 1,
+      backoffLimit: 10,
+    }
+  });
+
+  const response = await extClient.get('http://localhost:3000/retry');
+
+  assert.strictEqual(response.statusCode, 429);
+});
+
+test('nock mocks request once', async () => {
+  nock('http://localhost:3000')
+    .get('/json')
+    .reply(201, '{"test": "newvalue"}');
+
+  const response = await client.get<{ test: string }>('http://localhost:3000/json', {
+    responseType: 'json',
+  });
+
+  assert.strictEqual(response.statusCode, 201);
+  assert.strictEqual(response.body.test, 'newvalue');
+
+  const response2 = await client.get<{ test: string }>('http://localhost:3000/json', {
+    responseType: 'json',
+  });
+
+  assert.strictEqual(response2.body.test, 'value');
 });

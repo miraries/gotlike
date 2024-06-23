@@ -2,7 +2,7 @@
 .idea
 .vscode
 .env
-benchmark/node_modules/.package-lock.json
 package-lock.json
+yarn.lock
 dist
 node_modules

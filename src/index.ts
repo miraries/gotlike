@@ -1,14 +1,28 @@
-import undici, {Dispatcher} from 'undici'
+import dns from 'node:dns';
+import undici, {Agent, Dispatcher, getGlobalDispatcher, RetryAgent} from 'undici'
 import {IncomingHttpHeaders} from 'undici/types/header';
+import type BodyReadable from "undici/types/readable";
 import type Errors from 'undici/types/errors';
 
 // @ts-expect-error - no types
-import {BodyTimeoutError, HeadersTimeoutError} from 'undici/lib/core/errors';
+import {BodyTimeoutError, HeadersTimeoutError, RequestRetryError} from 'undici/lib/core/errors';
 
 function hrtimeToMilliseconds(hrtime: [number, number]) {
   const seconds = hrtime[0];
   const nanoseconds = hrtime[1];
-  return seconds * 1000 + nanoseconds / 1e6;
+
+  return seconds * 1000 + nanoseconds / 1_000_000;
+}
+
+type RetryOptions = {
+  limit: number;
+  methods: Dispatcher.HttpMethod[];
+  statusCodes: number[];
+  errorCodes: string[];
+  // calculateDelay: RetryFunction;
+  backoffLimit: number;
+  // noise: number;
+  maxRetryAfter?: number;
 }
 
 export class RequestError extends Error {
@@ -127,10 +141,23 @@ export type RequestOptions<T = unknown> = {
    * @default false
    **/
   resolveBodyOnly?: boolean
+
+  /**
+   * Different from `got`'s `agent` option, single dispatcher is used for all requests
+   */
+  agent?: Agent
+
+  retry?: Partial<RetryOptions>
+
+  http2?: boolean
+
+  pipelining?: number
+
+  dnsLookup?: typeof dns.lookup
 }
 
 export type Response<T = any> = {
-  body: T // todo: make response type tagged unions
+  body: T // todo: make response type tagged union based on responseType
   headers: IncomingHttpHeaders
   url: string | URL
   statusCode: number
@@ -149,11 +176,38 @@ const defaultOptions = {
   method: 'GET',
 } satisfies RequestOptions;
 
+const defaultAgent = getGlobalDispatcher();
+
 export class Gotlike {
   baseOptions?: RequestOptions;
 
+  agent: Dispatcher = defaultAgent;
+
   constructor(options?: RequestOptions) {
     this.baseOptions = options;
+
+    if (options?.agent) {
+      this.agent = options.agent;
+    } else if (options?.retry || options?.http2 || options?.pipelining || options?.dnsLookup) {
+      const agent = new undici.Agent({
+        allowH2: options.http2,
+        pipelining: options.pipelining,
+        connect: options.dnsLookup ? {
+          lookup: options.dnsLookup,
+        } : undefined,
+      });
+
+      if (options.retry) {
+        this.agent = new RetryAgent(agent, {
+          methods: options.retry.methods,
+          statusCodes: options.retry.statusCodes,
+          errorCodes: options.retry.errorCodes,
+          maxRetries: options.retry.limit,
+          maxTimeout: options.retry.backoffLimit,
+          retryAfter: !!options.retry.maxRetryAfter,
+        });
+      }
+    }
   }
 
   handle<T>(options: RequestOptions = {}): Promise<Response<T>> {
@@ -215,6 +269,7 @@ export class Gotlike {
 
       if (options.isStream) {
         const duplex = undici.pipeline(url, {
+          dispatcher: this.agent,
           headers: options.headers,
           body: 'zxc',
           method: options.method,
@@ -223,7 +278,7 @@ export class Gotlike {
           signal: options.signal,
           maxRedirections: options.followRedirect ? 10 : 0,
           throwOnError: false,
-        }, ({ body }) => body);
+        }, ({body}) => body);
 
         if (options.method === 'GET') {
           duplex.end();
@@ -236,6 +291,7 @@ export class Gotlike {
       startTime = process.hrtime();
 
       undiciResponse = await undici.request(url, {
+        dispatcher: this.agent,
         headers: options.headers,
         body,
         method: options.method,
@@ -247,14 +303,25 @@ export class Gotlike {
       });
 
       if (options.responseType === 'json') {
-        responseBody = await undiciResponse.body.json();
+        responseBody = await undiciResponse.body.text();
+        responseBody = JSON.parse(responseBody);
       } else if (options.responseType === 'text') {
         responseBody = await undiciResponse.body.text();
       } else {
         responseBody = await undiciResponse.body.arrayBuffer();
       }
-
     } catch (err) {
+      if (err instanceof RequestRetryError) {
+        undiciResponse = {
+          statusCode: (err as RequestRetryError).statusCode,
+          headers: (err as RequestRetryError).headers,
+          body: undefined as unknown as BodyReadable,
+          trailers: {},
+          opaque: undefined,
+          context: {},
+        };
+      }
+
       // todo: pass all errors to beforeError hook first
       if (this.baseOptions?.hooks?.beforeError) {
         const requestError = new RequestError(
@@ -279,6 +346,10 @@ export class Gotlike {
       }
 
       if (err instanceof SyntaxError && (err as { message?: string })?.message?.endsWith('not valid JSON')) {
+        if (undiciResponse) {
+          undiciResponse.body = responseBody
+        }
+
         throw new RequestError(
           err.message,
           'ERR_BODY_PARSE_FAILURE',
