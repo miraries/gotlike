@@ -1,25 +1,16 @@
 {
-  "name": "benchmark",
+  "name": "gotlike-benchmark",
   "version": "1.0.0",
   "main": "index.js",
   "type": "module",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "bench": "npm --prefix .. run build && node index.ts"
   },
-  "keywords": [],
   "author": "Ivan Kotlaja",
   "license": "ISC",
-  "description": "",
+  "description": "Benchmarks gotlike against got, undici and undici fetch",
   "dependencies": {
-    "axios": "^1.7.2",
-    "benchmark": "^2.1.4",
-    "create-cert": "^1.0.6",
-    "got": "^14.4.1",
-    "node-fetch": "^3.3.2",
-    "request": "^2.88.2"
+    "got": "^14.4.1"
   },
-  "devDependencies": {
-    "@types/benchmark": "^2.1.5",
-    "@types/request": "^2.48.12"
-  }
+  "private": true
 }

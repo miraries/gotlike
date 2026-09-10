@@ -1,5 +1,6 @@
 import {Url} from 'node:url';
 import {MockAgent, setGlobalDispatcher} from 'undici';
+import type {Interceptable, MockInterceptor} from 'undici/types/mock-interceptor';
 
 const mockAgent = new MockAgent();
 
@@ -7,91 +8,401 @@ if (process.env.NOCK_OFF !== 'true') {
   setGlobalDispatcher(mockAgent);
 }
 
-type Options = {
-  reqheaders?: Record<string, string | RegExp | { (fieldValue: string): boolean }>
-}
+/** Pools handed out by `mockAgent.get`, kept so `cleanAll()` can reach them. */
+const pools = new Map<string, Interceptable>();
 
-function nock(basePath: string | RegExp | Url | URL) {
-  let mockPool;
+type HeaderMatcher = string | RegExp | ((fieldValue: string) => boolean);
+type PathMatcher = string | RegExp | ((path: string) => boolean);
+type BodyMatcher = string | RegExp | ((body: string) => boolean);
 
-  if (typeof basePath === 'string') {
-    mockPool = mockAgent.get(basePath)
-  } else if (basePath instanceof RegExp) {
-    mockPool = mockAgent.get(basePath)
-  } else if (basePath instanceof URL) {
-    mockPool = mockAgent.get(basePath.origin)
-  } else {
-    mockPool = mockAgent.get(basePath.protocol + '//' + basePath.host)
+/** `true` matches any query string, an object matches those exact params. */
+type QueryMatcher = boolean | Record<string, any> | URLSearchParams;
+
+export type Options = {
+  reqheaders?: Record<string, HeaderMatcher>
+};
+
+type ReplyHeaders = Record<string, string | string[]>;
+type ReplyBody = string | Buffer | Record<string, any> | unknown[] | null;
+
+/** nock's `this` inside a reply callback. */
+type ReplyContext = {
+  req: {
+    headers: Record<string, string>
+    method: string
+    path: string
+  }
+};
+
+type ReplyFunctionResult = [number, ReplyBody?, ReplyHeaders?];
+type ReplyFunction = (this: ReplyContext, uri: string, requestBody: unknown) => ReplyFunctionResult | Promise<ReplyFunctionResult>;
+type ReplyBodyFunction = (this: ReplyContext, uri: string, requestBody: unknown) => ReplyBody | Promise<ReplyBody>;
+
+/**
+ * nock hands reply callbacks a parsed object when the request looked like JSON, and the
+ * raw string otherwise.
+ */
+function parseRequestBody(body: unknown, headers: Record<string, string>): unknown {
+  if (typeof body !== 'string' || body === '') {
+    return body;
   }
 
-  const interceptor = {
-    get(path: string, bodyMatcher?: string | RegExp | ((body: string) => boolean), options?: Options) {
-      const mocked = mockPool.intercept({
-        method: 'GET',
-        path,
-        body: bodyMatcher,
-        headers: options?.reqheaders,
-      });
+  const contentType = headers['content-type'] ?? headers['Content-Type'];
 
-      return Object.assign(interceptor, {reply: mocked.reply.bind(mocked)});
-    },
-    post(path: string, bodyMatcher?: string | RegExp | ((body: string) => boolean), options?: Options) {
-      const mocked = mockPool.intercept({
-        method: 'POST',
-        path,
-        body: bodyMatcher,
-        headers: options?.reqheaders,
-      });
-
-      return Object.assign(interceptor, {reply: mocked.reply.bind(mocked)});
-    },
-    delete(path: string, bodyMatcher?: string | RegExp | ((body: string) => boolean), options?: Options) {
-      const mocked = mockPool.intercept({
-        method: 'DELETE',
-        path,
-        body: bodyMatcher,
-        headers: options?.reqheaders,
-      });
-
-      return Object.assign(interceptor, {reply: mocked.reply.bind(mocked)});
-    },
-    patch(path: string, bodyMatcher?: string | RegExp | ((body: string) => boolean), options?: Options) {
-      const mocked = mockPool.intercept({
-        method: 'PATCH',
-        path,
-        body: bodyMatcher,
-        headers: options?.reqheaders,
-      });
-
-      return Object.assign(interceptor, {reply: mocked.reply.bind(mocked)});
-    },
-    put(path: string, bodyMatcher?: string | RegExp | ((body: string) => boolean), options?: Options) {
-      const mocked = mockPool.intercept({
-        method: 'PUT',
-        path,
-        body: bodyMatcher,
-        headers: options?.reqheaders,
-      });
-
-      return Object.assign(interceptor, {reply: mocked.reply.bind(mocked)});
-    },
-    reply(responseCode?: number, body?: string | Record<string, any>, headers?: Record<string, string | string[]>) {
-      throw new Error('Cannot reply without interceptor (todo: wrong types)');
+  if (contentType?.includes('json')) {
+    try {
+      return JSON.parse(body);
+    } catch {
+      return body;
     }
   }
 
-  return interceptor;
+  return body;
+}
+
+function stripQuery(path: string): string {
+  const index = path.indexOf('?');
+
+  return index === -1 ? path : path.slice(0, index);
+}
+
+/**
+ * Turn a nock path matcher into one undici will accept, accounting for the base path that
+ * `nock('https://host/base')` may carry and for `.query(true)`.
+ *
+ * undici matches a string `path` against the request path *including* its query string, so
+ * anything that has to ignore the query becomes a function matcher.
+ */
+function buildPathMatcher(basePath: string, path: PathMatcher, ignoreQuery: boolean): string | ((path: string) => boolean) {
+  if (typeof path === 'string' && !ignoreQuery && !basePath) {
+    return path;
+  }
+
+  if (typeof path === 'string' && !ignoreQuery) {
+    return basePath + path;
+  }
+
+  return (requestPath: string) => {
+    const candidate = ignoreQuery ? stripQuery(requestPath) : requestPath;
+
+    if (basePath) {
+      if (!candidate.startsWith(basePath)) {
+        return false;
+      }
+
+      // nock matches the interceptor path against what follows the base path.
+      return matchPath(path, candidate.slice(basePath.length));
+    }
+
+    return matchPath(path, candidate);
+  };
+}
+
+function matchPath(matcher: PathMatcher, path: string): boolean {
+  if (typeof matcher === 'string') {
+    return matcher === path;
+  }
+
+  if (typeof matcher === 'function') {
+    return matcher(path);
+  }
+
+  return matcher.test(path);
+}
+
+function queryToObject(query: Record<string, any> | URLSearchParams): Record<string, any> {
+  if (query instanceof URLSearchParams) {
+    return Object.fromEntries(query.entries());
+  }
+
+  return query;
+}
+
+class Interceptor {
+  #scope: Scope;
+  #pool: Interceptable;
+  #basePath: string;
+  #method: string;
+  #path: PathMatcher;
+  #body?: BodyMatcher;
+  #headers: Record<string, HeaderMatcher>;
+  #query?: QueryMatcher;
+
+  /** Recorded before `reply()`, applied to the undici MockScope it produces. */
+  #times?: number;
+  #persist = false;
+  #delay?: number;
+
+  constructor(
+    scope: Scope,
+    pool: Interceptable,
+    basePath: string,
+    method: string,
+    path: PathMatcher,
+    body?: BodyMatcher,
+    options?: Options,
+  ) {
+    this.#scope = scope;
+    this.#pool = pool;
+    this.#basePath = basePath;
+    this.#method = method;
+    this.#path = path;
+    this.#body = body;
+    this.#headers = {...options?.reqheaders};
+  }
+
+  query(matcher: QueryMatcher = true): this {
+    this.#query = matcher;
+
+    return this;
+  }
+
+  matchHeader(name: string, value: HeaderMatcher): this {
+    this.#headers[name] = value;
+
+    return this;
+  }
+
+  times(count: number): this {
+    this.#times = count;
+
+    return this;
+  }
+
+  once(): this {
+    return this.times(1);
+  }
+
+  twice(): this {
+    return this.times(2);
+  }
+
+  thrice(): this {
+    return this.times(3);
+  }
+
+  persist(): this {
+    this.#persist = true;
+
+    return this;
+  }
+
+  delay(ms: number): this {
+    this.#delay = ms;
+
+    return this;
+  }
+
+  #intercept(): MockInterceptor {
+    // Only `.query(true)` needs a query-ignoring matcher. For an object query undici folds
+    // the params into the interceptor's path string and compares that, which a function
+    // matcher would defeat - so those keep an ordinary string path.
+    const ignoreQuery = this.#query === true;
+
+    const options: MockInterceptor.Options = {
+      method: this.#method,
+      path: buildPathMatcher(this.#basePath, this.#path, ignoreQuery),
+      body: this.#body,
+      headers: Object.keys(this.#headers).length ? this.#headers : undefined,
+    };
+
+    if (this.#query !== undefined && this.#query !== true && this.#query !== false) {
+      options.query = queryToObject(this.#query);
+    }
+
+    return this.#pool.intercept(options);
+  }
+
+  #applyScopeOptions(mockScope: {times(n: number): any, persist(): any, delay(ms: number): any}): Scope {
+    if (this.#times !== undefined) {
+      mockScope.times(this.#times);
+    }
+
+    if (this.#persist) {
+      mockScope.persist();
+    }
+
+    if (this.#delay !== undefined) {
+      mockScope.delay(this.#delay);
+    }
+
+    return this.#scope;
+  }
+
+  #context(opts: {method?: string, path: string, headers?: Record<string, string>}): ReplyContext {
+    return {
+      req: {
+        headers: opts.headers ?? {},
+        method: opts.method ?? this.#method,
+        path: opts.path,
+      },
+    };
+  }
+
+  /** The uri a reply callback sees: path relative to the base path, query included. */
+  #uri(path: string): string {
+    return this.#basePath && path.startsWith(this.#basePath) ? path.slice(this.#basePath.length) : path;
+  }
+
+  reply(responseCode: number, body?: ReplyBody | ReplyBodyFunction, headers?: ReplyHeaders): Scope;
+  reply(replyFunction: ReplyFunction): Scope;
+  reply(
+    responseCodeOrFunction: number | ReplyFunction,
+    body?: ReplyBody | ReplyBodyFunction,
+    headers?: ReplyHeaders,
+  ): Scope {
+    const interceptor = this.#intercept();
+
+    // nock's `.reply(function (uri, requestBody) { return [status, body, headers] })`
+    if (typeof responseCodeOrFunction === 'function') {
+      const replyFunction = responseCodeOrFunction;
+
+      return this.#applyScopeOptions(interceptor.reply(async (opts: any) => {
+        const context = this.#context(opts);
+        const [statusCode, data, replyHeaders] = await replyFunction.call(
+          context,
+          this.#uri(opts.path),
+          parseRequestBody(opts.body, context.req.headers),
+        );
+
+        return {
+          statusCode,
+          data: data ?? '',
+          responseOptions: replyHeaders ? {headers: replyHeaders as any} : {},
+        };
+      }));
+    }
+
+    // nock's `.reply(status, function (uri, requestBody) { return body })`
+    if (typeof body === 'function') {
+      const bodyFunction = body as ReplyBodyFunction;
+
+      return this.#applyScopeOptions(interceptor.reply(async (opts: any) => {
+        const context = this.#context(opts);
+        const data = await bodyFunction.call(
+          context,
+          this.#uri(opts.path),
+          parseRequestBody(opts.body, context.req.headers),
+        );
+
+        return {
+          statusCode: responseCodeOrFunction,
+          data: data ?? '',
+          responseOptions: headers ? {headers: headers as any} : {},
+        };
+      }));
+    }
+
+    return this.#applyScopeOptions(interceptor.reply(
+      responseCodeOrFunction,
+      (body ?? '') as any,
+      headers ? {headers: headers as any} : {},
+    ));
+  }
+
+  replyWithError(error: Error | Record<string, any>): Scope {
+    const asError = error instanceof Error ? error : Object.assign(new Error('Mocked error'), error);
+
+    return this.#applyScopeOptions(this.#intercept().replyWithError(asError));
+  }
+}
+
+class Scope {
+  #pool: Interceptable;
+  #basePath: string;
+
+  constructor(origin: string, basePath: string) {
+    let pool = pools.get(origin);
+
+    if (!pool) {
+      pool = mockAgent.get(origin);
+      pools.set(origin, pool);
+    }
+
+    this.#pool = pool;
+    this.#basePath = basePath;
+  }
+
+  #verb(method: string, path: PathMatcher, body?: BodyMatcher, options?: Options): Interceptor {
+    return new Interceptor(this, this.#pool, this.#basePath, method, path, body, options);
+  }
+
+  get(path: PathMatcher, body?: BodyMatcher, options?: Options) {
+    return this.#verb('GET', path, body, options);
+  }
+
+  post(path: PathMatcher, body?: BodyMatcher, options?: Options) {
+    return this.#verb('POST', path, body, options);
+  }
+
+  put(path: PathMatcher, body?: BodyMatcher, options?: Options) {
+    return this.#verb('PUT', path, body, options);
+  }
+
+  patch(path: PathMatcher, body?: BodyMatcher, options?: Options) {
+    return this.#verb('PATCH', path, body, options);
+  }
+
+  delete(path: PathMatcher, body?: BodyMatcher, options?: Options) {
+    return this.#verb('DELETE', path, body, options);
+  }
+
+  head(path: PathMatcher, body?: BodyMatcher, options?: Options) {
+    return this.#verb('HEAD', path, body, options);
+  }
+
+  options(path: PathMatcher, body?: BodyMatcher, options?: Options) {
+    return this.#verb('OPTIONS', path, body, options);
+  }
+
+  /** True once every interceptor registered on this scope has been consumed. */
+  isDone(): boolean {
+    return mockAgent.pendingInterceptors().length === 0;
+  }
+}
+
+/**
+ * Split `https://host:port/base/path` into the origin undici wants and the path prefix
+ * every interceptor on the scope should inherit.
+ */
+function splitOrigin(basePath: string | RegExp | Url | URL): {origin: string, path: string} {
+  if (basePath instanceof RegExp) {
+    // A regex origin can't carry a base path.
+    return {origin: basePath as unknown as string, path: ''};
+  }
+
+  if (typeof basePath === 'string') {
+    const url = new URL(basePath);
+
+    return {origin: url.origin, path: trimTrailingSlash(url.pathname)};
+  }
+
+  if (basePath instanceof URL) {
+    return {origin: basePath.origin, path: trimTrailingSlash(basePath.pathname)};
+  }
+
+  return {origin: basePath.protocol + '//' + basePath.host, path: trimTrailingSlash(basePath.pathname ?? '')};
+}
+
+function trimTrailingSlash(path: string): string {
+  return path === '/' ? '' : path.replace(/\/$/, '');
+}
+
+function nock(basePath: string | RegExp | Url | URL): Scope {
+  const {origin, path} = splitOrigin(basePath);
+
+  return new Scope(origin, path);
 }
 
 Object.assign(nock, {
   active: true,
   activate() {
-    mockAgent.activate()
+    mockAgent.activate();
 
     this.active = true;
   },
   restore() {
-    mockAgent.deactivate()
+    mockAgent.deactivate();
 
     this.active = false;
   },
@@ -99,18 +410,41 @@ Object.assign(nock, {
     return this.active;
   },
   disableNetConnect() {
-    mockAgent.disableNetConnect()
+    mockAgent.disableNetConnect();
   },
-  enableNetConnect() {
-    mockAgent.enableNetConnect()
+  enableNetConnect(host?: string | RegExp | ((host: string) => boolean)) {
+    // undici's overloads don't accept `undefined` for the "allow everything" form.
+    return host === undefined ? mockAgent.enableNetConnect() : mockAgent.enableNetConnect(host as string);
   },
   pendingMocks() {
-    return mockAgent.pendingInterceptors()
-  }
-})
+    return mockAgent.pendingInterceptors();
+  },
+  /** Drop every interceptor registered so far, on every origin. */
+  cleanAll() {
+    for (const pool of pools.values()) {
+      (pool as unknown as {cleanMocks(): void}).cleanMocks();
+    }
+  },
+  abortPendingRequests() {
+    // undici has no equivalent; interceptors are removed instead.
+    this.cleanAll();
+  },
+});
 
-export default nock;
+export default nock as typeof nock & {
+  active: boolean
+  activate(): void
+  restore(): void
+  isActive(): boolean
+  disableNetConnect(): void
+  enableNetConnect(host?: string | RegExp | ((host: string) => boolean)): void
+  pendingMocks(): ReturnType<MockAgent['pendingInterceptors']>
+  cleanAll(): void
+  abortPendingRequests(): void
+};
 
 export {
-  mockAgent
-}
+  mockAgent,
+  Scope,
+  Interceptor,
+};
