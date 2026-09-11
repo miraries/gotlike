@@ -27,11 +27,13 @@ nock.disableNetConnect();
 const json = client.extend({responseType: 'json', throwHttpErrors: false});
 
 /**
- * An unmatched interceptor surfaces as a normal request failure; undici's
- * "Mock dispatch not matched" text is on the cause, not the RequestError's own message.
+ * An unmatched interceptor surfaces as a normal request failure carrying undici's
+ * "Mock dispatch not matched" text - on the `RequestError`'s own message as well as on the
+ * cause, since `ERR_REQUEST_ERROR` reports the underlying message rather than a generic label.
  */
 function assertUnmatched(error: RequestError, why: string) {
   assert.strictEqual(error.code, 'ERR_REQUEST_ERROR', why);
+  assert.match(error.message, /Mock dispatch not matched|Net connect/, why);
   assert.match((error.cause as Error).message, /Mock dispatch not matched|Net connect/, why);
 }
 
@@ -177,6 +179,71 @@ test('query(object) on a regex path requires every param to line up', async () =
   const missed = await failure(client.get('http://mock.test/items', {searchParams: {page: '1', extra: 'x'}}));
 
   assertUnmatched(missed, 'an extra param should not match');
+});
+
+/*
+ * nock allows a RegExp or a predicate as a query *value*, and an array for a repeated key.
+ * Those were run through `String(value)`, which turned a RegExp into the literal `"/bar/"`
+ * and an array into `"1,2"` - neither of which any real query string can equal, so such an
+ * interceptor silently never matched. A RegExp or predicate value also can't be handed to
+ * undici, which serialises the query into its stored path.
+ */
+test('query accepts a regex value', async () => {
+  nock('http://mock.test').get('/re').query({token: /^abc/}).reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/re', {searchParams: {token: 'abcdef'}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a regex query value still has to match', async () => {
+  nock('http://mock.test').get('/re').query({token: /^abc/}).reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/re', {searchParams: {token: 'zzz'}}));
+
+  assertUnmatched(missed, 'a value the regex rejects should not match');
+});
+
+test('query accepts a predicate value', async () => {
+  nock('http://mock.test')
+    .get('/fn')
+    .query({page: (value: string) => Number(value) > 10})
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/fn', {searchParams: {page: '42'}});
+
+  assert.strictEqual(response.body, 'matched');
+
+  nock('http://mock.test')
+    .get('/fn')
+    .query({page: (value: string) => Number(value) > 10})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/fn', {searchParams: {page: '2'}}));
+
+  assertUnmatched(missed, 'a value the predicate rejects should not match');
+});
+
+test('query accepts an array value for a repeated key', async () => {
+  nock('http://mock.test')
+    .get('/arr')
+    .query({id: ['1', '2']})
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/arr', {searchParams: {id: ['1', '2']}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('an array query value is not satisfied by a single occurrence', async () => {
+  nock('http://mock.test')
+    .get(/^\/arr/)
+    .query({id: ['1', '2']})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/arr', {searchParams: {id: '1'}}));
+
+  assertUnmatched(missed, 'one value should not satisfy a two-element expectation');
 });
 
 test('a plain path does not match a request carrying a query', async () => {

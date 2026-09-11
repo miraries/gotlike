@@ -43,6 +43,74 @@ function asStream(readable: Readable, head: StreamHead | undefined, error?: Erro
 function noop(): void {}
 
 /**
+ * Errors that have already been through `toRequestError` - hooks run, class and code
+ * assigned. `normaliseStreamErrors` skips these so a failure it already built (or one a
+ * `beforeError` hook replaced it with) isn't wrapped, and the hooks aren't fired twice.
+ *
+ * A WeakSet rather than a marker property: a hook may hand back any error it likes,
+ * including a frozen one, and tagging that would throw.
+ */
+const normalisedErrors = new WeakSet<object>();
+
+/** The stream internals Node exposes for this but doesn't type. */
+type DestroyableStream = Readable & {
+  _destroy(error: Error | null, callback: (error?: Error | null) => void): void;
+  _readableState?: {errored?: unknown};
+  _writableState?: {errored?: unknown};
+};
+
+/**
+ * Make a stream report failures the way the promise API does: as a `RequestError` subclass,
+ * with the `beforeError` hooks applied.
+ *
+ * Both stream paths hand back a stream undici owns - the response `Readable` on the bodyless
+ * path, the `pipeline` `Duplex` on the upload path - and undici destroys it with its own raw
+ * error. A connection refused arrived as a bare `Error`, a `timeout.request` as a
+ * `DOMException` whose `code` is the number 23, and a socket reset mid-body as a
+ * `SocketError`; none of them ran the `beforeError` hooks. got normalises every one of these,
+ * and the README promises the same.
+ *
+ * `_destroy` is the seam for it. Node emits whatever error that callback is given rather than
+ * the one it was called with, and the callback may be called asynchronously - which is what
+ * makes awaiting the async `beforeError` hooks possible. undici's own `_destroy` still runs
+ * first and does its cleanup; only the error handed onwards is replaced. Verified against
+ * `for await`, an `error` listener and `stream.pipeline`.
+ */
+function normaliseStreamErrors<T extends Readable>(stream: T, normalise: (error: Error) => Promise<Error>): T {
+  const target = stream as unknown as DestroyableStream;
+  const original = target._destroy;
+
+  target._destroy = function destroyNormalised(error, callback) {
+    original.call(this, error, (cleanupError) => {
+      if (!cleanupError || normalisedErrors.has(cleanupError)) {
+        callback(cleanupError);
+
+        return;
+      }
+
+      normalise(cleanupError).then(
+        (normalised) => {
+          // `stream.errored` is public API and is latched from the raw error before `_destroy`
+          // runs, so it would otherwise disagree with the error every listener is about to see.
+          if (this._readableState?.errored) {
+            this._readableState.errored = normalised;
+          }
+
+          if (this._writableState?.errored) {
+            this._writableState.errored = normalised;
+          }
+
+          callback(normalised);
+        },
+        () => callback(cleanupError),
+      );
+    });
+  };
+
+  return stream;
+}
+
+/**
  * A `stream()` duplex for a request that failed before it could be dispatched.
  *
  * The writable half accepts and discards writes so a caller that pipes into it doesn't fail
@@ -116,15 +184,18 @@ type AttemptState = DispatchState & {
 };
 
 /**
- * undici's typings don't expose the per-request options that the `redirect` and `retry`
- * interceptors pick off the dispatch options, but both read them at runtime (see
- * lib/interceptor/{redirect,retry}.js). Composing the interceptors once per client and
- * overriding per request is what keeps these as request options without rebuilding a
- * dispatcher on every call. `attempts` and `redirects` are ours.
+ * undici's typings don't expose `maxRedirections` as a per-request option, but the `redirect`
+ * interceptor reads it off the dispatch options at runtime (see lib/interceptor/redirect.js).
+ * Composing the interceptor once per client and overriding per request is what keeps
+ * `followRedirect` a request option without rebuilding a dispatcher on every call.
+ *
+ * `attempts` and `redirects` are ours - the state holders the two trackers record onto.
+ *
+ * The retry interceptor reads a per-request `retryOptions` the same way, but `retry` is a
+ * client-only option here, so nothing ever sets one and the field is not declared.
  */
 type InterceptorOptions = {
   maxRedirections?: number;
-  retryOptions?: RetryHandlerOptions;
   attempts?: AttemptState;
   redirects?: RedirectState;
 };
@@ -284,6 +355,8 @@ const acceptEncoding = [
 
 const absoluteUrl = /^[a-z][a-z\d+\-.]*:\/\//i;
 
+const leadingSlashes = /^\/+/;
+
 /** A single `searchParams` / `form` value. Arrays of these repeat the key. */
 export type QueryValue = string | number | boolean | null | undefined;
 
@@ -417,7 +490,10 @@ function mergeRecords<T extends object>(base?: T, override?: T): T | undefined {
     return override;
   }
 
-  return override ? {...base, ...override} : base;
+  // Copied even when only the base is present. Returning `base` itself made an extended
+  // client's `context` the *same object* as its parent's, so writing through the child's
+  // `baseOptions` changed the parent too. Only ever runs on the create/extend path.
+  return override ? {...base, ...override} : {...base};
 }
 
 const hookNames = ['beforeRequest', 'afterResponse', 'beforeError', 'beforeRetry', 'beforeRedirect'] as const;
@@ -428,10 +504,9 @@ function mergeHooks(base?: Hooks, override?: Hooks): Hooks | undefined {
     return override;
   }
 
-  if (!override) {
-    return base;
-  }
-
+  // No early return for an absent override: `concatHooks` below copies each array, which
+  // returning `base` would skip - leaving the child sharing the parent's `hooks` object and
+  // every array in it.
   const merged: Hooks = {};
 
   for (const name of hookNames) {
@@ -439,7 +514,7 @@ function mergeHooks(base?: Hooks, override?: Hooks): Hooks | undefined {
     // is generic over the element type and the names do not unify.
     (merged as Record<string, unknown[] | undefined>)[name] = concatHooks(
       base[name] as unknown[] | undefined,
-      override[name] as unknown[] | undefined,
+      override?.[name] as unknown[] | undefined,
     );
   }
 
@@ -456,7 +531,9 @@ function concatHooks<T>(base?: T[], added?: T[]): T[] | undefined {
     return added;
   }
 
-  return added ? [...base, ...added] : base;
+  // A fresh array either way, so an extended client never shares the parent's: pushing onto
+  // `child.baseOptions.handlers` used to add a handler to the parent as well.
+  return added ? [...base, ...added] : [...base];
 }
 
 /**
@@ -485,6 +562,18 @@ function requestSignal(options: FormedOptions): AbortSignal | undefined {
   return options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
 }
 
+/**
+ * The message to report a failure under: the underlying error's own, when it has one.
+ *
+ * `fallback` covers an error thrown with an empty message, and a non-`Error` thrown value -
+ * which is rare but perfectly legal, and would otherwise produce `message: undefined`.
+ */
+function messageOf(error: unknown, fallback: string): string {
+  const message = (error as Error | undefined)?.message;
+
+  return typeof message === 'string' && message !== '' ? message : fallback;
+}
+
 /** Milliseconds since `startTime`, or 0 when the request never got far enough to have one. */
 function elapsedMs(startTime?: [number, number]): number {
   return startTime ? hrtimeToMilliseconds(process.hrtime(startTime)) : 0;
@@ -497,14 +586,16 @@ function hrtimeToMilliseconds(hrtime: [number, number]) {
   return seconds * 1000 + nanoseconds / 1_000_000;
 }
 
+/**
+ * got's `retry`, minus what undici's `RetryHandler` can't express: `calculateDelay` and
+ * `noise` have no equivalent, and `maxRetryAfter` degrades to a boolean (see the constructor).
+ */
 type RetryOptions = {
   limit: number;
   methods: Dispatcher.HttpMethod[];
   statusCodes: number[];
   errorCodes: string[];
-  // calculateDelay: RetryFunction;
   backoffLimit: number;
-  // noise: number;
   maxRetryAfter?: number;
 };
 
@@ -789,6 +880,10 @@ export type Hooks<T = any> = {
   /**
    * Run before `throwHttpErrors` is applied, so error statuses are visible here.
    * Must return a response - either the one it was given, or `retryWithMergedOptions(...)`.
+   *
+   * __Note__: not run for `stream()`, since there is no parsed body to hand over and no way
+   * to replay a streamed request. got scopes these to its promise API for the same reason.
+   * `beforeRequest`, `beforeError`, `beforeRetry` and `beforeRedirect` all do fire for streams.
    */
   afterResponse?: ((
     response: Response<T>,
@@ -1149,8 +1244,19 @@ export function validateOptions(options: RequestOptions, atCreation: boolean): v
       invalid('`timeout` must be an object like `{request: 5000}`');
     }
 
-    if (timeout.request !== undefined && (typeof timeout.request !== 'number' || timeout.request < 0)) {
-      invalid('`timeout.request` must be a non-negative number of milliseconds');
+    /*
+     * Finite and above zero, not merely non-negative. Both excluded values were accepted and
+     * then behaved badly: `0` made `AbortSignal.timeout(0)` fire immediately and fail every
+     * request, while undici reads `bodyTimeout: 0` as *disabled* - the two halves of one
+     * option meaning opposite things. `Infinity` made `AbortSignal.timeout` throw a
+     * `RangeError` that surfaced as an opaque `ERR_REQUEST_ERROR`. Leave the option off to
+     * have no timeout.
+     */
+    if (
+      timeout.request !== undefined &&
+      (typeof timeout.request !== 'number' || !Number.isFinite(timeout.request) || timeout.request <= 0)
+    ) {
+      invalid('`timeout.request` must be a finite number of milliseconds greater than 0, or left unset for none');
     }
   }
 
@@ -1158,8 +1264,21 @@ export function validateOptions(options: RequestOptions, atCreation: boolean): v
     invalid('`headers` must be an object');
   }
 
-  if (prefixUrl !== undefined && typeof prefixUrl !== 'string') {
-    invalid('`prefixUrl` must be a string');
+  if (prefixUrl !== undefined) {
+    if (typeof prefixUrl !== 'string') {
+      invalid('`prefixUrl` must be a string');
+    }
+
+    /*
+     * A prefix is joined to `url` by string concatenation, so a query or fragment on it lands
+     * in the middle of the result: `http://h/base?x=1` + `p` became `http://h/base?x=1/p`,
+     * and adding `searchParams` then cut everything from the `?` onwards and dropped the path
+     * segment entirely. Rejected rather than silently mangled - put the query in
+     * `searchParams`, which is what it is for.
+     */
+    if (prefixUrl.includes('?') || prefixUrl.includes('#')) {
+      invalid('`prefixUrl` must not contain a query string or a fragment - use `searchParams` instead');
+    }
   }
 
   if (
@@ -1586,17 +1705,28 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         : url === ''
           ? options.prefixUrl
           : (options.prefixUrl.endsWith('/') ? options.prefixUrl : options.prefixUrl + '/') +
-            (url.startsWith('/') ? url.slice(1) : url);
+            // Every leading slash, not just the first: stripping one left `//evil/x` as
+            // `prefix//evil/x`, which is the `//` this is supposed to rule out.
+            url.replace(leadingSlashes, '');
 
     if (options.searchParams === undefined) {
       return joined;
     }
 
+    /*
+     * The fragment has to come off before the query is located, and never goes back on: it is
+     * not sent to the server anyway. Splitting on `?` alone appended the query *inside* a
+     * fragment - `http://h/p#frag` became `http://h/p#frag?a=1`, the server saw `/p`, and the
+     * search params vanished off the wire with no error at all.
+     */
+    const fragment = joined.indexOf('#');
+    const addressable = fragment === -1 ? joined : joined.slice(0, fragment);
+
     const search = stringifyQuery(options.searchParams);
-    const existing = joined.indexOf('?');
+    const existing = addressable.indexOf('?');
 
     // got's `searchParams` replaces the url's own query rather than merging into it.
-    const withoutQuery = existing === -1 ? joined : joined.slice(0, existing);
+    const withoutQuery = existing === -1 ? addressable : addressable.slice(0, existing);
 
     return search ? withoutQuery + '?' + search : withoutQuery;
   }
@@ -1624,6 +1754,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         }
       }
     }
+
+    // Recorded so `normaliseStreamErrors` lets it through untouched rather than wrapping it
+    // again and re-firing the hooks.
+    normalisedErrors.add(error);
 
     return error;
   }
@@ -1807,7 +1941,17 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         );
       }
 
-      throw await this.toRequestError('Request error', 'ERR_REQUEST_ERROR', err as Error, options, response);
+      // The underlying message, not a generic one - the same reasoning as the pre-request
+      // catch above. "Request error" was all that reached `error.message` for a connection
+      // refused, a DNS failure and a malformed url alike, leaving every log line and every
+      // APM grouping unable to tell them apart. got reports the underlying message too.
+      throw await this.toRequestError(
+        messageOf(err, 'Request error'),
+        'ERR_REQUEST_ERROR',
+        err as Error,
+        options,
+        response,
+      );
     }
 
     let response: Response<T> = new GotlikeResponse<T>(
@@ -1882,7 +2026,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     };
 
     if (!options.throwHttpErrors || !isHttpError(undiciResponse.statusCode)) {
-      return asStream(undiciResponse.body, streamHead);
+      // The head arrived, but the body can still fail: a socket reset part-way through a
+      // download used to surface undici's raw `SocketError` and skip the `beforeError` hooks.
+      return asStream(this.normaliseBodyErrors(undiciResponse.body, options), streamHead);
     }
 
     // The body is being replaced by the error, so let undici reclaim the socket.
@@ -1911,6 +2057,14 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   }
 
   /**
+   * Make a stream raise `RequestError`s rather than undici's raw ones, with the `beforeError`
+   * hooks applied - what got does, and what the README promises. Used on both stream paths.
+   */
+  normaliseBodyErrors<T extends Readable>(stream: T, options: FormedOptions): T {
+    return normaliseStreamErrors(stream, (error) => this.toStreamError(error, options));
+  }
+
+  /**
    * Normalise a pre-response stream failure the way `call()`'s catch does, so that a stream
    * and a plain request report the same thing for the same underlying error.
    */
@@ -1927,7 +2081,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       return this.toRequestError(error.message, 'ETIMEDOUT', error, options, undefined, TimeoutError);
     }
 
-    return this.toRequestError('Request error', 'ERR_REQUEST_ERROR', error, options);
+    return this.toRequestError(messageOf(error, 'Request error'), 'ERR_REQUEST_ERROR', error, options);
   }
 
   /**
@@ -2028,6 +2182,17 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       return failedUploadStream(this.toStreamError(error as Error, options));
     }
 
+    /*
+     * Installed before anything can fail - `undici.pipeline` returns synchronously and every
+     * failure it reports is asynchronous. This is the only thing standing between the caller
+     * and undici's raw errors on this path: a connection refused arrived as a bare `Error`, a
+     * `timeout.request` as a `DOMException` with a numeric `code`, and a mid-body socket reset
+     * as a `SocketError`, none of them running the `beforeError` hooks. The bodyless path had
+     * always normalised its pre-response failures; this one never did.
+     */
+    this.normaliseBodyErrors(duplex, options);
+
+    // Fires with the normalised error, since that is what `_destroy` hands on to be emitted.
     duplex.on('error', (error: Error) => rejectHead(error));
 
     // `undici.pipeline` takes the request body from the duplex's writable side, not from
@@ -2076,6 +2241,34 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // normalise both sides: a refreshed `authorization` has to replace the stale one.
       headers: mergeHeaders(lowercaseHeaders(options.headers), newOptions.headers),
     } as FormedOptions;
+
+    /*
+     * A hook that supplies a body replaces the first attempt's, rather than merging with it.
+     * `call()` resolves `json` -> `form` -> `body` in that order, so without this the first
+     * attempt's `json` outranked a `body` or `form` the hook had just set and was sent again
+     * unchanged - the hook's body silently never left the process. `formOptions` applies the
+     * same mutual exclusion to the client defaults; this is the same rule for the same reason.
+     */
+    if (newOptions.json !== undefined || newOptions.body !== undefined || newOptions.form !== undefined) {
+      if (newOptions.json === undefined) {
+        merged.json = undefined;
+      }
+
+      if (newOptions.body === undefined) {
+        merged.body = undefined;
+      }
+
+      if (newOptions.form === undefined) {
+        merged.form = undefined;
+      }
+
+      // The first attempt's `content-type` described the body being replaced, and `call()`
+      // only sets one when none is present - so a json-then-form retry went out as a form
+      // body labelled `application/json`. Dropped unless the hook named one itself.
+      if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-type')) {
+        delete merged.headers['content-type'];
+      }
+    }
 
     if (newOptions.context) {
       merged.context = {...options.context, ...newOptions.context};

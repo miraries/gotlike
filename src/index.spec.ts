@@ -105,6 +105,19 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  // Announces a body far longer than it sends, then kills the socket: the response head
+  // arrives fine and the failure only shows up part-way through reading. A truncated
+  // download is the realistic version of this, and it used to surface undici's raw
+  // `SocketError` on both stream paths.
+  if (req.url === '/truncate') {
+    res.writeHead(200, {'content-length': '1000', 'content-type': 'text/plain'});
+    res.write('partial');
+
+    setTimeout(() => res.socket?.destroy(), 50);
+
+    return;
+  }
+
   // Mimics the provider auth flow the afterResponse token-refresh hooks exist for:
   // 401 with a JSON body until a bearer token shows up.
   if (req.url === '/unauthorized') {
@@ -479,6 +492,43 @@ test('extend client with handler', async () => {
 
   assert.deepStrictEqual(order, ['before request', 'after request', 'after response']);
   assert.strictEqual(response.statusCode, 200);
+});
+
+/*
+ * `extend()` used to hand the child the parent's own `handlers` array, `hooks` object and
+ * `context` whenever the child supplied none of its own - the merge helpers returned `base`
+ * unchanged. Writing through the child's `baseOptions` then mutated the parent, and every
+ * other client extended from it. All three run once per client, so copying is free.
+ */
+test('extend does not let a child share the parent’s handlers, hooks or context', () => {
+  const parentHandler: HandlerFunction = (options, next) => next(options);
+  const parentHook = () => undefined;
+
+  const parent = new Gotlike({
+    handlers: [parentHandler],
+    hooks: {beforeRequest: [parentHook]},
+    context: {tenant: 'parent'},
+  });
+
+  const child = parent.extend({});
+
+  assert.notStrictEqual(child.baseOptions.handlers, parent.baseOptions.handlers);
+  assert.notStrictEqual(child.baseOptions.hooks, parent.baseOptions.hooks);
+  assert.notStrictEqual(child.baseOptions.hooks?.beforeRequest, parent.baseOptions.hooks?.beforeRequest);
+  assert.notStrictEqual(child.baseOptions.context, parent.baseOptions.context);
+
+  // ... and the contents still came across.
+  assert.deepStrictEqual(child.baseOptions.handlers, [parentHandler]);
+  assert.deepStrictEqual(child.baseOptions.hooks?.beforeRequest, [parentHook]);
+  assert.deepStrictEqual(child.baseOptions.context, {tenant: 'parent'});
+
+  child.baseOptions.handlers!.push((options, next) => next(options));
+  child.baseOptions.hooks!.beforeRequest!.push(() => undefined);
+  child.baseOptions.context!.tenant = 'child';
+
+  assert.strictEqual(parent.baseOptions.handlers!.length, 1);
+  assert.strictEqual(parent.baseOptions.hooks!.beforeRequest!.length, 1);
+  assert.strictEqual(parent.baseOptions.context!.tenant, 'parent');
 });
 
 test('extend client with hook', async () => {
@@ -1173,6 +1223,10 @@ test('prefixUrl joins without doubling slashes', async () => {
   for (const [prefix, path] of [
     ['http://localhost:3000/api', 'thing'],
     ['http://localhost:3000/api/', '/thing'],
+    // Every leading slash, not just the first: `//thing` used to join as `/api//thing`,
+    // which is exactly the doubled slash this is here to rule out.
+    ['http://localhost:3000/api', '//thing'],
+    ['http://localhost:3000/api/', '///thing'],
   ] as const) {
     const seen: string[] = [];
     const probe = client.extend({
@@ -1431,6 +1485,36 @@ test('searchParams works with prefixUrl', async () => {
   const response = await extClient.get<Echo>('echo', {searchParams: {a: '1'}});
 
   assert.strictEqual(response.body.url, '/echo?a=1');
+});
+
+/*
+ * A fragment on the url used to swallow the query whole. `#` was never looked for, so the
+ * params were appended *after* it - `/echo#frag` became `/echo#frag?a=1`, the fragment (which
+ * is never sent) took the query with it, and the server saw a bare `/echo`. No error, no
+ * warning; the request just quietly went out without its parameters.
+ */
+test('searchParams are not swallowed by a fragment on the url', async () => {
+  const response = await client.get<Echo>('http://localhost:3000/echo#frag', {
+    responseType: 'json',
+    searchParams: {a: '1'},
+  });
+
+  assert.strictEqual(response.body.url, '/echo?a=1');
+});
+
+test('searchParams replace a query and drop a fragment together', async () => {
+  const response = await client.get<Echo>('http://localhost:3000/echo?old=1#frag', {
+    responseType: 'json',
+    searchParams: {new: '2'},
+  });
+
+  assert.strictEqual(response.body.url, '/echo?new=2');
+});
+
+test('a fragment with no searchParams is left for undici to strip', async () => {
+  const response = await client.get<Echo>('http://localhost:3000/echo#frag', {responseType: 'json'});
+
+  assert.strictEqual(response.body.url, '/echo');
 });
 
 test('form sends a urlencoded body with the right content-type', async () => {
@@ -1933,9 +2017,17 @@ test('validation rejects unknown and malformed options', async () => {
     [{responseType: 'jsn'}, /`responseType` must be one of/],
     [{method: 'FETCH'}, /`method` must be a valid HTTP method/],
     [{timeout: 5000}, /`timeout` must be an object/],
-    [{timeout: {request: -1}}, /`timeout.request` must be a non-negative number/],
+    [{timeout: {request: -1}}, /`timeout.request` must be a finite number/],
+    // 0 made `AbortSignal.timeout` fire at once and fail every request, while undici reads
+    // its own `bodyTimeout: 0` as disabled; Infinity made `AbortSignal.timeout` throw.
+    [{timeout: {request: 0}}, /`timeout.request` must be a finite number/],
+    [{timeout: {request: Number.POSITIVE_INFINITY}}, /`timeout.request` must be a finite number/],
+    [{timeout: {request: Number.NaN}}, /`timeout.request` must be a finite number/],
     [{headers: []}, /`headers` must be an object/],
     [{prefixUrl: 123}, /`prefixUrl` must be a string/],
+    // A query on the prefix lands mid-url once `url` is concatenated onto it.
+    [{prefixUrl: 'http://localhost:3000/api?x=1'}, /`prefixUrl` must not contain a query string/],
+    [{prefixUrl: 'http://localhost:3000/api#frag'}, /`prefixUrl` must not contain a query string/],
     [{searchParams: 5}, /`searchParams` must be a string/],
     [{form: 'a=1'}, /`form` must be a URLSearchParams/],
     [{retry: {limit: 1}}, /can only be set when creating or extending/],
@@ -2595,6 +2687,28 @@ test('an error thrown by a beforeRequest hook is a RequestError and runs beforeE
   assert.deepStrictEqual(seen, ['hook exploded']);
 });
 
+/*
+ * `ERR_REQUEST_ERROR` used to be raised with the literal message 'Request error', so a
+ * connection refused, a DNS failure and a malformed url were indistinguishable in any log line
+ * or APM grouping - the real reason only reachable through `cause`, which little code reads.
+ * got reports the underlying message, and so does the pre-request catch just above.
+ */
+test('a transport failure reports the underlying message, not a generic label', async () => {
+  const refused = await failure(client.get('http://127.0.0.1:1/nothing-here'));
+
+  assert.strictEqual(refused.code, 'ERR_REQUEST_ERROR');
+  assert.match(refused.message, /ECONNREFUSED/);
+  assert.notStrictEqual(refused.message, 'Request error');
+
+  const malformed = await failure(client.get('not-a-url'));
+
+  assert.strictEqual(malformed.code, 'ERR_REQUEST_ERROR');
+  assert.match(malformed.message, /Invalid URL/);
+
+  // The originating error is still on `cause` as well.
+  assert.strictEqual((refused.cause as Error).message, refused.message);
+});
+
 /**
  * The one retry test that genuinely spends real time: the wall clock *is* the assertion, and
  * nothing can be faked away. `mock.timers` can't help - node's fake timers never reach
@@ -2703,6 +2817,109 @@ test("an afterResponse retry does not write back onto the first attempt's option
   assert.strictEqual(first?.request.options.body, undefined);
 });
 
+/*
+ * A body the hook supplies has to replace the first attempt's, not lose to it. `call()`
+ * resolves `json` -> `form` -> `body`, so the first attempt's `json` used to outrank a `body`
+ * or `form` the hook had just set: the original body was sent a second time and the hook's
+ * never left the process. The stale `content-type` came along with it, so a json-then-form
+ * retry went out as a form body labelled `application/json`.
+ */
+test('an afterResponse retry can replace a json body with a raw one', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.request.options.context.retried) {
+            return response;
+          }
+
+          return retryWithMergedOptions({context: {retried: true}, body: 'replaced'});
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://localhost:3000/echo', {json: {first: true}});
+
+  assert.strictEqual(response.body.body, 'replaced');
+  // The json content-type described the body that was just replaced.
+  assert.strictEqual(response.body.headers['content-type'], undefined);
+});
+
+test('an afterResponse retry can replace a json body with a form', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.request.options.context.retried) {
+            return response;
+          }
+
+          return retryWithMergedOptions({context: {retried: true}, form: {q: 'x'}});
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://localhost:3000/echo', {json: {first: true}});
+
+  assert.strictEqual(response.body.body, 'q=x');
+  assert.strictEqual(response.body.headers['content-type'], 'application/x-www-form-urlencoded');
+});
+
+test('an afterResponse retry keeps a content-type the hook set itself', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.request.options.context.retried) {
+            return response;
+          }
+
+          return retryWithMergedOptions({
+            context: {retried: true},
+            body: '<xml/>',
+            headers: {'content-type': 'application/xml'},
+          });
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://localhost:3000/echo', {json: {first: true}});
+
+  assert.strictEqual(response.body.body, '<xml/>');
+  assert.strictEqual(response.body.headers['content-type'], 'application/xml');
+});
+
+test('an afterResponse retry that names no body keeps the first attempt’s', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.request.options.context.retried) {
+            return response;
+          }
+
+          // Only credentials change - the body and its content-type must survive, which is
+          // the whole point of a token-refresh retry.
+          return retryWithMergedOptions({context: {retried: true}, headers: {authorization: 'Bearer new'}});
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://localhost:3000/echo', {json: {first: true}});
+
+  assert.strictEqual(response.body.body, '{"first":true}');
+  assert.strictEqual(response.body.headers['content-type'], 'application/json');
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer new');
+});
+
 test('an afterResponse hook that always retries fails instead of recursing forever', async () => {
   let calls = 0;
 
@@ -2772,6 +2989,144 @@ test('beforeError runs for an upload stream too', async () => {
   assert.ok(error instanceof HTTPError, `expected an HTTPError, got ${error}`);
   assert.deepStrictEqual(seen, ['ERR_HTTP_ERROR']);
   assert.strictEqual(error.response?.statusCode, 500);
+});
+
+/*
+ * Stream failures that aren't an HTTP status. Every one of these used to escape as undici's
+ * own error with the `beforeError` hooks unrun: a connection refused as a bare `Error`, a
+ * `timeout.request` as a `DOMException` whose `code` is the *number* 23, and a mid-body socket
+ * reset as a `SocketError`. The upload path normalised none of them; the bodyless path
+ * normalised only the ones that happened before the response head.
+ *
+ * got reports all of these as `RequestError` subclasses with the hooks applied, and the README
+ * promises the same, so each combination gets its own test.
+ */
+function hookRecorder() {
+  const seen: string[] = [];
+
+  const recording = client.extend({
+    hooks: {
+      beforeError: [
+        (error) => {
+          seen.push(error.code);
+
+          return error;
+        },
+      ],
+    },
+  });
+
+  return {seen, recording};
+}
+
+test('a connection failure on a bodyless stream is a RequestError with beforeError applied', async () => {
+  const {seen, recording} = hookRecorder();
+
+  const stream = await recording.stream('http://127.0.0.1:1/nothing-here');
+  const error = await failure(text(stream));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+  // The underlying reason survives onto `message`, not just onto `cause`.
+  assert.match(error.message, /ECONNREFUSED/);
+});
+
+test('a connection failure on an upload stream is a RequestError with beforeError applied', async () => {
+  const {seen, recording} = hookRecorder();
+
+  const duplex = await recording.stream('http://127.0.0.1:1/nothing-here', {method: 'POST'});
+
+  duplex.end('body');
+
+  const error = await failure(text(duplex));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+});
+
+test('the response promise of a failed upload stream rejects with the normalised error', async () => {
+  const duplex = await client.stream('http://127.0.0.1:1/nothing-here', {method: 'POST'});
+
+  duplex.end('body');
+  duplex.resume();
+
+  const error = await failure(duplex.response);
+
+  // It used to reject with undici's raw error while the stream itself reported something else.
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+});
+
+test('timeout.request on an upload stream is a TimeoutError, not a DOMException', async () => {
+  const {seen, recording} = hookRecorder();
+
+  const duplex = await recording.stream('http://localhost:3000/slow', {method: 'POST', timeout: {request: 50}});
+
+  duplex.end('body');
+
+  const error = await failure(text(duplex));
+
+  assert.ok(error instanceof TimeoutError, `expected a TimeoutError, got ${error}`);
+  // Was the number 23 off a DOMException, which no caller matching on the documented codes
+  // could ever have recognised.
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+  assert.deepStrictEqual(seen, ['ETIMEDOUT']);
+});
+
+test('a truncated body on a bodyless stream is a RequestError with beforeError applied', async () => {
+  const {seen, recording} = hookRecorder();
+
+  const stream = await recording.stream('http://localhost:3000/truncate');
+
+  // The head arrives fine - this only fails part-way through the body.
+  assert.strictEqual((await stream.response).statusCode, 200);
+
+  const error = await failure(text(stream));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
+  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+});
+
+test('a truncated body on an upload stream is a RequestError with beforeError applied', async () => {
+  const {seen, recording} = hookRecorder();
+
+  const duplex = await recording.stream('http://localhost:3000/truncate', {method: 'POST'});
+
+  duplex.end('body');
+
+  const error = await failure(text(duplex));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
+  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+});
+
+test('stream.errored reports the normalised error, not undici’s raw one', async () => {
+  const stream = await client.stream('http://localhost:3000/truncate');
+
+  await failure(text(stream));
+
+  // `errored` is public API and is latched before `_destroy` runs, so it has to be put back
+  // in step with the error every listener saw.
+  assert.ok(stream.errored instanceof RequestError, `expected a RequestError, got ${stream.errored}`);
+});
+
+test('a stream error surfaces the same way through stream.pipeline', async () => {
+  const stream = await client.stream('http://localhost:3000/truncate');
+
+  const error = await failure(
+    pipeline(
+      stream,
+      new Writable({
+        write(_chunk, _encoding, callback) {
+          callback();
+        },
+      }),
+    ),
+  );
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
 });
 
 test('beforeRetry fires and retryCount is reported on a stream', async () => {

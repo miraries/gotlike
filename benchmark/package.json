@@ -8,7 +8,8 @@
   "type": "module",
   "main": "index.js",
   "scripts": {
-    "bench": "npm --prefix .. run build && node index.ts"
+    "bench": "npm --prefix .. run build && node index.ts",
+    "typecheck": "npm --prefix .. run build && ../node_modules/.bin/tsc -p tsconfig.json"
   },
   "dependencies": {
     "got": "^14.4.1"

@@ -96,11 +96,28 @@ that triggers them. Reordering these breaks every provider auth flow in the aggr
 The URL is resolved and written back *before* hooks run because request signing needs the full URL
 (`igd-aggregator-api`'s N2d provider signs `options.url`).
 
+Three things `resolveUrl` has to get right, each of which was silently wrong:
+- **The fragment comes off before the query is located.** `joined.indexOf('?')` alone appended `searchParams`
+  *inside* a fragment: `http://h/p#frag` became `http://h/p#frag?a=1`, the fragment took the query with it (a
+  fragment is never sent), and the server received a bare `/p`. The params vanished off the wire with no error at
+  all. The fragment is dropped rather than preserved, which is what got's `URL`-based handling ends up doing too.
+- **Every leading slash is stripped from `url`, not just the first** (`leadingSlashes`). `url = '//x'` joined as
+  `prefix//x` — exactly the doubled slash the join exists to prevent.
+- **A `prefixUrl` carrying a `?` or `#` is a `ValidationError`.** The prefix is concatenated, so a query on it
+  landed mid-url (`http://h/base?x=1` + `p` → `http://h/base?x=1/p`), and adding `searchParams` then cut
+  everything from the `?` onwards and dropped the path segment entirely. Rejected rather than mangled.
+
 Every failure is normalized into a `RequestError` carrying `options` and the undici response, with `code` one of
 `ETIMEDOUT` (headers/body timeout), `ERR_BODY_PARSE_FAILURE` (JSON parse — the raw text is attached to
 `response.body` so callers can inspect it), `ERR_HTTP_ERROR` (non-2xx/3xx), or `ERR_REQUEST_ERROR`. Timeout and
 retry errors are detected with the public `errors` export from undici 8 (undici 6/7 had no types for these, so
 older code reached into `undici/lib/core/errors` — that internal import is gone).
+
+**The message is the underlying error's, via `messageOf()` — not a generic label.** `ERR_REQUEST_ERROR` used to
+be raised with the literal string `'Request error'`, so a connection refused, a DNS failure and a malformed URL
+were indistinguishable in any log line or APM grouping; the real reason was only on `cause`, which almost nothing
+reads. got reports the underlying message, and the pre-request catch in the same function always did. `messageOf`
+falls back to the generic label only for an error with no message, or a non-`Error` thrown value.
 
 `RequestError.response` is a full gotlike `Response` (parsed `body`, `timings`, `request.options`), not the raw
 undici response — the aggregator's error handling reads all three. It is `undefined` only when the failure
@@ -182,6 +199,15 @@ It **always reallocates `headers`**, even when the hook passed none. Aliasing th
 meant `call()`'s own writes on the retry — a `content-type` for a body the retry added — landed on the options
 the *first* response reports having been sent with.
 
+**A body the hook supplies replaces the first attempt's, and takes its `content-type` with it.** `call()` resolves
+`json` → `form` → `body` in that order, so a plain `{...options, ...newOptions}` let the first attempt's `json`
+outrank a `body` or `form` the hook had just set: measured, a hook returning `retry({form: {q: 'x'}})` after a
+`json: {a: 1}` first attempt re-sent `{"a":1}` labelled `application/json`, and the form never left the process.
+So if `newOptions` names any of the three, the other two are cleared — the same mutual exclusion `formOptions`
+applies to the client defaults via `baseHasBody` — and the stale `content-type` is dropped so `call()` re-derives
+it, unless the hook set a `content-type` itself. A hook that names *no* body keeps the first attempt's body and
+content-type, which is what a token refresh wants.
+
 It is also **bounded** (`maxAfterResponseRetries`, 20), tracked through a symbol key on the options so option
 spreads carry it while `for...in` validation and `Object.keys` never see it. A hook that always retries on a
 status it never stops seeing — an auth refresh that silently fails — used to recurse until the process died;
@@ -222,6 +248,11 @@ forget a field:
 - **`trackDispatches(select, onRedispatch)`** + **`OutcomeHandler`** — one interceptor factory and one
   `DecoratorHandler` behind both `countAttempts` (retries) and `makeRedirectTracker` (redirects). They had
   separate, near-identical handler classes recording the same three fields.
+- **`normaliseStreamErrors()`** / **`normaliseBodyErrors()`** — one `_destroy` wrap behind both stream paths, so
+  the upload path can't drift back into reporting undici's raw errors while the bodyless one normalises. See
+  Streams.
+- **`messageOf()`** — the underlying error's message with a fallback, used by the two `ERR_REQUEST_ERROR` sites
+  that had diverged (one reported the real message, the other a generic label).
 - **`isOk()` / `isHttpError()`** — the status predicates were spelled out inline in four places, twice with
   subtly different boundaries.
 - **`elapsedMs()`**, **`mergeRecords()`**, **`mergeHooks()`**, **`usedHooks()`** — small, but each replaced a
@@ -281,9 +312,15 @@ compression — so without the header nothing upstream compresses in the first p
 this to things like `sharp()` which reject anything else.
 
 `acceptEncoding` is computed once at module load from what this runtime's `zlib` actually provides —
-`createZstdDecompress` only exists from node 22.15 and `engines` allows 22.0, so a hardcoded header would
+`createZstdDecompress` only exists from node 22.15 and `engines` allows 22.12, so a hardcoded header would
 advertise an encoding we can't decode. undici degrades to *not* decompressing in that case rather than
 throwing, which would hand callers compressed bytes silently.
+
+**undici's decompress interceptor is still flagged experimental**, so because `decompress` defaults to `true`,
+every consumer gets `ExperimentalWarning: DecompressInterceptor is experimental and subject to change` on stderr
+once per process. Nothing we can suppress from inside a library without hiding the caller's own warnings, so it is
+documented in the README (with `decompress: false` and `--disable-warning=ExperimentalWarning` as the outs) rather
+than worked around. Worth re-checking whenever undici is bumped — if it graduates, the README note goes.
 
 `response.rawBody` is a lazy getter, not an eager field: text and JSON go through undici's optimised
 `body.text()`, and materialising a Buffer per request just in case would cost more than it saves.
@@ -344,6 +381,44 @@ attached at creation — nothing is obliged to await it, and an unhandled reject
 `undici.pipeline` can also reject its arguments synchronously; that is caught and reported on the stream
 (`failedUploadStream`) rather than by rejecting `stream()`, so both paths fail the same way.
 
+#### Every stream failure goes through `normaliseStreamErrors`
+
+`throwHttpErrors` was the *only* stream failure that was ever normalised. Everything else reached the caller as
+undici's own error, with the `beforeError` hooks unrun — while the README promised the opposite. Measured, before
+the fix: a connection refused arrived as a bare `Error`, a `timeout.request` as a **`DOMException` whose `code` is
+the number 23** (so nothing matching on `'ETIMEDOUT'` could see it), and a socket reset part-way through a body as
+a `SocketError`. The bodyless path normalised only its *pre-response* failures, in `callBodylessStream`'s catch;
+the upload path normalised nothing at all, because `duplex.on('error', …)` just forwarded the raw error to
+`rejectHead`.
+
+`normaliseStreamErrors` (via `this.normaliseBodyErrors`) is applied to **both** streams undici hands back, and is
+the only thing between the caller and those raw errors. It works by wrapping `_destroy`:
+
+- **Node emits whatever error the `_destroy` callback is given**, not the one `_destroy` was called with, and that
+  callback may be called asynchronously — which is what makes awaiting the async `beforeError` hooks possible.
+  undici's own `_destroy` still runs first and does its cleanup (aborting the request, destroying `req`/`res`);
+  only the error passed onwards is replaced. Verified against `for await`, an `error` listener, and
+  `stream.pipeline` — all three report the normalised error.
+- **`stream.errored` is put back in step too.** It is public API and Node latches it from the raw error *before*
+  `_destroy` runs, so it would otherwise disagree with the error every listener just saw. This is the one place
+  that touches `_readableState`/`_writableState`, and only ever replaces one `Error` with another.
+- **`normalisedErrors` (a `WeakSet`, populated by `toRequestError`) stops double-wrapping.** The HTTP-error path
+  already builds its error through `toRequestError` and destroys the readable with it; without the set that error
+  would be wrapped again and the hooks fired twice. A `WeakSet` rather than a marker property on the error,
+  because a `beforeError` hook may return any error it likes, including a frozen one.
+- Installed immediately after `undici.pipeline` returns, which is safe because it returns synchronously and every
+  failure it reports is asynchronous. The synchronous-argument-rejection case is the separate
+  `failedUploadStream` path above.
+
+There is a test for each combination — pre-response and mid-body, on each path — plus one asserting `errored` and
+one asserting `stream.pipeline`. The mid-body ones use the `/truncate` route, which announces a `content-length`
+of 1000 and then kills the socket.
+
+**`afterResponse` hooks do not run for streams**, and that is deliberate rather than an oversight: there is no
+parsed body to hand a hook, and a streamed request cannot be replayed, so `retryWithMergedOptions` would have
+nothing to re-send. got scopes `afterResponse` to its promise API for the same reason. Every other hook does fire
+for streams.
+
 ### Timeouts
 
 `timeout.request` sets undici's `headersTimeout` + `bodyTimeout` **and** an `AbortSignal.timeout` deadline
@@ -359,11 +434,27 @@ undici's own timeout errors are still mapped, since they give the more specific 
 The deadline reports itself as a `TimeoutError` DOMException, which lands on the same `TimeoutError`/`ETIMEDOUT`
 as everything else.
 
+**`timeout.request` must be finite and above zero**, not merely non-negative. The validator used to accept both
+excluded values and each then misbehaved silently:
+- `0` made `AbortSignal.timeout(0)` fire immediately and fail *every* request, while undici reads its own
+  `bodyTimeout: 0` as **disabled** — one option meaning two opposite things, and a total outage for anyone writing
+  `timeout: {request: config.timeout ?? 0}`.
+- `Infinity` made `AbortSignal.timeout` throw a `RangeError` from inside `dispatchOptions`, which landed in the
+  generic catch and surfaced as an opaque `ERR_REQUEST_ERROR`.
+
+Leaving the option off is how you get no timeout.
+
 ### extend()
 
 `extend()` returns a **new** `Gotlike` built from `{...baseOptions, ...options}` with headers merged and handler
 arrays concatenated. Because the constructor re-evaluates the agent options, extending with `retry`/`http2`/etc.
 creates a fresh dispatcher.
+
+**The merge helpers always allocate, even when only one side has a value.** `mergeRecords`, `concatHooks` and
+`mergeHooks` used to return `base` unchanged when the override was absent, which handed the child the parent's own
+`context` object, `handlers` array and `hooks` object — so a write through `child.baseOptions` mutated the parent
+and every other client extended from it. All three run once per client, so copying costs nothing; this is not the
+hot path, and `formOptions` is what has to stay allocation-conscious.
 
 ### Mocking
 
@@ -385,6 +476,12 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   that path is a string, so behind the function matcher a regex or function path uses for `.query({...})` the
   constraint was dropped entirely and every query matched. `queryMatches` checks it inside the matcher instead;
   `options.query` is only handed to undici when undici is the one that can apply it.
+- **A query *value* may be a RegExp, a predicate or an array**, as it may in nock. All three went through
+  `String(value)`, which turns a RegExp into the literal `"/bar/"` and an array into `"1,2"` — neither of which any
+  real query string can equal, so those interceptors silently never matched. `queryValueMatches` handles each
+  shape, and `isSerialisableQuery` keeps a RegExp or predicate value away from undici, which would serialise it
+  into its stored path. The entry count is compared against the flattened expectation, so a repeated key is only
+  satisfied by an array of the same length.
 - **`responseOptions` must always be an object**, never `undefined`, or undici throws `UND_ERR_INVALID_ARG`.
 - **`persist()`, `done()` and `isDone()` live on the `Scope`**, which is where nock's docs put them —
   `nock(host).persist().get('/')` and `scope.done()`. `isDone()` filters `pendingInterceptors()` by the scope's
@@ -392,7 +489,8 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
 - **Reply callbacks** are translated from undici's `(opts) => {statusCode, data, responseOptions}` to nock's
   `function (uri, requestBody) => [status, body, headers]` with `this.req.headers`. The request body is
   JSON-parsed when the content-type says so, as nock does.
-- `cleanAll()` needs the `pools` map — `MockAgent` has no global clear, only `cleanMocks()` per pool.
+- `cleanAll()` needs the `pools` map — `MockAgent` has no global clear, only `cleanMocks()` per pool. It clears the
+  map afterwards as well, so it doesn't just grow for the lifetime of a suite; `Scope` re-fetches from the agent.
 
 `src/nock.spec.ts` covers all of this, with the aggregator's actual patterns (pragmatic's base path + regex,
 amigo's `.query(true)`, spribe's capture-via-`reply(function)`) as named tests.
@@ -400,9 +498,15 @@ amigo's `.query(true)`, spribe's capture-via-`reply(function)`) as named tests.
 ### Tests
 
 `index.spec.ts` boots a real `http.createServer` on port 3000 in `test.before` with route-based behaviors
-(`/json`, `/timeout`, `/stream`, `/headers`, `/status?code=`, `/redirect`, `/retry`). The `/retry` route counts
-hits per `test-id` header — pass a unique `test-id` (e.g. `randomUUID()`) for retry tests so counters don't leak
-between them. Uses `node:test` + `node:assert`, flat `test(...)` calls, no framework.
+(`/json`, `/timeout`, `/stream`, `/headers`, `/status?code=`, `/redirect`, `/retry`, `/truncate`). The `/retry`
+route counts hits per `test-id` header — pass a unique `test-id` (e.g. `randomUUID()`) for retry tests so counters
+don't leak between them. `/truncate` announces a `content-length` of 1000, writes 7 bytes and then destroys the
+socket: that is how the mid-body stream failures are provoked, since the response *head* has to arrive normally
+for the failure to land where `normaliseStreamErrors` has to catch it. Uses `node:test` + `node:assert`, flat
+`test(...)` calls, no framework.
+
+Connection-failure tests point at `http://127.0.0.1:1`, not an unroutable address — a refused connection is
+immediate, whereas a blackholed one waits out the connect timeout.
 
 **Retry tests set `backoffLimit: 10`** unless the wait itself is what's under test. undici's
 backoff is `min(minTimeout * factor ** n, maxTimeout)` — and `min(retryAfter, maxTimeout)` when the
@@ -442,7 +546,12 @@ undici, that is a measurement artefact, not a result. Env knobs: `BENCH_DURATION
 
 ## Lint, format, typecheck
 
-`npm run check` runs typecheck → lint → format check → tests, and is what CI runs.
+`npm run check` runs typecheck → lint → format check → tests. CI runs it, then `npm run build` — `check`
+typechecks with `noEmit`, which can't catch a declaration-emit failure.
+
+`benchmark/` is linted by `npm run lint` but is **not** typechecked by `check`, because doing so needs both
+`npm install` inside `benchmark/` (for `got`) and a built `dist/` for its `../dist` import. `npm --prefix benchmark
+run typecheck` does it on demand and handles the build itself.
 
 - **oxlint** (`.oxlintrc.json`) with `correctness: error`, `suspicious`/`pedantic` as warnings. Rules turned
   off are listed with a reason where it isn't obvious — `unicorn/no-useless-undefined` in particular, because

@@ -134,17 +134,65 @@ function matchPath(matcher: PathMatcher, path: string): boolean {
   return matcher.test(path);
 }
 
+/**
+ * Match one expected query value against what arrived. nock allows a RegExp or a function
+ * here, and an array for a repeated key - `String(value)` alone turned a RegExp into the
+ * literal `"/bar/"` and an array into `"1,2"`, neither of which could ever match.
+ */
+function queryValueMatches(actual: URLSearchParams, name: string, expected: unknown): boolean {
+  if (Array.isArray(expected)) {
+    const values = actual.getAll(name);
+
+    return values.length === expected.length && expected.every((item, i) => values[i] === String(item));
+  }
+
+  const value = actual.get(name);
+
+  if (value === null) {
+    return false;
+  }
+
+  if (expected instanceof RegExp) {
+    return expected.test(value);
+  }
+
+  if (typeof expected === 'function') {
+    return Boolean((expected as (v: string) => unknown)(value));
+  }
+
+  return value === String(expected);
+}
+
 /** nock's default is an exact match: every param the interceptor named, and nothing else. */
 function queryMatches(requestPath: string, expected: Record<string, any>): boolean {
   const index = requestPath.indexOf('?');
   const actual = new URLSearchParams(index === -1 ? '' : requestPath.slice(index + 1));
   const names = Object.keys(expected);
 
-  if (actual.size !== names.length) {
+  // Counted over entries, so a repeated key is only satisfied by an array expectation of
+  // the same length.
+  const arrayValues = names.reduce(
+    (total, name) => total + (Array.isArray(expected[name]) ? expected[name].length : 1),
+    0,
+  );
+
+  if (actual.size !== arrayValues) {
     return false;
   }
 
-  return names.every((name) => actual.get(name) === String(expected[name]));
+  return names.every((name) => queryValueMatches(actual, name, expected[name]));
+}
+
+/**
+ * Whether undici can fold this query into its stored path itself. It serialises values, so a
+ * RegExp or a predicate has to be matched by `queryMatches` instead; arrays it handles fine.
+ */
+function isSerialisableQuery(query?: Record<string, any>): boolean {
+  if (!query) {
+    return true;
+  }
+
+  return Object.values(query).every((value) => !(value instanceof RegExp) && typeof value !== 'function');
 }
 
 function queryToObject(query: Record<string, any> | URLSearchParams): Record<string, any> {
@@ -242,7 +290,10 @@ class Interceptor {
     // compares that, which a function matcher would defeat - so those keep an ordinary string
     // path. It can only do that when the path *is* a string, though: behind the function
     // matcher a regex or function path needs, it drops the query and matches every one of them.
-    const undiciAppliesQuery = typeof this.#path === 'string' && !ignoreQuery;
+    //
+    // It also can only do it for values it can serialise. A RegExp or a predicate value
+    // stringifies to nonsense (`"/bar/"`), so those go through `queryMatches` instead.
+    const undiciAppliesQuery = typeof this.#path === 'string' && !ignoreQuery && isSerialisableQuery(query);
 
     const options: MockInterceptor.Options = {
       method: this.#method,
@@ -490,6 +541,10 @@ Object.assign(nock, {
     for (const pool of pools.values()) {
       (pool as unknown as {cleanMocks(): void}).cleanMocks();
     }
+
+    // The pools themselves are done with too - holding them meant the map only ever grew over
+    // a suite's lifetime. `Scope` re-fetches from the agent on the next `nock(...)`.
+    pools.clear();
   },
   abortPendingRequests() {
     // undici has no equivalent; interceptors are removed instead.

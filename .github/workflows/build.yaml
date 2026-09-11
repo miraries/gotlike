@@ -14,3 +14,5 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - run: npm install
       - run: npm run check
+      # `check` typechecks with `noEmit`, which can't catch a declaration-emit failure.
+      - run: npm run build

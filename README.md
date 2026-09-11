@@ -100,6 +100,10 @@ Supports:
 | `validate` | n/a | client-only, like the options above - it is read from the instance, so a per-request value would do nothing |
 | `followRedirect` | `true` | **`false`** - redirects cost ~2µs/request to support, whether or not one happens. Enable per client with `extend({ followRedirect: true })`; a per-request `true` is a `ValidationError`, since composing the interceptor is a create/extend-time decision |
 | `stream()` for a bodyless request | always a `Duplex` | a **`Readable`** - nothing can be written to a GET, and the duplex wrapper cost ~10% of stream throughput |
+| `stream()` and `afterResponse` | promise API only | **same** - there is no parsed body to hand over and no way to replay a streamed request. Every other hook does fire for streams |
+| `prefixUrl` with an absolute `url` | throws | the **absolute url wins**, silently. `prefixUrl` therefore does *not* pin the host: if `url` can be influenced from outside, validate it yourself |
+| `prefixUrl` with a query or fragment | allowed | a **`ValidationError`** - the prefix is concatenated with `url`, so a `?` on it would land mid-url. Use `searchParams` |
+| `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
 
 ### Forced by undici
 
@@ -218,8 +222,12 @@ const client = gotlike.extend({
 });
 ```
 
-`beforeError` runs for streamed requests too, and a stream's `HTTPError` carries the same
-`error.response` a non-streamed one does.
+`beforeError` runs for streamed requests too - for *every* stream failure, not just an error status
+- and a stream's `HTTPError` carries the same `error.response` a non-streamed one does.
+
+`afterResponse` is the one hook that does **not** run for `stream()`: there is no parsed body to
+hand it, and a streamed request can't be replayed. got scopes it to its promise API for the same
+reason.
 
 `beforeRedirect` and `beforeRetry` **cannot delay or cancel** the redirect or retry - undici decides
 both inside a synchronous dispatch interceptor, so a promise returned from them is not awaited. They
@@ -228,6 +236,10 @@ are for logging, metrics, and (for `beforeRedirect`) adjusting `request.headers`
 `retryWithMergedOptions` re-runs the request with `newOptions` merged over the ones it was sent
 with (`headers` and `context` merge one level deep, everything else is replaced). It goes straight
 back to the request - handlers already ran and are not re-entered.
+
+A body is *replaced*, not merged: passing any of `json`, `body` or `form` drops the other two and
+the `content-type` that described the old one, so a retry can change a json body to a form. Passing
+none keeps the first attempt's body and its `content-type`, which is what a token refresh wants.
 
 ## Mocking
 
@@ -310,6 +322,13 @@ advertised, since nothing uses them.
 
 Set `decompress: false` on create/extend to skip the interceptor and send no `accept-encoding`.
 
+> [!NOTE]
+> undici's decompress interceptor is still flagged experimental, so node prints
+> `ExperimentalWarning: DecompressInterceptor is experimental and subject to change` the first
+> time a client uses it - which, since decompression is on by default, means once per process.
+> It is harmless. Silence it with `decompress: false`, or with node's
+> `--disable-warning=ExperimentalWarning`.
+
 ## Errors
 
 Failures are normalised to a `RequestError` subclass, all of which stay `instanceof RequestError`:
@@ -322,11 +341,19 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 | `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
 | `RequestError` | `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
 
-The originating error is kept as `error.cause`.
+`error.message` is the underlying failure's own - `connect ECONNREFUSED 127.0.0.1:443`,
+`getaddrinfo ENOTFOUND …` - not a generic label, so a log line or an APM grouping can tell one
+transport failure from another. The originating error is also kept as `error.cause`.
 
 `error.response` is a full response - parsed `body`, `headers`, `statusCode`, `ok`, `retryCount`,
 `timings` and `request.options` - and is `undefined` only when the request failed before a response
 arrived. On a parse failure `response.body` is the raw text that failed to parse.
+
+**Streams fail the same way.** Both stream paths raise these same classes with the `beforeError`
+hooks applied, whether the failure came before the response head (connection refused, a
+`timeout.request`), from the status (`throwHttpErrors`), or part-way through the body (a truncated
+download). `stream.errored`, the `error` event, `stream.response` and `stream.pipeline` all report
+the identical normalised error - undici's raw `SocketError`/`DOMException` never reaches you.
 
 ## Bodyless responses
 
