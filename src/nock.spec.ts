@@ -247,6 +247,84 @@ test('an array query value is not satisfied by a single occurrence', async () =>
   assertUnmatched(missed, 'one value should not satisfy a two-element expectation');
 });
 
+/*
+ * A RegExp or a predicate is legal inside a repeated key too, not just as a bare value.
+ * `String(/news/)` is the literal `"/news/"`, which no query string can equal - and because
+ * only top-level values were checked for one, the expectation was also handed to undici to
+ * fold into its stored path, where it stringified the same way.
+ */
+test('an array query value accepts a regex and a predicate', async () => {
+  nock('http://mock.test')
+    .get('/arr-re')
+    .query({tags: [/^new/, (value: string) => value.endsWith('ates')]})
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/arr-re', {searchParams: {tags: ['news', 'updates']}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a regex inside an array query value still has to match', async () => {
+  nock('http://mock.test')
+    .get('/arr-re')
+    .query({tags: [/^new/, 'updates']})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/arr-re', {searchParams: {tags: ['olds', 'updates']}}));
+
+  assertUnmatched(missed, 'a value the regex rejects should not match');
+});
+
+/*
+ * nock's `.query(fn)` form: one predicate over the whole parsed query rather than a value at
+ * a time, exactness included. It was accepted and then never consulted - the expectation went
+ * to undici, which serialised a function into its stored path, so nothing ever matched and the
+ * request fell through to the real network.
+ */
+test('query accepts a predicate over the whole query', async () => {
+  const seen: Array<Record<string, string | string[]>> = [];
+
+  nock('http://mock.test')
+    .get('/whole')
+    .query((query) => {
+      seen.push(query);
+
+      return query.page === '1';
+    })
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/whole', {searchParams: {page: '1', extra: 'ignored'}});
+
+  assert.strictEqual(response.body, 'matched');
+  // Handed the whole query, so it can be as strict or as loose as it likes - unlike the
+  // object form, an unnamed `extra` is the predicate's business rather than a mismatch.
+  // undici consults a path matcher more than once per dispatch, so only the first call is
+  // asserted; a nock predicate is expected to be a pure question either way.
+  assert.deepStrictEqual(seen[0], {page: '1', extra: 'ignored'});
+});
+
+test('a query predicate that says no does not match', async () => {
+  nock('http://mock.test')
+    .get('/whole')
+    .query((query) => query.page === '1')
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/whole', {searchParams: {page: '2'}}));
+
+  assertUnmatched(missed, 'a query the predicate rejects should not match');
+});
+
+test('a query predicate sees a repeated key as an array', async () => {
+  nock('http://mock.test')
+    .get('/whole-arr')
+    .query((query) => Array.isArray(query.id) && query.id.length === 2)
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/whole-arr', {searchParams: {id: ['1', '2']}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
 test('a plain path does not match a request carrying a query', async () => {
   nock('http://mock.test').get('/strict').reply(200, 'matched');
 
@@ -434,6 +512,21 @@ test('body matcher constrains matching', async () => {
   const response = await client.post('http://mock.test/exact-body', {json: {a: 1}});
 
   assert.strictEqual(response.body, 'matched');
+});
+
+/*
+ * Exact means the field has to be *there*, not merely read back the same. `{a: undefined}`
+ * matched a body of `{b: 'foo'}`: the key counts agreed, and `actual.a` was `undefined` for
+ * the same reason any absent property is. An unmatched interceptor falls through to the real
+ * network, so a false positive here is the less dangerous half of the bug - the danger is the
+ * matcher agreeing to something it was never shown.
+ */
+test('an undefined expected field is not satisfied by an absent one', async () => {
+  nock('http://mock.test').post('/undef', {a: undefined}).reply(200, 'matched');
+
+  const missed = await failure(client.post('http://mock.test/undef', {json: {b: 'foo'}}));
+
+  assertUnmatched(missed, 'a body naming none of the expected fields should not match');
 });
 
 test('cleanAll removes pending interceptors across origins', async () => {

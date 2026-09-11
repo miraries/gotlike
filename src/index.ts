@@ -738,20 +738,26 @@ const hookNames = ['beforeRequest', 'afterResponse', 'beforeError', 'beforeRetry
 
 /** Concatenates every hook array, so extending a client adds to its hooks rather than replacing them. */
 function mergeHooks(base?: Hooks, override?: Hooks): Hooks | undefined {
-  if (!base) {
-    return override;
+  if (!base && !override) {
+    return undefined;
   }
 
-  // No early return for an absent override: `concatHooks` below copies each array, which
-  // returning `base` would skip - leaving the child sharing the parent's `hooks` object and
-  // every array in it.
+  /*
+   * No early return for either side being absent: `concatHooks` below copies each array, and
+   * returning one side unchanged skips that. Returning `base` left the child sharing the
+   * parent's `hooks` object and every array in it; returning `override` - which is what
+   * extending a *hookless* client did, the default singleton included - handed the child the
+   * caller's own object, so a later `hooks.beforeRequest.push(...)` added a hook to a client
+   * that had already been built. Both directions contradict what this file promises about
+   * extend(), and the second was the likelier one to hit, since most parents have no hooks.
+   */
   const merged: Hooks = {};
 
   for (const name of hookNames) {
     // Assigned through a cast because each hook name has its own signature; `concatHooks`
     // is generic over the element type and the names do not unify.
     (merged as Record<string, unknown[] | undefined>)[name] = concatHooks(
-      base[name] as unknown[] | undefined,
+      base?.[name] as unknown[] | undefined,
       override?.[name] as unknown[] | undefined,
     );
   }
@@ -766,7 +772,10 @@ function usedHooks<T>(hooks?: T[]): T[] | undefined {
 
 function concatHooks<T>(base?: T[], added?: T[]): T[] | undefined {
   if (!base) {
-    return added;
+    // Copied, not handed back: the array the caller passed to `extend()` stayed live inside
+    // the client (`usedHooks` doesn't copy either), so pushing to it afterwards changed the
+    // client's hooks or handlers underneath it.
+    return added && [...added];
   }
 
   // A fresh array either way, so an extended client never shares the parent's: pushing onto
@@ -907,7 +916,10 @@ export class RequestError<T = unknown> extends Error {
     options: RequestOptions,
     response?: Response<T>,
   ) {
-    super(message, error instanceof Error ? {cause: error} : undefined);
+    // Any value may be a `cause`, not only an `Error` - and a hook is allowed to
+    // `throw 'Unauthorized'`, which used to arrive with `cause` unset. Still omitted entirely
+    // when there is no underlying error, rather than set to `undefined` as an own property.
+    super(message, error === undefined ? undefined : {cause: error});
 
     this.code = code ?? 'ERR_GOT_REQUEST_ERROR';
     this.response = response;
@@ -1681,6 +1693,16 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      * code was right to trust them; this is what makes that true.
      */
     const merged: RequestOptions = options ? {...defaultOptions, ...options} : {...defaultOptions};
+
+    /*
+     * The same copies `extend()` makes, because a directly built client reached them by a
+     * shallow spread and so kept the caller's own `hooks` object and arrays live inside it -
+     * `usedHooks` doesn't copy either. Pushing to the array that was handed to
+     * `createClient({hooks})` afterwards added a hook to a client that was already built.
+     * Create-time only, and both helpers hand back `undefined` for an absent side.
+     */
+    merged.hooks = mergeHooks(undefined, merged.hooks);
+    merged.handlers = concatHooks(undefined, merged.handlers);
 
     this.baseOptions = merged;
     this.followsRedirects = merged.followRedirect === true;

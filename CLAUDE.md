@@ -610,11 +610,17 @@ creates a fresh dispatcher.
 `retry` is shallow-merged rather than replaced: `extend({retry: {limit: 5}})` used to drop the parent's
 `statusCodes`/`methods` with it, silently widening what got retried.
 
-**The merge helpers always allocate, even when only one side has a value.** `mergeRecords`, `concatHooks` and
-`mergeHooks` used to return `base` unchanged when the override was absent, which handed the child the parent's own
-`context` object, `handlers` array and `hooks` object — so a write through `child.baseOptions` mutated the parent
-and every other client extended from it. All three run once per client, so copying costs nothing; this is not the
-hot path, and `formOptions` is what has to stay allocation-conscious.
+**The merge helpers always allocate, whichever side has a value — and so does the constructor.** `mergeRecords`,
+`concatHooks` and `mergeHooks` used to return `base` unchanged when the override was absent, which handed the child
+the parent's own `context` object, `handlers` array and `hooks` object — so a write through `child.baseOptions`
+mutated the parent and every other client extended from it. The mirror image lasted longer and was easier to hit:
+with no `base` they returned the *override* unchanged, which is what extending a hookless client does — the
+exported singleton included — so the `hooks` object and array handed to `extend()` stayed live inside the client,
+and a later `hooks.beforeRequest.push(...)` added a hook to a client that was already built. `usedHooks` doesn't
+copy either, so there was nothing downstream to catch it. The constructor had the same hole by a different route,
+since `{...defaultOptions, ...options}` is shallow; it now runs `hooks` and `handlers` through the same two helpers.
+All of this happens once per client, so copying costs nothing; this is not the hot path, and `formOptions` is what
+has to stay allocation-conscious.
 
 ### Mocking
 
@@ -642,6 +648,20 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   shape, and `isSerialisableQuery` keeps a RegExp or predicate value away from undici, which would serialise it
   into its stored path. The entry count is compared against the flattened expectation, so a repeated key is only
   satisfied by an array of the same length.
+- **A RegExp or predicate *inside* an array counts too**, on both sides of that. The array branch compared
+  `values[i] === String(item)`, and `isSerialisableQuery` only looked at top-level values — so `{tags: [/news/,
+  'updates']}` was both matched by stringifying the regex and handed to undici to stringify again.
+  `queryLeafMatches` is the one place a single expected value is applied, shared by the array and scalar branches.
+- **`.query(fn)` is a predicate over the whole parsed query**, repeated keys as arrays, and decides exactness for
+  itself. nock has this form; it used to be neither typed nor applied, so the function went to undici as if it
+  were an expectation object, serialised into the stored path, and matched nothing — which means the request went
+  to the real network. `isSerialisableQuery` rejects a function outright, which is what routes it to
+  `queryMatches`. A predicate is consulted more than once per dispatch, since undici applies a path matcher
+  several times; nock's are pure questions, so that is left alone.
+- **An expected body field has to be *present*, not merely read back equal.** `bodyValueMatches` compared
+  `expected[key]` with `actual[key]` behind a key-count check, so `{a: undefined}` matched a body of `{b: 'foo'}`:
+  the counts agreed and an absent property reads as `undefined` just as the expectation did. `Object.hasOwn`
+  guards it now.
 - **An object/array body matcher has to become a function matcher.** undici compares a non-RegExp, non-function
   `body` with `===`, so nock's most common form — `nock(host).post('/p', {a: 1})` — never matched anything, and
   because an unmatched interceptor falls through to the *real network*, a test written that way quietly made a
@@ -675,6 +695,10 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   it at module load; `activate()` re-installs the mock.
 - `cleanAll()` needs the `pools` map — `MockAgent` has no global clear, only `cleanMocks()` per pool. It clears the
   map afterwards as well, so it doesn't just grow for the lifetime of a suite; `Scope` re-fetches from the agent.
+  undici's own client map is *not* cleared by this and keeps one `MockClient` per origin ever mocked — measured, 50
+  origins leaves 50 behind a `cleanAll()`. Only `mockAgent.close()` empties it, which would end mocking altogether,
+  and the map is behind a private symbol. Left alone deliberately: it is a test-time retention with no effect on
+  matching, and reaching into undici's internals to fix it costs more than it buys.
 
 `src/nock.spec.ts` covers all of this, with the aggregator's actual patterns (pragmatic's base path + regex,
 amigo's `.query(true)`, spribe's capture-via-`reply(function)`) as named tests.

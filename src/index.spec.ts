@@ -771,6 +771,49 @@ test('extend does not let a child share the parent’s handlers, hooks or contex
   assert.strictEqual(parent.baseOptions.context!.tenant, 'parent');
 });
 
+/*
+ * The other direction of the same guarantee, and the likelier one to hit: extending a client
+ * that has *no* hooks or handlers of its own - the default singleton included - took the
+ * early return and handed the child the caller's own `hooks` object and arrays. Nothing
+ * copies them after that (`usedHooks` doesn't), so the array passed to `extend()` stayed live
+ * inside the client and a later `push` added a hook to a client that was already built.
+ */
+test('extend does not keep the caller’s own hooks or handlers live', async () => {
+  const calls: string[] = [];
+  const hooks = {beforeRequest: [() => void calls.push('first')]};
+  const handlers: HandlerFunction[] = [(options, next) => next(options)];
+
+  const child = client.extend({hooks, handlers});
+
+  assert.notStrictEqual(child.baseOptions.hooks, hooks);
+  assert.notStrictEqual(child.baseOptions.hooks?.beforeRequest, hooks.beforeRequest);
+  assert.notStrictEqual(child.baseOptions.handlers, handlers);
+
+  hooks.beforeRequest.push(() => void calls.push('added afterwards'));
+  handlers.push((options, next) => next(options));
+
+  await child.get('http://localhost:3000/json');
+
+  assert.deepStrictEqual(calls, ['first']);
+  assert.strictEqual(child.baseOptions.handlers!.length, 1);
+});
+
+/** The same, for a client built directly - which reached its hooks by a plain spread. */
+test('a directly built client does not keep the caller’s own hooks live', async () => {
+  const calls: string[] = [];
+  const hooks = {beforeRequest: [() => void calls.push('first')]};
+
+  const built = new Gotlike({hooks});
+
+  assert.notStrictEqual(built.baseOptions.hooks, hooks);
+
+  hooks.beforeRequest.push(() => void calls.push('added afterwards'));
+
+  await built.get('http://localhost:3000/json');
+
+  assert.deepStrictEqual(calls, ['first']);
+});
+
 test('extend client with hook', async () => {
   const extClient = client.extend({
     hooks: {
@@ -4168,6 +4211,17 @@ test('a beforeRequest hook throwing a non-Error still fails as a RequestError', 
   assert.ok(error instanceof RequestError);
   assert.strictEqual(error.message, 'plain string failure');
   assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+  // Any value may be a `cause`, not only an `Error`. It used to be dropped for a thrown
+  // primitive, which is the one case where the thrown value is all there is to keep.
+  assert.strictEqual(error.cause, 'plain string failure');
+});
+
+// The other half: no underlying error means no `cause` at all, not one set to `undefined`.
+test('an http error has no cause property', async () => {
+  const error = await failure(client.get('http://localhost:3000/status?code=500'));
+
+  assert.ok(error instanceof RequestError);
+  assert.strictEqual('cause' in error, false);
 });
 
 test('a beforeRequest hook throwing null still fails as a RequestError', async () => {

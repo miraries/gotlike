@@ -33,7 +33,13 @@ type PathMatcher = string | RegExp | ((path: string) => boolean);
 type BodyMatcher = string | RegExp | Record<string, any> | unknown[] | ((body: string) => boolean);
 
 /** `true` matches any query string, an object matches those exact params. */
-type QueryMatcher = boolean | Record<string, any> | URLSearchParams;
+type QueryMatcher = boolean | Record<string, any> | URLSearchParams | QueryPredicate;
+
+/** nock's `.query(fn)`: the whole parsed query at once, repeated keys as arrays. */
+type QueryPredicate = (query: Record<string, string | string[]>) => boolean;
+
+/** What `queryMatches` is asked to apply: per-key expectations, or one predicate. */
+type QueryExpectation = Record<string, any> | QueryPredicate;
 
 export type Options = {
   reqheaders?: Record<string, HeaderMatcher>;
@@ -124,11 +130,16 @@ function bodyValueMatches(expected: unknown, actual: unknown): boolean {
     const expectedKeys = Object.keys(expected);
     const actualKeys = Object.keys(actual as object);
 
-    // Exact, as nock's object body matching is: every field named and nothing besides.
+    // Exact, as nock's object body matching is: every field named and nothing besides -
+    // and the field has to be *there*. Reading it and comparing was not the same thing:
+    // `{a: undefined}` matched a body of `{b: 'foo'}`, because the key counts agreed and
+    // `actual.a` read back as `undefined` just as the expectation did.
     return (
       expectedKeys.length === actualKeys.length &&
-      expectedKeys.every((key) =>
-        bodyValueMatches((expected as Record<string, unknown>)[key], (actual as Record<string, unknown>)[key]),
+      expectedKeys.every(
+        (key) =>
+          Object.hasOwn(actual as object, key) &&
+          bodyValueMatches((expected as Record<string, unknown>)[key], (actual as Record<string, unknown>)[key]),
       )
     );
   }
@@ -215,7 +226,7 @@ function buildPathMatcher(
   basePath: string,
   path: PathMatcher,
   ignoreQuery: boolean,
-  expectedQuery?: Record<string, any>,
+  expectedQuery?: QueryExpectation,
 ): string | ((path: string) => boolean) {
   if (typeof path === 'string' && !ignoreQuery && !expectedQuery && !basePath) {
     return path;
@@ -266,15 +277,18 @@ function queryValueMatches(actual: URLSearchParams, name: string, expected: unkn
   if (Array.isArray(expected)) {
     const values = actual.getAll(name);
 
-    return values.length === expected.length && expected.every((item, i) => values[i] === String(item));
+    // Through the same leaf matcher as a single value: a RegExp or a predicate is legal
+    // inside a repeated key too, and comparing `String(/news/)` could only ever fail.
+    return values.length === expected.length && expected.every((item, i) => queryLeafMatches(values[i]!, item));
   }
 
   const value = actual.get(name);
 
-  if (value === null) {
-    return false;
-  }
+  return value !== null && queryLeafMatches(value, expected);
+}
 
+/** One expected query value against one that arrived, with nock's leaf matchers. */
+function queryLeafMatches(value: string, expected: unknown): boolean {
   if (expected instanceof RegExp) {
     return expected.test(value);
   }
@@ -287,9 +301,15 @@ function queryValueMatches(actual: URLSearchParams, name: string, expected: unkn
 }
 
 /** nock's default is an exact match: every param the interceptor named, and nothing else. */
-function queryMatches(requestPath: string, expected: Record<string, any>): boolean {
+function queryMatches(requestPath: string, expected: QueryExpectation): boolean {
   const index = requestPath.indexOf('?');
   const actual = new URLSearchParams(index === -1 ? '' : requestPath.slice(index + 1));
+
+  // `.query(fn)` is handed the whole parsed query and decides for itself, exactness included.
+  if (typeof expected === 'function') {
+    return Boolean(expected(searchParamsToObject(actual)));
+  }
+
   const names = Object.keys(expected);
 
   // Counted over entries, so a repeated key is only satisfied by an array expectation of
@@ -310,37 +330,50 @@ function queryMatches(requestPath: string, expected: Record<string, any>): boole
  * Whether undici can fold this query into its stored path itself. It serialises values, so a
  * RegExp or a predicate has to be matched by `queryMatches` instead; arrays it handles fine.
  */
-function isSerialisableQuery(query?: Record<string, any>): boolean {
+function isSerialisableQuery(query?: QueryExpectation): boolean {
   if (!query) {
     return true;
   }
 
-  return Object.values(query).every((value) => !(value instanceof RegExp) && typeof value !== 'function');
-}
-
-function queryToObject(query: Record<string, any> | URLSearchParams): Record<string, any> {
-  if (query instanceof URLSearchParams) {
-    const object: Record<string, string | string[]> = {};
-
-    // Not `Object.fromEntries`, which keeps only the last of a repeated key - so
-    // `.query(new URLSearchParams('a=1&a=2'))` silently became `{a: '2'}` and matched the wrong
-    // requests. `queryValueMatches` already understands an array.
-    for (const [key, value] of query.entries()) {
-      const existing = object[key];
-
-      if (existing === undefined) {
-        object[key] = value;
-      } else if (Array.isArray(existing)) {
-        existing.push(value);
-      } else {
-        object[key] = [existing, value];
-      }
-    }
-
-    return object;
+  // A predicate over the whole query is never undici's to apply.
+  if (typeof query === 'function') {
+    return false;
   }
 
-  return query;
+  // Inside an array as well as at the top level - undici serialises each element, so a
+  // `{tags: [/news/, 'updates']}` slipped past a top-level-only check and was handed over.
+  return Object.values(query).every((value) =>
+    (Array.isArray(value) ? value : [value]).every((item) => !(item instanceof RegExp) && typeof item !== 'function'),
+  );
+}
+
+function queryToObject(query: QueryExpectation | URLSearchParams): QueryExpectation {
+  return query instanceof URLSearchParams ? searchParamsToObject(query) : query;
+}
+
+/**
+ * A `URLSearchParams` as the plain object nock deals in.
+ *
+ * Not `Object.fromEntries`, which keeps only the last of a repeated key - so
+ * `.query(new URLSearchParams('a=1&a=2'))` silently became `{a: '2'}` and matched the wrong
+ * requests. `queryValueMatches` and `.query(fn)` both understand an array.
+ */
+function searchParamsToObject(query: URLSearchParams): Record<string, string | string[]> {
+  const object: Record<string, string | string[]> = {};
+
+  for (const [key, value] of query.entries()) {
+    const existing = object[key];
+
+    if (existing === undefined) {
+      object[key] = value;
+    } else if (Array.isArray(existing)) {
+      existing.push(value);
+    } else {
+      object[key] = [existing, value];
+    }
+  }
+
+  return object;
 }
 
 class Interceptor {
@@ -376,6 +409,10 @@ class Interceptor {
     this.#headers = {...options?.reqheaders};
   }
 
+  /**
+   * nock's `.query()`: an object or `URLSearchParams` of expected params, `true` to ignore the
+   * query entirely, or a predicate handed the whole parsed query (repeated keys as arrays).
+   */
   query(matcher: QueryMatcher = true): this {
     this.#query = matcher;
 
@@ -432,7 +469,8 @@ class Interceptor {
     // matcher a regex or function path needs, it drops the query and matches every one of them.
     //
     // It also can only do it for values it can serialise. A RegExp or a predicate value
-    // stringifies to nonsense (`"/bar/"`), so those go through `queryMatches` instead.
+    // stringifies to nonsense (`"/bar/"`), so those go through `queryMatches` instead - as
+    // does `.query(fn)`, which is a predicate over the whole query rather than a value at all.
     const undiciAppliesQuery = typeof this.#path === 'string' && !ignoreQuery && isSerialisableQuery(query);
 
     const options: MockInterceptor.Options = {
@@ -443,7 +481,9 @@ class Interceptor {
     };
 
     if (query && undiciAppliesQuery) {
-      options.query = query;
+      // `undiciAppliesQuery` is what rules out a predicate here; `isSerialisableQuery` is the
+      // one place that decides, so this narrows by hand rather than repeating the test.
+      options.query = query as Record<string, any>;
     }
 
     return this.#pool.intercept(options);
