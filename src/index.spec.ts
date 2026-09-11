@@ -317,6 +317,16 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  // Lands on `/headers`, so a test can see what the request headers looked like after a hop.
+  if (req.url === '/redirect-headers') {
+    res.statusCode = 302;
+    res.setHeader('Location', '/headers');
+
+    res.end();
+
+    return;
+  }
+
   if (req.url === '/retry-after') {
     // Always fails, and always asks for a 2s wait. A client that honours `Retry-After`
     // cannot get through its retries quickly; one that ignores it races through them.
@@ -439,6 +449,103 @@ test('timeout.request bounds the whole request, not just the gap between chunks'
 
   // The route writes a byte every 250ms for 3s; each gap alone is well inside the timeout.
   assert.ok(elapsedMs < 1500, `expected the trickling body to be cut off, ran for ${elapsedMs}ms`);
+});
+
+/**
+ * Count the deadline timers `timeout.request` arms, and how many are still pending.
+ *
+ * The deadline used to be an `AbortSignal.timeout`, which cannot be cancelled: an abandoned
+ * one is retained until it fires, so a request that finished in 5ms under a 30s timeout held
+ * ~885 bytes for the remaining 29995ms - ~265MB of uncollectable heap at 10k requests/second.
+ * `process.getActiveResourcesInfo()` can't see this, because the timer is unref'd; patching
+ * the global is what makes it observable. `delay` is distinctive so undici's own timers, which
+ * go through the same global, can never be mistaken for the deadline.
+ */
+function countDeadlines(delay: number): {armed: () => number; pending: () => number; restore: () => void} {
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  const live = new Set<unknown>();
+  let armed = 0;
+
+  globalThis.setTimeout = ((callback: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+    const handle = realSetTimeout(callback, ms as number, ...rest);
+
+    if (ms === delay) {
+      live.add(handle);
+      armed++;
+    }
+
+    return handle;
+  }) as typeof globalThis.setTimeout;
+
+  globalThis.clearTimeout = ((handle: Parameters<typeof globalThis.clearTimeout>[0]) => {
+    live.delete(handle);
+
+    return realClearTimeout(handle);
+  }) as typeof globalThis.clearTimeout;
+
+  return {
+    // Asserted alongside `pending`, so reverting to an uncancellable `AbortSignal.timeout` -
+    // which arms no global timer at all - fails these tests instead of passing them vacuously.
+    armed: () => armed,
+    pending: () => live.size,
+    restore: () => {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    },
+  };
+}
+
+test('a settled request cancels its deadline rather than leaving it to expire', async () => {
+  const delay = 28_731;
+  const deadlines = countDeadlines(delay);
+
+  try {
+    const response = await client.get('http://localhost:3000/json', {timeout: {request: delay}});
+
+    assert.strictEqual(response.statusCode, 200);
+    assert.strictEqual(deadlines.armed(), 1, 'the request should have armed a cancellable deadline');
+    assert.strictEqual(deadlines.pending(), 0, 'the deadline should be cancelled once the body has been read');
+  } finally {
+    deadlines.restore();
+  }
+});
+
+test('a failed request cancels its deadline too', async () => {
+  const delay = 28_733;
+  const deadlines = countDeadlines(delay);
+
+  try {
+    const error = await failure(client.get('http://127.0.0.1:1/', {timeout: {request: delay}}));
+
+    assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+    assert.strictEqual(deadlines.armed(), 1, 'the request should have armed a cancellable deadline');
+    assert.strictEqual(deadlines.pending(), 0, 'a connection failure should cancel the deadline as well');
+  } finally {
+    deadlines.restore();
+  }
+});
+
+test('a stream cancels its deadline when the stream closes, not when the head arrives', async () => {
+  const delay = 28_737;
+  const deadlines = countDeadlines(delay);
+
+  try {
+    const stream = await client.stream('http://localhost:3000/stream', {timeout: {request: delay}});
+
+    await stream.response;
+
+    // The body is exactly what the deadline still has to bound at this point: the head has
+    // arrived, but a trickling or truncated body is what `timeout.request` is there to catch.
+    assert.strictEqual(deadlines.armed(), 1, 'the stream should have armed a cancellable deadline');
+    assert.strictEqual(deadlines.pending(), 1, 'the deadline must outlive the response head');
+
+    await text(stream);
+
+    assert.strictEqual(deadlines.pending(), 0, 'the deadline should be cancelled once the stream closes');
+  } finally {
+    deadlines.restore();
+  }
 });
 
 test('a caller signal still aborts when a timeout is also set', async () => {
@@ -2221,6 +2328,34 @@ test('beforeRedirect can restore a header stripped on a cross-origin redirect', 
   });
 
   assert.strictEqual(withHook.body.headers['authorization'], 'Bearer restored');
+});
+
+/**
+ * At a hop undici hands the interceptor its flat `[name, value]` header form, and a
+ * multi-valued header arrives there as an array. `String(['one', 'two'])` flattened it to the
+ * single value `one,two`, so a request carrying an array header went out as two headers before
+ * a redirect and one after it - and only on clients that have a `beforeRedirect` hook, since
+ * nothing else converts those headers at all.
+ */
+test('a multi-valued request header survives a redirect intact', async () => {
+  const extClient = client.extend({
+    followRedirect: true,
+    hooks: {beforeRedirect: [() => {}]},
+  });
+
+  const redirected = await extClient.get<Record<string, string>>('http://localhost:3000/redirect-headers', {
+    headers: {'x-multi': ['one', 'two']},
+    responseType: 'json',
+  });
+
+  const direct = await extClient.get<Record<string, string>>('http://localhost:3000/headers', {
+    headers: {'x-multi': ['one', 'two']},
+    responseType: 'json',
+  });
+
+  // node joins repeated headers with ', '; a single flattened one would read 'one,two'.
+  assert.strictEqual(redirected.body['x-multi'], 'one, two');
+  assert.strictEqual(redirected.body['x-multi'], direct.body['x-multi']);
 });
 
 test('beforeRedirect does not fire when nothing redirects', async () => {

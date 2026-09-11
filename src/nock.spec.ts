@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
+import {getGlobalDispatcher} from 'undici';
 import nock, {type ReplyFunctionResult} from './nock.ts';
 import client, {type RequestError} from './index.ts';
 
@@ -280,6 +281,50 @@ test('reply(function) receives uri, parsed body and this.req.headers', async () 
   assert.strictEqual(capturedHeaders?.['x-signature'], 'abc');
   assert.strictEqual(response.body.code, 200);
   assert.strictEqual(response.headers['x-from'], 'callback');
+});
+
+/**
+ * nock stringifies the request body before the callback ever sees it, so a `Buffer` body that
+ * is json parses just as a string one does. Here it reached the callback as a raw `Buffer`, so
+ * a callback reading `requestBody.amount` got `undefined` against the mock and the right answer
+ * against the real server - which is the one thing a mocking shim must not do.
+ */
+test('reply(function) parses a Buffer request body like nock does', async () => {
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/buffered')
+    .reply(function (_uri, requestBody) {
+      capturedBody = requestBody;
+
+      return [200, 'ok'];
+    });
+
+  await client.post('http://mock.test/buffered', {
+    body: Buffer.from(JSON.stringify({amount: 5})),
+    headers: {'content-type': 'application/json'},
+  });
+
+  assert.deepStrictEqual(capturedBody, {amount: 5});
+});
+
+test('reply(function) hands back a non-json Buffer body as text', async () => {
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/buffered-text')
+    .reply(function (_uri, requestBody) {
+      capturedBody = requestBody;
+
+      return [200, 'ok'];
+    });
+
+  await client.post('http://mock.test/buffered-text', {
+    body: Buffer.from('plain words'),
+    headers: {'content-type': 'text/plain'},
+  });
+
+  assert.strictEqual(capturedBody, 'plain words');
 });
 
 test('reply(function) uri is relative to the base path and keeps the query', async () => {
@@ -629,4 +674,26 @@ test('replies with a json null', async () => {
   const response = await json.get('http://mock.test/null');
 
   assert.strictEqual(response.body, null);
+});
+
+/**
+ * `deactivate()` alone makes the mock pass requests through, which looks like a restore until
+ * the caller had set a dispatcher of their own - a proxy agent, or a pool tuned for their
+ * workload. That one stayed replaced for the lifetime of the process, with nothing to put it
+ * back, because the dispatcher that was global before the import was never kept.
+ */
+test('restore() puts the previous global dispatcher back, and activate() re-installs the mock', () => {
+  const mocked = getGlobalDispatcher();
+
+  nock.restore();
+
+  try {
+    assert.notStrictEqual(getGlobalDispatcher(), mocked, 'restore() should hand the global dispatcher back');
+    assert.strictEqual(nock.isActive(), false);
+  } finally {
+    nock.activate();
+  }
+
+  assert.strictEqual(getGlobalDispatcher(), mocked);
+  assert.strictEqual(nock.isActive(), true);
 });

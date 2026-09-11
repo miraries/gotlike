@@ -227,6 +227,10 @@ const client = gotlike.extend({
 A `beforeRequest` hook may rewrite `options.url`, and the request goes to the url it left. An absolute one is
 used exactly as written, so a signed query survives; a relative one is resolved against `prefixUrl` again.
 
+To change the body from a hook, **write `options.body`** - `json` and `form` have already been serialised into it
+by the time hooks run, as they have in got, so assigning `options.json` there has no effect. `content-length` is
+re-derived from whatever `options.body` ends up as.
+
 `beforeError` runs for streamed requests too - for *every* stream failure, not just an error status
 - and a stream's `HTTPError` carries the same `error.response` a non-streamed one does.
 

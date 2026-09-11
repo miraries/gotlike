@@ -271,6 +271,14 @@ strictly fewer hooks left to run; the depth bound stays as a guard for `retryWit
 **every** failure path, streams included — see Streams — and for anything a `beforeRequest` or `afterResponse`
 hook throws. The `afterResponse` loop was the last uncovered path; it has its own `try` now.
 
+**`json`/`form` are serialised into `options.body` *before* the `beforeRequest` hooks run**, which is where got
+does it too, so a hook that rewrites `options.json` is writing to something already consumed and the original body
+goes out. Measured against got 14, which is *louder* about it rather than different: assigning `options.json` in a
+got hook throws (`Expected value which is undefined, received value of type string`), because got's `json` setter
+asserts that `body` is still unset. **Write `options.body` instead** — that works here, and `content-length` is
+re-derived from it (in got it is not, and the stale length gets the request rejected). Reordering the two to make
+`options.json` writable would be a divergence from got, so it is documented rather than changed.
+
 **The pre-request work in `call()` has its own `try`.** The url resolution, body serialisation and the
 `beforeRequest` hook loop all sit inside it, so a throwing hook (or a circular `json`) becomes a `RequestError`
 with the hook's own message and runs the `beforeError` hooks. It used to reject with the raw error, which meant
@@ -309,8 +317,8 @@ These exist because the same code was written out two or three times, and each c
 forget a field:
 
 - **`dispatchOptions()`** — the options every dispatch shares. `call()`, `callBodylessStream()` and
-  `callStream()` each built this literal by hand. It also owns the `redirects` and `attempts` holders, so no
-  caller recomputes them — and, because it owns `attempts`, the stream paths get retry bookkeeping for free.
+  `callStream()` each built this literal by hand. It also owns the `redirects` and `attempts` holders and the
+  deadline's `release` (see Timeouts), so no caller recomputes them — and, because it owns `attempts`, the stream paths get retry bookkeeping for free.
   They used to get none, which left `beforeRetry` silently unfired and `retryCount` pinned at 0 on a stream
   undici had in fact retried.
 - **`trackDispatches(select, onRedispatch)`** + **`OutcomeHandler`** — one interceptor factory and one
@@ -372,6 +380,11 @@ Two things that cost real debugging and are easy to undo:
 - **At a redirect hop `opts.headers` is undici's flat `[name, value, ...]` array**, not an object. A hook
   writing `headers.authorization` on that array achieves nothing, so `headersToObject` normalises it and the
   result is always assigned back.
+- **A multi-valued header has to survive that conversion as an array.** In the flat form a header's value may
+  itself be an array, and `String(['one', 'two'])` flattened it to the single value `one,two` — so a request
+  carrying `{'x-a': ['one', 'two']}` went out as two headers before a redirect and one after it. A name repeated
+  across the flat array is collected the same way. Only clients with a `beforeRedirect` hook were affected, since
+  nothing else reaches this conversion.
 
 `DecoratorHandler`'s `.d.ts` declares no members even though the runtime class has them, hence the
 `DecoratorHandlerShape` declaration used to type the two methods we override.
@@ -503,8 +516,8 @@ for streams.
 
 ### Timeouts
 
-`timeout.request` sets undici's `headersTimeout` + `bodyTimeout` **and** an `AbortSignal.timeout` deadline
-(`requestSignal`), combined with any caller `signal` via `AbortSignal.any`.
+`timeout.request` sets undici's `headersTimeout` + `bodyTimeout` **and** a deadline signal (`requestSignal`),
+combined with any caller `signal` via `AbortSignal.any`.
 
 The deadline is what actually bounds the request, and it is not optional. undici's two timeouts are per-phase and
 `bodyTimeout` **restarts on every chunk received**, so a response that trickles a byte at a time never trips
@@ -516,13 +529,33 @@ undici's own timeout errors are still mapped, since they give the more specific 
 The deadline reports itself as a `TimeoutError` DOMException, which lands on the same `TimeoutError`/`ETIMEDOUT`
 as everything else.
 
+**The deadline is an `AbortController` plus a cancellable timer, not `AbortSignal.timeout`.** An
+`AbortSignal.timeout` cannot be cancelled, so an abandoned one is retained until it fires: a request that finished
+in 5ms under a 30s timeout held its signal for the remaining 29995ms. Measured at ~885 bytes apiece, which is
+~265MB of uncollectable heap at 10k requests/second — and the longer the timeout, the worse it gets.
+`dispatchOptions` therefore hands back a `release` alongside the signal, and every path calls it:
+
+- `call()` in a `finally` around the dispatch and the body read. `afterResponse` hooks run *outside* it
+  deliberately — they are the caller's own code and were never covered by `timeout.request`.
+- both stream paths on the stream's `close`, not when the head arrives. A trickling or truncated body is exactly
+  what the deadline is there to catch, so it has to outlive the response head; `close` rather than `end` so a
+  failed download releases as surely as a completed one. An unconsumed stream never closes and keeps its
+  deadline, which is correct — that request is still in flight.
+
+The timer is `unref`'d, as `AbortSignal.timeout` is, so a pending deadline never holds the process open. It aborts
+with the same `TimeoutError` DOMException and the same message, so `isTimeoutReason` and anything a caller matches
+on are unchanged. `process.getActiveResourcesInfo()` cannot see an unref'd timer, so the tests patch the global
+`setTimeout`/`clearTimeout` and count; they assert a deadline was *armed* as well as released, so reverting to
+`AbortSignal.timeout` — which arms no global timer at all — fails them rather than passing vacuously.
+
 **`timeout.request` must be finite and above zero**, not merely non-negative. The validator used to accept both
 excluded values and each then misbehaved silently:
 - `0` made `AbortSignal.timeout(0)` fire immediately and fail *every* request, while undici reads its own
   `bodyTimeout: 0` as **disabled** — one option meaning two opposite things, and a total outage for anyone writing
   `timeout: {request: config.timeout ?? 0}`.
-- `Infinity` made `AbortSignal.timeout` throw a `RangeError` from inside `dispatchOptions`, which landed in the
-  generic catch and surfaced as an opaque `ERR_REQUEST_ERROR`.
+- `Infinity` made the then-`AbortSignal.timeout` deadline throw a `RangeError` from inside `dispatchOptions`,
+  which landed in the generic catch and surfaced as an opaque `ERR_REQUEST_ERROR`. The validator is what rules
+  both out now, so neither reaches the timer.
 
 Leaving the option off is how you get no timeout.
 
@@ -589,7 +622,15 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   origin; it used to ask about every origin at once, so an unrelated scope's pending mock made it answer `false`.
 - **Reply callbacks** are translated from undici's `(opts) => {statusCode, data, responseOptions}` to nock's
   `function (uri, requestBody) => [status, body, headers]` with `this.req.headers`. The request body is
-  JSON-parsed when the content-type says so, as nock does.
+  JSON-parsed when the content-type says so, as nock does — and a `Buffer`/`Uint8Array` body is decoded to text
+  first. nock stringifies the body before the callback ever sees it, so `post(url, {body: Buffer.from(json)})`
+  handed the callback a raw `Buffer` here where nock gives the parsed object, and a callback reading
+  `requestBody.id` got `undefined` against the mock and the right answer against the server.
+- **`restore()` puts the previous global dispatcher back**, not just a deactivated mock. `deactivate()` alone
+  makes the mock pass requests through, which looks like a restore until the caller had set a dispatcher of their
+  own — a proxy agent, or a pool tuned for their workload. That one stayed replaced for the lifetime of the
+  process, because the dispatcher that was global before the import was never kept. `originalDispatcher` captures
+  it at module load; `activate()` re-installs the mock.
 - `cleanAll()` needs the `pools` map — `MockAgent` has no global clear, only `cleanMocks()` per pool. It clears the
   map afterwards as well, so it doesn't just grow for the lifetime of a suite; `Scope` re-fetches from the agent.
 

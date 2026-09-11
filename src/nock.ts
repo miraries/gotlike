@@ -1,9 +1,18 @@
 import type {Url} from 'node:url';
-import {MockAgent, setGlobalDispatcher} from 'undici';
+import {getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
 import type {MockInterceptor} from 'undici/types/mock-interceptor.js';
-import type {Interceptable} from 'undici';
+import type {Dispatcher, Interceptable} from 'undici';
 
 const mockAgent = new MockAgent();
+
+/**
+ * Whatever was global before this module replaced it, so `restore()` can put it back.
+ *
+ * `deactivate()` alone makes the mock pass requests through, which looks like a restore until
+ * the caller had set a dispatcher of their own - a proxy agent, or a pool tuned for their
+ * workload. That one stayed replaced for the lifetime of the process.
+ */
+const originalDispatcher: Dispatcher = getGlobalDispatcher();
 
 if (process.env.NOCK_OFF !== 'true') {
   setGlobalDispatcher(mockAgent);
@@ -58,8 +67,17 @@ type ReplyBodyFunction = (this: ReplyContext, uri: string, requestBody: unknown)
 /**
  * nock hands reply callbacks a parsed object when the request looked like JSON, and the
  * raw string otherwise.
+ *
+ * A `Buffer`/`Uint8Array` body is decoded first. nock stringifies the request body before it
+ * ever reaches the callback, so `post(url, {body: Buffer.from(json)})` handed the callback a
+ * raw `Buffer` here where nock gives the parsed object - and a callback reading
+ * `requestBody.id` got `undefined` against the mock and the right answer against the server.
  */
 function parseRequestBody(body: unknown, headers: Record<string, string>): unknown {
+  if (ArrayBuffer.isView(body)) {
+    body = Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString('utf8');
+  }
+
   if (typeof body !== 'string' || body === '') {
     return body;
   }
@@ -654,11 +672,15 @@ Object.assign(nock, {
   active: true,
   activate() {
     mockAgent.activate();
+    setGlobalDispatcher(mockAgent);
 
     this.active = true;
   },
   restore() {
     mockAgent.deactivate();
+    // Put the caller's own dispatcher back, not just a pass-through mock - see
+    // `originalDispatcher`.
+    setGlobalDispatcher(originalDispatcher);
 
     this.active = false;
   },

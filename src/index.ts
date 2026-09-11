@@ -164,7 +164,17 @@ function headersToObject(headers: unknown): IncomingHttpHeaders {
   const object: IncomingHttpHeaders = {};
 
   for (let i = 0; i < headers.length; i += 2) {
-    object[String(headers[i]).toLowerCase()] = String(headers[i + 1]);
+    const name = String(headers[i]).toLowerCase();
+    // A multi-valued header has to survive as an array. `String(['one', 'two'])` flattened it
+    // to the single value `one,two`, so a request carrying `{'x-a': ['one', 'two']}` went out
+    // as two headers before a redirect and one after it - and only for clients that have a
+    // `beforeRedirect` hook, since nothing else reaches this. A name repeated across the flat
+    // array is collected the same way.
+    const raw = headers[i + 1];
+    const value = Array.isArray(raw) ? raw.map(String) : String(raw);
+    const existing = object[name];
+
+    object[name] = existing === undefined ? value : ([] as string[]).concat(existing, value);
   }
 
   return object;
@@ -359,7 +369,31 @@ type UndiciRequestOptions = NonNullable<Parameters<typeof undici.request>[1]> & 
 type UndiciPipelineOptions = NonNullable<Parameters<typeof undici.pipeline>[1]> & InterceptorOptions;
 
 /** The fields both `undici.request` and `undici.pipeline` accept. */
-type SharedDispatchOptions = UndiciRequestOptions & UndiciPipelineOptions;
+type SharedDispatchOptions = UndiciRequestOptions &
+  UndiciPipelineOptions & {
+    /**
+     * Cancels the request deadline's timer. Must be called once the request is settled - for a
+     * stream, once the stream is done rather than once the head has arrived. A no-op when no
+     * `timeout.request` was set. See `requestSignal`.
+     */
+    release: () => void;
+  };
+
+/** The `release` of a request that has no deadline to cancel. */
+const noRelease = (): void => {};
+
+/**
+ * Cancel a stream's deadline once the request is really over.
+ *
+ * `close` rather than `end`: it fires whether the stream finished or was destroyed, so a
+ * failed download releases as surely as a completed one. An unconsumed stream never closes,
+ * and that is correct - the request is still in flight and still wants its deadline.
+ */
+function releaseOnClose(stream: Readable, release: () => void): void {
+  if (release !== noRelease) {
+    stream.once('close', release);
+  }
+}
 
 const emptyContext: Record<string, any> = Object.freeze({});
 
@@ -723,18 +757,33 @@ function concatHooks<T>(base?: T[], added?: T[]): T[] | undefined {
  * It also sidesteps undici's coarse timer wheel (`lib/util/timers.js`, `RESOLUTION_MS = 1000`),
  * which used to round every sub-second timeout up to roughly a second.
  */
-function requestSignal(options: FormedOptions): AbortSignal | undefined {
+function requestSignal(options: FormedOptions): {signal?: AbortSignal; release: () => void} {
   const timeout = options.timeout?.request;
 
   if (timeout === undefined) {
-    return options.signal;
+    return {signal: options.signal, release: noRelease};
   }
 
-  // Reports itself as a `TimeoutError` DOMException, which `call()` already maps to
-  // `TimeoutError`/`ETIMEDOUT` - the same place undici's own timeout errors land.
-  const deadline = AbortSignal.timeout(timeout);
+  // Built from an `AbortController` rather than `AbortSignal.timeout`, which cannot be
+  // cancelled: an abandoned one is retained until its timer fires, so a request that finished
+  // in 5ms under a 30s timeout held its signal for the remaining 29995ms. Measured at ~885
+  // bytes a piece, which is ~265MB of uncollectable heap at 10k requests/second - and the
+  // longer the timeout, the worse it gets. Releasing on settle keeps it to the requests
+  // actually in flight.
+  const controller = new AbortController();
+  const timer = setTimeout(() => {
+    // The same `TimeoutError` DOMException `AbortSignal.timeout` reports, message included, so
+    // `isTimeoutReason` and anything a caller matches on are unchanged.
+    controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+  }, timeout);
 
-  return options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+  // As `AbortSignal.timeout` does: a pending deadline must not hold the process open.
+  timer.unref();
+
+  return {
+    signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
+    release: () => clearTimeout(timer),
+  };
 }
 
 /**
@@ -1918,13 +1967,16 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       options.headers = lowercaseHeaders(options.headers);
     }
 
+    const deadline = requestSignal(options);
+
     return {
       dispatcher: this.agent,
       headers: options.headers,
       method: options.method,
       bodyTimeout: options.timeout?.request,
       headersTimeout: options.timeout?.request,
-      signal: requestSignal(options),
+      signal: deadline.signal,
+      release: deadline.release,
       maxRedirections: this.follows(options) ? maxRedirections : 0,
       // Only when redirects are actually in play. Allocating it for any client that merely
       // *had* a `beforeRedirect` hook meant a per-request object the tracker never read.
@@ -2017,6 +2069,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     let attempts: AttemptState | undefined;
     let redirects: RedirectState | undefined;
     let parseFailed = false;
+    // Cancels the deadline once the body has been read, however that turned out. The stream
+    // paths own theirs, so this stays a no-op on the branch that hands off to them.
+    let release = noRelease;
     let url = '';
 
     /*
@@ -2116,6 +2171,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       attempts = dispatch.attempts;
       // Only allocated when redirects are being followed; records where the chain ended.
       redirects = dispatch.redirects;
+      release = dispatch.release;
 
       const requestOptions: UndiciRequestOptions = {
         ...dispatch,
@@ -2254,6 +2310,11 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         options,
         response,
       );
+    } finally {
+      // The body has been read (or the request has failed), so the deadline has nothing left
+      // to bound. `afterResponse` hooks run after this and are deliberately outside it: they
+      // are the caller's own code and were never covered by `timeout.request`.
+      release();
     }
 
     let response: Response<T> = new GotlikeResponse<T>(
@@ -2349,11 +2410,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     try {
       undiciResponse = await undici.request(options.url as string, dispatch);
     } catch (error) {
+      // Nothing left to bound - the request never got off the ground.
+      dispatch.release();
+
       // Reported through the duplex rather than by rejecting `stream()`, so that both
       // stream paths fail the same way whatever the caller is listening on. Normalised the
       // same way `call()` normalises it, `beforeError` hooks included.
       return asStream(Readable.from([]), undefined, await this.toStreamError(error as Error, options));
     }
+
+    // The body is what the deadline still has to cover: the head has arrived, but a trickling
+    // or truncated body is exactly what `timeout.request` is there to catch. Dumping it below
+    // closes it too, so the error path releases through the same listener.
+    releaseOnClose(undiciResponse.body, dispatch.release);
 
     const retryCount = retriesFrom(dispatch.attempts);
     // Where the response came from, which is not `options.url` once redirects moved it.
@@ -2546,11 +2615,18 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         });
       }) as unknown as GotlikeUploadStream;
     } catch (error) {
+      // Nothing left to bound - the request never got off the ground.
+      dispatch.release();
+
       // `undici.pipeline` can reject its arguments synchronously. Reported on the stream like
       // every other stream failure, rather than by rejecting `stream()` - which is what the
       // bodyless path already did for the same class of error.
       return failedUploadStream(this.toStreamError(error as Error, options));
     }
+
+    // The duplex covers the whole exchange here - upload and download both - so its close is
+    // the moment the deadline stops being needed.
+    releaseOnClose(duplex, dispatch.release);
 
     /*
      * Installed before anything can fail - `undici.pipeline` returns synchronously and every
