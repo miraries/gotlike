@@ -1,6 +1,7 @@
-import {Url} from 'node:url';
+import type {Url} from 'node:url';
 import {MockAgent, setGlobalDispatcher} from 'undici';
-import type {Interceptable, MockInterceptor} from 'undici/types/mock-interceptor';
+import type {MockInterceptor} from 'undici/types/mock-interceptor.js';
+import type {Interceptable} from 'undici';
 
 const mockAgent = new MockAgent();
 
@@ -19,23 +20,32 @@ type BodyMatcher = string | RegExp | ((body: string) => boolean);
 type QueryMatcher = boolean | Record<string, any> | URLSearchParams;
 
 export type Options = {
-  reqheaders?: Record<string, HeaderMatcher>
+  reqheaders?: Record<string, HeaderMatcher>;
 };
 
-type ReplyHeaders = Record<string, string | string[]>;
-type ReplyBody = string | Buffer | Record<string, any> | unknown[] | null;
+export type ReplyHeaders = Record<string, string | string[]>;
+export type ReplyBody = string | Buffer | Record<string, any> | unknown[] | null;
 
 /** nock's `this` inside a reply callback. */
 type ReplyContext = {
   req: {
-    headers: Record<string, string>
-    method: string
-    path: string
-  }
+    headers: Record<string, string>;
+    method: string;
+    path: string;
+  };
 };
 
-type ReplyFunctionResult = [number, ReplyBody?, ReplyHeaders?];
-type ReplyFunction = (this: ReplyContext, uri: string, requestBody: unknown) => ReplyFunctionResult | Promise<ReplyFunctionResult>;
+/**
+ * Exported so an async reply callback can annotate its return: TypeScript infers an array,
+ * not a tuple, through `async () => [200, body]`, and contextual typing doesn't reach inside
+ * the promise.
+ */
+export type ReplyFunctionResult = [number, ReplyBody?, ReplyHeaders?];
+type ReplyFunction = (
+  this: ReplyContext,
+  uri: string,
+  requestBody: unknown,
+) => ReplyFunctionResult | Promise<ReplyFunctionResult>;
 type ReplyBodyFunction = (this: ReplyContext, uri: string, requestBody: unknown) => ReplyBody | Promise<ReplyBody>;
 
 /**
@@ -73,7 +83,11 @@ function stripQuery(path: string): string {
  * undici matches a string `path` against the request path *including* its query string, so
  * anything that has to ignore the query becomes a function matcher.
  */
-function buildPathMatcher(basePath: string, path: PathMatcher, ignoreQuery: boolean): string | ((path: string) => boolean) {
+function buildPathMatcher(
+  basePath: string,
+  path: PathMatcher,
+  ignoreQuery: boolean,
+): string | ((path: string) => boolean) {
   if (typeof path === 'string' && !ignoreQuery && !basePath) {
     return path;
   }
@@ -203,7 +217,7 @@ class Interceptor {
       method: this.#method,
       path: buildPathMatcher(this.#basePath, this.#path, ignoreQuery),
       body: this.#body,
-      headers: Object.keys(this.#headers).length ? this.#headers : undefined,
+      headers: Object.keys(this.#headers).length > 0 ? this.#headers : undefined,
     };
 
     if (this.#query !== undefined && this.#query !== true && this.#query !== false) {
@@ -213,7 +227,7 @@ class Interceptor {
     return this.#pool.intercept(options);
   }
 
-  #applyScopeOptions(mockScope: {times(n: number): any, persist(): any, delay(ms: number): any}): Scope {
+  #applyScopeOptions(mockScope: {times(n: number): any; persist(): any; delay(ms: number): any}): Scope {
     if (this.#times !== undefined) {
       mockScope.times(this.#times);
     }
@@ -229,7 +243,7 @@ class Interceptor {
     return this.#scope;
   }
 
-  #context(opts: {method?: string, path: string, headers?: Record<string, string>}): ReplyContext {
+  #context(opts: {method?: string; path: string; headers?: Record<string, string>}): ReplyContext {
     return {
       req: {
         headers: opts.headers ?? {},
@@ -255,49 +269,39 @@ class Interceptor {
 
     // nock's `.reply(function (uri, requestBody) { return [status, body, headers] })`
     if (typeof responseCodeOrFunction === 'function') {
-      const replyFunction = responseCodeOrFunction;
-
-      return this.#applyScopeOptions(interceptor.reply(async (opts: any) => {
-        const context = this.#context(opts);
-        const [statusCode, data, replyHeaders] = await replyFunction.call(
-          context,
-          this.#uri(opts.path),
-          parseRequestBody(opts.body, context.req.headers),
-        );
-
-        return {
-          statusCode,
-          data: data ?? '',
-          responseOptions: replyHeaders ? {headers: replyHeaders as any} : {},
-        };
-      }));
+      return this.#replyWith(interceptor, responseCodeOrFunction);
     }
 
-    // nock's `.reply(status, function (uri, requestBody) { return body })`
+    // nock's `.reply(status, function (uri, requestBody) { return body })` - the same thing
+    // with the status and headers already decided.
     if (typeof body === 'function') {
+      // `body` narrows to the bare `Function` half of its union, so restate the shape.
       const bodyFunction = body as ReplyBodyFunction;
 
-      return this.#applyScopeOptions(interceptor.reply(async (opts: any) => {
+      return this.#replyWith(interceptor, async function (this: ReplyContext, uri, requestBody) {
+        return [responseCodeOrFunction, await bodyFunction.call(this, uri, requestBody), headers];
+      });
+    }
+
+    return this.#applyScopeOptions(
+      interceptor.reply(responseCodeOrFunction, (body ?? '') as any, headers ? {headers: headers as any} : {}),
+    );
+  }
+
+  /** The single place that builds nock's callback context, parses the body and calls back. */
+  #replyWith(interceptor: MockInterceptor, resolve: ReplyFunction): Scope {
+    return this.#applyScopeOptions(
+      interceptor.reply(async (opts: any) => {
         const context = this.#context(opts);
-        const data = await bodyFunction.call(
+        const [statusCode, data, replyHeaders] = await resolve.call(
           context,
           this.#uri(opts.path),
           parseRequestBody(opts.body, context.req.headers),
         );
 
-        return {
-          statusCode: responseCodeOrFunction,
-          data: data ?? '',
-          responseOptions: headers ? {headers: headers as any} : {},
-        };
-      }));
-    }
-
-    return this.#applyScopeOptions(interceptor.reply(
-      responseCodeOrFunction,
-      (body ?? '') as any,
-      headers ? {headers: headers as any} : {},
-    ));
+        return {statusCode, data: data ?? '', responseOptions: replyHeaders ? {headers: replyHeaders as any} : {}};
+      }),
+    );
   }
 
   replyWithError(error: Error | Record<string, any>): Scope {
@@ -365,7 +369,7 @@ class Scope {
  * Split `https://host:port/base/path` into the origin undici wants and the path prefix
  * every interceptor on the scope should inherit.
  */
-function splitOrigin(basePath: string | RegExp | Url | URL): {origin: string, path: string} {
+function splitOrigin(basePath: string | RegExp | Url | URL): {origin: string; path: string} {
   if (basePath instanceof RegExp) {
     // A regex origin can't carry a base path.
     return {origin: basePath as unknown as string, path: ''};
@@ -431,20 +435,22 @@ Object.assign(nock, {
   },
 });
 
-export default nock as typeof nock & {
-  active: boolean
-  activate(): void
-  restore(): void
-  isActive(): boolean
-  disableNetConnect(): void
-  enableNetConnect(host?: string | RegExp | ((host: string) => boolean)): void
-  pendingMocks(): ReturnType<MockAgent['pendingInterceptors']>
-  cleanAll(): void
-  abortPendingRequests(): void
+type NockApi = typeof nock & {
+  active: boolean;
+  activate(): void;
+  restore(): void;
+  isActive(): boolean;
+  disableNetConnect(): void;
+  enableNetConnect(host?: string | RegExp | ((host: string) => boolean)): void;
+  pendingMocks(): ReturnType<MockAgent['pendingInterceptors']>;
+  cleanAll(): void;
+  abortPendingRequests(): void;
 };
 
-export {
-  mockAgent,
-  Scope,
-  Interceptor,
-};
+export default nock as NockApi;
+
+// Also named, so plain CommonJS `require('gotlike/nock').nock` works - a bare
+// `require()` of an ESM module yields the namespace, not the default export.
+const nockExport = nock as NockApi;
+
+export {nockExport as nock, mockAgent, Scope, Interceptor};

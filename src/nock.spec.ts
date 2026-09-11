@@ -1,9 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert';
-import nock from './nock';
-import client from './index';
+import nock, {type ReplyFunctionResult} from './nock.ts';
+import client, {type RequestError} from './index.ts';
+
+/**
+ * Await something expected to fail and hand back the error.
+ *
+ * `promise.catch(e => e as RequestError)` types as `Response | RequestError`, and quietly
+ * yields a `Response` when the request doesn't fail at all - so a test that stops failing
+ * fails confusingly instead of clearly.
+ */
+async function failure<E extends Error = RequestError>(promise: Promise<unknown>): Promise<E> {
+  try {
+    await promise;
+  } catch (error) {
+    return error as E;
+  }
+
+  throw new assert.AssertionError({message: 'expected the request to fail, but it resolved'});
+}
+
+// Without this an unmatched interceptor falls through to a real DNS lookup, which is both
+// slow and a different failure than "no mock matched".
+nock.disableNetConnect();
 
 const json = client.extend({responseType: 'json', throwHttpErrors: false});
+
+/**
+ * An unmatched interceptor surfaces as a normal request failure; undici's
+ * "Mock dispatch not matched" text is on the cause, not the RequestError's own message.
+ */
+function assertUnmatched(error: RequestError, why: string) {
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR', why);
+  assert.match((error.cause as Error).message, /Mock dispatch not matched|Net connect/, why);
+}
 
 test.afterEach(() => {
   nock.cleanAll();
@@ -43,9 +73,7 @@ test('honours a base path on the scope', async () => {
     .post('/CasinoGameAPI/game/url')
     .reply(200, {gameURL: 'https://example.test/game/1'});
 
-  const response = await json.post<{gameURL: string}>(
-    'http://mock.test/IntegrationService/v3/CasinoGameAPI/game/url',
-  );
+  const response = await json.post<{gameURL: string}>('http://mock.test/IntegrationService/v3/CasinoGameAPI/game/url');
 
   assert.strictEqual(response.body.gameURL, 'https://example.test/game/1');
 });
@@ -53,9 +81,9 @@ test('honours a base path on the scope', async () => {
 test('a base path does not match a different prefix', async () => {
   nock('http://mock.test/base').get('/thing').reply(200, 'matched');
 
-  const response = await client.get('http://mock.test/other/thing').catch(err => err);
+  const response = await failure(client.get('http://mock.test/other/thing'));
 
-  assert.ok(response instanceof Error, 'expected the request not to match');
+  assertUnmatched(response, 'a different base path should not match');
 });
 
 test('trailing slashes on the base path are ignored', async () => {
@@ -79,7 +107,9 @@ test('matches a regex path, including under a base path', async () => {
 });
 
 test('matches a function path', async () => {
-  nock('http://mock.test').get((path) => path.startsWith('/dynamic')).reply(200, 'fn');
+  nock('http://mock.test')
+    .get((path) => path.startsWith('/dynamic'))
+    .reply(200, 'fn');
 
   const response = await client.get('http://mock.test/dynamic/thing');
 
@@ -113,17 +143,17 @@ test('query(object) matches only those params', async () => {
 
   nock('http://mock.test').get('/exact').query({a: '1'}).reply(200, 'matched');
 
-  const missed = await client.get('http://mock.test/exact', {searchParams: {a: '2'}}).catch(err => err);
+  const missed = await failure(client.get('http://mock.test/exact', {searchParams: {a: '2'}}));
 
-  assert.ok(missed instanceof Error, 'expected a different query not to match');
+  assertUnmatched(missed, 'a different query should not match');
 });
 
 test('a plain path does not match a request carrying a query', async () => {
   nock('http://mock.test').get('/strict').reply(200, 'matched');
 
-  const missed = await client.get('http://mock.test/strict', {searchParams: {a: '1'}}).catch(err => err);
+  const missed = await failure(client.get('http://mock.test/strict', {searchParams: {a: '1'}}));
 
-  assert.ok(missed instanceof Error, 'nock semantics: no query matcher means no query');
+  assertUnmatched(missed, 'a different query should not match');
 });
 
 /** The shape spribe.spec.ts uses to capture what was actually sent. */
@@ -182,11 +212,13 @@ test('reply(status, function) computes just the body', async () => {
 });
 
 test('reply callbacks may be async', async () => {
-  nock('http://mock.test').get('/async').reply(async () => {
-    await new Promise(resolve => setTimeout(resolve, 1));
+  nock('http://mock.test')
+    .get('/async')
+    .reply(async (): Promise<ReplyFunctionResult> => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
 
-    return [200, {done: true}];
-  });
+      return [200, {done: true}];
+    });
 
   const response = await json.get<{done: boolean}>('http://mock.test/async');
 
@@ -196,11 +228,13 @@ test('reply callbacks may be async', async () => {
 test('a non-json request body reaches the callback as a string', async () => {
   let captured: unknown;
 
-  nock('http://mock.test').post('/form').reply(200, (_uri, body) => {
-    captured = body;
+  nock('http://mock.test')
+    .post('/form')
+    .reply(200, (_uri, body) => {
+      captured = body;
 
-    return 'ok';
-  });
+      return 'ok';
+    });
 
   await client.post('http://mock.test/form', {form: {a: '1', b: '2'}});
 
@@ -213,9 +247,9 @@ test('times(n) replays the interceptor n times', async () => {
   assert.strictEqual((await client.get('http://mock.test/repeat')).body, 'twice');
   assert.strictEqual((await client.get('http://mock.test/repeat')).body, 'twice');
 
-  const third = await client.get('http://mock.test/repeat').catch(err => err);
+  const third = await failure(client.get('http://mock.test/repeat'));
 
-  assert.ok(third instanceof Error, 'expected the third call to be unmatched');
+  assertUnmatched(third, 'the third call should be unmatched');
 });
 
 test('persist() replays indefinitely', async () => {
@@ -229,7 +263,7 @@ test('persist() replays indefinitely', async () => {
 test('replyWithError rejects the request', async () => {
   nock('http://mock.test').get('/broken').replyWithError(new Error('boom'));
 
-  const err = await client.get('http://mock.test/broken').catch(e => e as Error);
+  const err = await failure<Error>(client.get('http://mock.test/broken'));
 
   assert.strictEqual(err.name, 'RequestError');
   assert.strictEqual((err.cause as Error).message, 'boom');
@@ -242,11 +276,13 @@ test('matchHeader and reqheaders both constrain matching', async () => {
 
   assert.strictEqual(matched.body, 'ok');
 
-  nock('http://mock.test').get('/guarded2', undefined, {reqheaders: {'x-key': 'secret'}}).reply(200, 'ok');
+  nock('http://mock.test')
+    .get('/guarded2', undefined, {reqheaders: {'x-key': 'secret'}})
+    .reply(200, 'ok');
 
-  const missed = await client.get('http://mock.test/guarded2', {headers: {'x-key': 'wrong'}}).catch(err => err);
+  const missed = await failure(client.get('http://mock.test/guarded2', {headers: {'x-key': 'wrong'}}));
 
-  assert.ok(missed instanceof Error, 'expected a wrong header not to match');
+  assertUnmatched(missed, 'a different query should not match');
 });
 
 test('body matcher constrains matching', async () => {
@@ -269,9 +305,7 @@ test('cleanAll removes pending interceptors across origins', async () => {
 });
 
 test('scopes chain across multiple interceptors', async () => {
-  nock('http://mock.test')
-    .get('/one').reply(200, 'first')
-    .get('/two').reply(200, 'second');
+  nock('http://mock.test').get('/one').reply(200, 'first').get('/two').reply(200, 'second');
 
   assert.strictEqual((await client.get('http://mock.test/one')).body, 'first');
   assert.strictEqual((await client.get('http://mock.test/two')).body, 'second');
@@ -282,7 +316,7 @@ test('interceptors are consumed once by default', async () => {
 
   assert.strictEqual((await client.get('http://mock.test/once')).body, 'first');
 
-  const second = await client.get('http://mock.test/once').catch(err => err);
+  const second = await failure(client.get('http://mock.test/once'));
 
-  assert.ok(second instanceof Error, 'expected the interceptor to be consumed');
+  assertUnmatched(second, 'the interceptor should be consumed');
 });

@@ -1,17 +1,41 @@
 # Gotlike
 
-Barebones [got](https://github.com/sindresorhus/got)-like [undici](https://github.com/nodejs/undici)-based not-as-safe
-commonjs-compatible http client for node.js.
+A [got](https://github.com/sindresorhus/got)-shaped HTTP client for node.js, built on
+[undici](https://github.com/nodejs/undici). Includes a nock-like mocking layer, since nock doesn't
+intercept undici.
 
-Includes a basic nock-like mocking system (since nock doesn't work with undici).
+ESM, node >= 22.12. CommonJS projects can still `require('gotlike')` - node supports `require()`
+of ESM from 22.12, and named exports destructure as usual:
 
-The idea is to be able to replace got and nock with gotlike in most cases, while being more performant.
-At the moment only the features I use are implemented.
+```js
+const { got, Gotlike, RequestError } = require('gotlike');
+```
+
+## Motivation
+
+got has the API worth keeping - extendable clients, handlers, hooks, sane errors - but it sits on
+node's `http` module and costs about three times as much per request as undici does. undici is the
+fast path, but its API is deliberately low-level: no client extension, no option merging, no hooks,
+errors that arrive as raw dispatch failures.
+
+Swapping one for the other in a codebase with hundreds of call sites means rewriting all of them,
+and replacing nock as well, because nock doesn't intercept undici at all.
+
+So: undici underneath, got's shape on top, and nock's shape for the tests. The aim is that moving a
+codebase over is an import change rather than a rewrite - and that the result is roughly **3x got**
+on throughput while staying within a few percent of raw undici.
+
+It is not a got clone. Features are added when they're needed, and got's design is followed only
+where it doesn't cost anything at runtime - see [Differences](#differences-from-got).
+
+> **Redirects are not followed by default**, unlike got. undici allocates a redirect handler on
+> every request once its interceptor is in play, which measured at ~80% of this client's entire
+> per-request overhead - so it is opt-in: `gotlike.extend({ followRedirect: true })`.
 
 Supports:
 - [x] Extendable client
 - [x] Handlers
-- [x] Hooks *(arrays, `beforeRequest` / `afterResponse` / `beforeError`, instance-level only)*
+- [x] Hooks *(arrays, instance-level only)*
 - [x] `afterResponse` retries via `retryWithMergedOptions`
 - [x] `context`
 - [x] Retries *(partial - maps onto undici's `retry` interceptor)*
@@ -21,6 +45,7 @@ Supports:
 - [x] `response.ok` / `rawBody` / `retryCount`
 - [x] Named error classes - `HTTPError`, `TimeoutError`, `ParseError`
 - [x] Streams *(with response head + timings; no progress events)*
+- [x] All hooks - `beforeRequest`, `afterResponse`, `beforeError`, `beforeRetry`, `beforeRedirect`
 - [x] Timings *(only total request)*
 - [x] Parsed response body and timings on errors
 - [x] Nock-like mocking
@@ -29,30 +54,42 @@ Supports:
 - [x] Response caching and request deduplication
 - [x] HTTP2 *(over TLS; cleartext h2c needs an `agent`)*
 - [x] Pipelining
-- [ ] HTTP3 - not possible, undici has no QUIC support
-- [ ] Options validation
-- [ ] Callable client - `gotlike(url, options)`
-- [ ] `beforeRedirect` hook - would mean reimplementing undici's redirect handling
+- [ ] HTTP3 - blocked upstream: node has no QUIC, undici has no h3. See below
+- [x] Options validation
+- [x] Callable client - `gotlike(url, options)`
 
-## Differences
+## Differences from got
 
-Deliberate divergences from got, mostly to keep the per-request path cheap:
+### Chosen for speed
 
-- `retry`, `http2`, `pipelining`, `dnsCache`, `dnsLookup`, `agent`, `handlers` and `hooks` can be
-  set only on instance create/extend. Passing them to a single call has no effect - resolving them
-  once per client is what keeps them off the hot path
-- Options are shallow-merged (instance defaults, then call options, with `headers` and `context`
-  merged one level deep). got walks a per-option merge table on every request
-- `options.url` is a string, not a `URL`. It is rewritten to the full `prefixUrl`-resolved URL
-  before handlers and hooks see it, so use `String(options.url)` rather than `options.url.href`
-- An absolute `url` overrides `prefixUrl` rather than being appended to it (got refuses the
-  combination outright)
-- `timeout.request` is subject to undici's timer resolution: undici arms header/body timeouts on a
-  coarse timer wheel with a 1 second resolution, so **any timeout below ~1s behaves as ~1s**
-- `options.context` defaults to a shared frozen empty object. Reads are safe; writing to it throws
-  rather than silently leaking across requests. Pass a `context` to get a writable one
-- Only one function per hook type runs per request in got's `init`/`beforeRedirect`/`beforeRetry`
-  sense - those three hooks don't exist here at all
+| | got | gotlike |
+| --- | --- | --- |
+| `hooks`, `handlers`, `retry`, `agent`, `http2`, `pipelining`, `dnsCache`, `dnsLookup`, `decompress` | per request or per client | **create/extend only** - passing them per request is a `ValidationError` |
+| option merging | per-option merge table, every request | **one shallow spread**; `headers` and `context` merge one level deep |
+| `response.rawBody` | always materialised | **computed on first access** |
+| `options.url` | normalised to a `URL` | **left a string**, rewritten to the full `prefixUrl`-resolved URL before handlers and hooks see it. Use `String(options.url)`, not `options.url.href` |
+| `options.context` | fresh `{}` per request | a **shared frozen** `{}` when unset - reads are safe, writes throw rather than leak. Pass a `context` to get a writable one |
+| `validate` | n/a | client-only, like the options above - it is read from the instance, so a per-request value would do nothing |
+| `followRedirect` | `true` | **`false`** - redirects cost ~2µs/request to support, whether or not one happens. Enable per client with `extend({ followRedirect: true })`; a per-request `true` is a `ValidationError`, since composing the interceptor is a create/extend-time decision |
+| `stream()` for a bodyless request | always a `Duplex` | a **`Readable`** - nothing can be written to a GET, and the duplex wrapper cost ~10% of stream throughput |
+
+### Forced by undici
+
+| | behaviour |
+| --- | --- |
+| `timeout.request` | undici arms timeouts on a coarse timer wheel with 1s resolution, so **anything under ~1s behaves as ~1s** |
+| `beforeRedirect`, `beforeRetry` | **cannot delay or cancel** - undici decides both inside a synchronous dispatch interceptor, so a returned promise is not awaited |
+| streamed request bodies | **not replayed across a 307/308**, which must preserve method and body. 301/302/303 are fine (they rewrite to GET and drop the body); non-streamed bodies replay normally |
+| HTTP/3 | not available - see [On HTTP/3](#on-http3) |
+
+### Smaller surface
+
+`stream()` resolves to the stream rather than returning it synchronously, so async `beforeRequest`
+hooks can be awaited. An absolute `url` overrides `prefixUrl` instead of being rejected outright.
+got's `init` hook, `pagination`, `allowGetBody` and `methodRewriting` are not implemented.
+
+This is also a much younger library than got, with a correspondingly smaller amount of production
+mileage behind it. The behaviour above is covered by tests; the long tail beyond it is not.
 
 ## Performance options
 
@@ -75,9 +112,32 @@ const client = gotlike.extend({
 ```
 
 Interceptors are only composed when the corresponding option is set, and the whole chain is
-built once per client rather than per request. `followRedirect: false` on the client skips
-composing the redirect interceptor as well - worth doing when you never expect redirects,
-since the interceptor rest-spreads the dispatch options before it can bail out.
+built once per client rather than per request.
+
+### Where the time actually goes
+
+Measured against a null dispatcher, so only client-side work is left (median of 3 runs, each in a
+fresh process - comparing dispatchers in one process poisons the inline caches badly enough to
+invert results):
+
+| | ns/request | vs raw undici |
+| --- | --- | --- |
+| raw `undici.request` | 2115 | - |
+| gotlike, default (no redirects) | 2588 | +473 |
+| gotlike, `followRedirect: true` | 4569 | +2454 |
+| gotlike, default + `decompress: false` | 2513 | +398 |
+
+**Redirect support is worth ~2µs per request** - about 80% of gotlike's entire overhead. undici's
+redirect interceptor allocates a `RedirectHandler` on *every* request to handle a case that almost
+never happens (`maxRedirections: 10` costs ~1.4µs against ~0.2µs for `0`). That is why it is off by
+default here, and why enabling it is a per-client decision:
+
+```ts
+const client = gotlike.extend({ followRedirect: true });
+```
+
+Everything left after that - option forming, header merging, response construction, validation - is
+**under 500ns combined**. There is not much left to win here without giving up correctness.
 
 For anything else - proxies, cleartext h2c - pass your own dispatcher as `agent`:
 
@@ -87,6 +147,36 @@ import { H2CClient, EnvHttpProxyAgent } from 'undici';
 gotlike.extend({ agent: new H2CClient('http://internal.service') });
 gotlike.extend({ agent: new EnvHttpProxyAgent() });
 ```
+
+`agent` takes any undici `Dispatcher`, including one you write yourself. gotlike never looks
+inside it, and its own interceptor chain composes on top - so a new transport needs no changes
+here.
+
+### On HTTP/3
+
+Not implementable today, and not for want of trying:
+
+- **node has no QUIC.** `node:quic` is not a builtin, even behind `--experimental-quic`.
+- **undici has no HTTP/3**, and its connection layer is TCP/TLS-oriented; QUIC is UDP with its own
+  TLS 1.3 integration, stream multiplexing and loss recovery.
+- **the npm ecosystem has no usable h3 client.** `@matrixai/quic` is maintained but is QUIC
+  *transport* only - HTTP/3 also needs h3 framing and QPACK header compression on top. Everything
+  else (`node-quic`, `quiche`, `http3`) was last touched in 2022.
+
+Implementing it here would mean owning a QUIC binding plus an h3/QPACK stack, which is a project in
+itself rather than a feature of an http client wrapper.
+
+The upside of the `agent` seam is that this stays a one-line change whenever an h3 dispatcher does
+exist, from undici or anyone else:
+
+```ts
+gotlike.extend({ agent: new SomeHttp3Dispatcher() });
+```
+
+Worth checking whether it would buy anything first: HTTP/3's wins are largely connection setup and
+lossy networks. Server-to-server calls to a fixed set of upstreams over warm keep-alive connections
+- which is what this client is for - see much less from it, and UDP in userspace can cost more than
+it saves.
 
 ## Hooks
 
@@ -112,9 +202,23 @@ const client = gotlike.extend({
 
     // return an error to replace the one about to be thrown
     beforeError: [(error) => new ServiceError(error.code, error.response?.body)],
+
+    // undici strips `authorization` across origins; put it back if you mean to
+    beforeRedirect: [(request, response) => {
+      logger.info({ to: request.path, status: response.statusCode }, 'following redirect');
+      request.headers.authorization = token;
+    }],
+
+    beforeRetry: [(error, statusCode, retryCount) => {
+      logger.warn({ statusCode, retryCount }, 'retrying');
+    }],
   },
 });
 ```
+
+`beforeRedirect` and `beforeRetry` **cannot delay or cancel** the redirect or retry - undici decides
+both inside a synchronous dispatch interceptor, so a promise returned from them is not awaited. They
+are for logging, metrics, and (for `beforeRedirect`) adjusting `request.headers` on the next hop.
 
 `retryWithMergedOptions` re-runs the request with `newOptions` merged over the ones it was sent
 with (`headers` and `context` merge one level deep, everything else is replaced). It goes straight
@@ -168,8 +272,22 @@ const upload = await gotlike.stream(url, { method: 'POST' });
 await pipeline(createReadStream('file'), upload);
 ```
 
-With `throwHttpErrors` on, an error status destroys the stream with an `HTTPError` rather than
-resolving - listen on `error`, or await `stream.response` and check `ok` with it turned off.
+With `throwHttpErrors` on, an error status surfaces when you read the stream - listen on `error`,
+or await `stream.response` and check `ok` with it turned off.
+
+A request with no body of its own resolves to a plain `Readable`: there is nothing to write to a
+GET, and wrapping it in a duplex costs ~10% of stream throughput for a writable half nobody can
+use. Pass a body-carrying method to get the writable half, and TypeScript will type it as a duplex:
+
+```ts
+const download = await gotlike.stream(url);                    // Readable
+const upload   = await gotlike.stream(url, { method: 'POST' }); // Duplex
+```
+
+**Redirects and streamed bodies.** Bodyless streams follow redirects normally. A streamed request
+body cannot be replayed, so a 307/308 - which must preserve method and body - resolves with the
+redirect response itself rather than following it. A 301/302/303 on a POST is fine, since those
+rewrite to GET and drop the body anyway. Non-streamed bodies replay normally.
 
 ## Compression
 
@@ -190,15 +308,22 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 | class | `code` | when |
 | --- | --- | --- |
 | `HTTPError` | `ERR_HTTP_ERROR` | non-2xx/3xx and `throwHttpErrors` is on |
-| `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request` |
+| `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request`, or an `AbortSignal.timeout()` fired |
 | `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType` |
-| `RequestError` | `ERR_REQUEST_ERROR` | everything else (connection refused, aborted, ...) |
+| `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
+| `RequestError` | `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
 
 The originating error is kept as `error.cause`.
 
 `error.response` is a full response - parsed `body`, `headers`, `statusCode`, `ok`, `retryCount`,
 `timings` and `request.options` - and is `undefined` only when the request failed before a response
 arrived. On a parse failure `response.body` is the raw text that failed to parse.
+
+## Bodyless responses
+
+`204`, `205`, `304` and any `HEAD` response cannot carry a body, so none is parsed. With
+`responseType: 'json'` the body is `undefined`, with `text` it is `''`, and with `buffer` it is an
+empty `Buffer` - rather than a parse failure on an empty string.
 
 ## Response
 
@@ -270,3 +395,29 @@ const response = await gotlike.get('/test')
 
 console.log(response.body)
 ```
+
+The client is also callable, like got's export:
+
+```ts
+const response = await gotlike('/test', { responseType: 'json' })
+
+// `new Gotlike(...)` gives the plain, non-callable class;
+// `createClient(...)` gives the callable form.
+```
+
+## Options validation
+
+Options are validated: unknown keys, a misspelled `responseType`, `timeout: 5000` where an object
+was meant, or a client-only option passed to a single call.
+
+```ts
+await gotlike.get('/test', { responseType: 'jsn' })
+// ValidationError: `responseType` must be one of text, json, buffer, got `jsn`
+
+await gotlike.get('/test', { retry: { limit: 2 } })
+// ValidationError: `retry` can only be set when creating or extending a client, not per request
+```
+
+Client options are always validated on create/extend, where it throws synchronously and costs
+nothing. Per-request validation measures ~50ns, around 0.1% of a request, and rejects rather than
+throwing so it behaves like any other failure. Turn it off with `validate: false` if you disagree.

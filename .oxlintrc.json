@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "oxc"
+  ],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "pedantic": "warn"
+  },
+  "env": {
+    "builtin": true,
+    "node": true,
+    "es2024": true
+  },
+  "rules": {
+    "no-inline-comments": "off",
+    "require-unicode-regexp": "off",
+    "max-lines": "off",
+    "max-lines-per-function": "off",
+    "max-classes-per-file": "off",
+    "no-warning-comments": "off",
+    "require-await": "off",
+    "unicorn/no-negated-condition": "off",
+    "unicorn/consistent-function-scoping": "off",
+    "unicorn/prefer-code-point": "off",
+    "unicorn/no-array-callback-reference": "off",
+    "unicorn/no-useless-undefined": "off",
+    "unicorn/no-array-sort": "off",
+    "unicorn/prefer-top-level-await": "off",
+    "no-promise-executor-return": "off",
+    "no-underscore-dangle": "off",
+    "unicorn/escape-case": "off",
+    "unicorn/no-hex-escape": "off",
+    "max-depth": "off"
+  },
+  "ignorePatterns": [
+    "**/dist/**",
+    "**/node_modules/**"
+  ]
+}

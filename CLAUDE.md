@@ -20,22 +20,21 @@ wins over an exact signature match, as long as the aggregator can still express 
 ## Commands
 
 ```bash
-npm test                 # node --test with ts-node/register over ./**/*.spec.ts
+npm test                 # node --test over src/**/*.spec.ts, via native type stripping
 npm run test:watch
+npm run typecheck        # tsc --noEmit
 npm run build            # tsc -> dist/ (specs are excluded from the build)
 
 # single test file / single test
-node --test -r ts-node/register ./src/index.spec.ts
-node --test -r ts-node/register --test-name-pattern 'extend client with hook' ./src/index.spec.ts
+node --test src/index.spec.ts
+node --test --test-name-pattern 'extend client with hook' src/index.spec.ts
 ```
 
-ts-node runs with the swc transform (`ts-node.swc` in tsconfig.json), so tests are transpile-only — type errors
-surface from `npm run build`, not from `npm test`. CI (`.github/workflows`) runs `npm install && npm run test`
-on Node 22 and 24.
+Type stripping erases types without checking them, so **type errors only surface from `npm run typecheck` or
+`npm run build`, never from `npm test`**. CI runs both, on node 22, 24 and 26.
 
-Benchmarks live in `benchmark/` as a separate npm project with its own `package.json`/`node_modules` (ESM, compares
-against got/axios/node-fetch/request/native fetch). Run `benchmark/server.ts` (self-signed HTTPS on :8080) first,
-then `benchmark/index.ts`.
+Benchmarks live in `benchmark/` as a separate npm project with its own `package.json`/`node_modules`. See the
+Benchmark section below before trusting any number out of it.
 
 ## Architecture
 
@@ -102,15 +101,28 @@ they must be composed onto a dispatcher up front. The `agent` getter does this:
   outermost (it re-runs the whole chain) and dns innermost (resolving right before the connection is made).
   Getting this backwards silently reorders behaviour — there's a probe in the git history if you need to
   re-verify;
-- `redirect` is skipped when the client sets `followRedirect: false` — it rest-spreads the dispatch options
-  on every request before it can bail out, so skipping it is a real saving for clients that never redirect;
+- `redirect` is composed **only on an explicit `followRedirect: true`** — this is opt-in, and a documented
+  divergence from got. undici allocates a `RedirectHandler` per request once the interceptor is in the chain
+  (~1.4µs vs ~0.2µs for `maxRedirections: 0`), which measured at ~80% of the client's total overhead.
+  `Gotlike.followsRedirects` records the decision, and `formOptions` rejects a per-request
+  `followRedirect: true` rather than ignoring it — composing the interceptor is a create/extend-time
+  decision, so a per-request opt-in could never work. Per-request `false` is fine and just sets
+  `maxRedirections: 0`;
 - when nothing needs composing, `agent` returns the base dispatcher untouched;
 - the composition is memoised against the base dispatcher's identity (`#composedFrom`), so the chain is built
   once per dispatcher rather than once per request.
 
-**HTTP/3 is not possible** — undici has no QUIC support. HTTP/2 works over TLS via `allowH2`; cleartext h2c
-needs the caller to pass `agent: new H2CClient(origin)`, since `H2CClient` is single-origin and can't back a
-general-purpose client.
+HTTP/2 works over TLS via `allowH2`; cleartext h2c needs the caller to pass `agent: new H2CClient(origin)`,
+since `H2CClient` is single-origin and can't back a general-purpose client.
+
+**HTTP/3 is blocked upstream, not by us.** Verified: `node:quic` is not a builtin even behind
+`--experimental-quic`; undici has no h3; and the npm ecosystem has no usable h3 client (`@matrixai/quic` is
+QUIC transport only — h3 also needs framing and QPACK — and everything else is abandoned). Don't accept a PR
+that "adds HTTP/3" without a real h3 dispatcher behind it.
+
+The `agent` option is the transport seam: gotlike never inspects a dispatcher and composes its interceptors
+on top of whatever is passed, so a future h3 dispatcher plugs in with no changes here. There's a test
+(*an arbitrary custom dispatcher can back the client*) that locks that seam open.
 
 Resolving lazily is what lets a `setGlobalDispatcher` call made *after* the client was constructed take effect —
 which is exactly what `./nock` does, and why import order no longer matters (there's a regression test for it).
@@ -138,6 +150,47 @@ request, and re-entering them would re-log and re-wrap a request the caller made
 
 `beforeError` hooks may return a replacement error; anything that isn't an `Error` is ignored.
 
+### Bodyless responses and parse failures
+
+`hasNoBody()` short-circuits parsing for `204`/`205`/`304` and `HEAD` — the body is `undefined` for `json`,
+`''` for `text`, an empty `Buffer` otherwise. Without it every empty 204 became a failure.
+
+Parse failures are flagged (`parseFailed`) at the `JSON.parse` call, **not recognised by message**. V8 words
+them differently depending on input — "Unexpected end of JSON input" for an empty body versus "… is not valid
+JSON" for garbage — and the old `message.endsWith('not valid JSON')` check misfiled empty bodies as
+`ERR_REQUEST_ERROR`. Don't reintroduce message sniffing.
+
+A signal reports its reason as a `DOMException`: `AbortError` from `abort()`, `TimeoutError` from
+`AbortSignal.timeout()`. The first maps to `AbortError`/`ERR_ABORTED`, the second to `TimeoutError`/`ETIMEDOUT`
+so that both kinds of timeout look the same to callers.
+
+### Shared internals worth not re-duplicating
+
+These exist because the same code was written out two or three times, and each copy was a place to
+forget a field:
+
+- **`dispatchOptions()`** — the options every dispatch shares. `call()`, `callBodylessStream()` and
+  `callStream()` each built this literal by hand. It also owns the `redirects` holder, so no caller
+  recomputes it.
+- **`trackDispatches(select, onRedispatch)`** + **`OutcomeHandler`** — one interceptor factory and one
+  `DecoratorHandler` behind both `countAttempts` (retries) and `makeRedirectTracker` (redirects). They had
+  separate, near-identical handler classes recording the same three fields.
+- **`isOk()` / `isHttpError()`** — the status predicates were spelled out inline in four places, twice with
+  subtly different boundaries.
+- **`elapsedMs()`**, **`mergeRecords()`**, **`mergeHooks()`**, **`usedHooks()`** — small, but each replaced a
+  repeated expression.
+- **`GotlikeResponse` is constructed directly.** There used to be a `formResponse()` wrapper that took
+  `(body, statusCode, headers, …)` and called the constructor as `(body, headers, statusCode, …)` — an
+  invisible swap, one edit from a silent bug.
+
+`formOptions()` deliberately still hand-rolls its merge rather than sharing one with `extend()` and
+`retryWithMergedOptions()`: it is the hot path (~120ns including validation, measured), and the other two run
+once per client or once per refresh.
+
+`knownOptionMap` is `satisfies Record<keyof RequestOptions, true>`, so **adding an option to the type without
+registering it is a compile error**. `clientOnlyOptions` is a `Set` because validation consults it per option
+per request. Both were lists that could silently drift.
+
 ### retryCount and beforeRetry
 
 undici exposes no retry counter — `response.context` is `null` after a retried request, and the
@@ -150,8 +203,18 @@ error so the next dispatch can report why it was retried. All public API.
 inside a synchronous dispatch, so there is nothing to await on. It is for logging and metrics; this is a
 documented divergence from got, not an oversight.
 
-`beforeRedirect` is not implemented. undici's `RedirectHandler` takes no hook, so supporting it means
-writing our own redirect handling. Worth knowing before someone "just adds it".
+`beforeRedirect` uses the same shape: `makeRedirectTracker` is composed **inside** undici's redirect
+interceptor, so it is re-entered per hop, and the hop's options are still mutable there — which is what lets
+a hook put back an `authorization` header that undici stripped on a cross-origin redirect.
+
+Two things that cost real debugging and are easy to undo:
+- **The state holder must be handed in with the dispatch options, not attached on first entry.**
+  `RedirectHandler` copies the options in its constructor — *before* hop 1 reaches the interceptor — and
+  re-dispatches hops 2+ with that copy. State attached on hop 1 is invisible to hop 2, which silently loses
+  the first hook call.
+- **At a redirect hop `opts.headers` is undici's flat `[name, value, ...]` array**, not an object. A hook
+  writing `headers.authorization` on that array achieves nothing, so `headersToObject` normalises it and the
+  result is always assigned back.
 
 `DecoratorHandler`'s `.d.ts` declares no members even though the runtime class has them, hence the
 `DecoratorHandlerShape` declaration used to type the two methods we override.
@@ -176,6 +239,29 @@ throwing, which would hand callers compressed bytes silently.
 `body.text()`, and materialising a Buffer per request just in case would cost more than it saves.
 
 ### Streams
+
+There are **two** stream paths, and which one runs depends on whether the request has a body:
+
+- **bodyless (GET/HEAD, no body)** → `callBodylessStream`, via `undici.request`. Returns the response
+  `Readable` unwrapped.
+- **anything else** → `callStream`, via `undici.pipeline`, returning a `Duplex` whose writable half is the
+  request body.
+
+The split exists because `undici.pipeline` makes the duplex's writable side the request body, and
+`RedirectHandler` refuses to follow a redirect whose body it cannot replay — so a piped GET silently
+returned the 302 itself with an empty body. That was a live bug: a download through a redirecting CDN got
+an empty file and no error.
+
+Returning the readable unwrapped rather than `Duplex.from({writable, readable})` is deliberate:
+`Duplex.from` measured ~10% of stream throughput for a writable half that a GET cannot use. The `stream()`
+overloads keep the type honest — a body-carrying `method` types as `GotlikeUploadStream` (a `Duplex`),
+everything else as `GotlikeStream` (a `Readable`). `Duplex` extends `Readable`, so neither declaration lies.
+
+**Errors are raised by the readable at read time**, not by destroying the duplex. Destroying has no good
+moment: synchronously, the error is emitted before an awaiting caller attaches a listener; on a later tick,
+a small body has already been consumed and the read finished cleanly. The `response` event goes out on
+`setImmediate` for the same reason — a microtask queued before `await stream(...)` resolves fires first and
+is missed.
 
 `stream()` resolves to a `GotlikeStream` (a `Duplex`) rather than returning one synchronously as got does —
 `beforeRequest` hooks are async and awaiting them is worth more than the sync return. The head arrives via
@@ -260,6 +346,57 @@ Between-process variance is still ~15%, so **gotlike and raw `undici.request` sh
 gotlike is a thin wrapper and cannot genuinely be faster. If a change makes gotlike look like it beats raw
 undici, that is a measurement artefact, not a result. Env knobs: `BENCH_DURATION`, `BENCH_ROUNDS`,
 `BENCH_WARMUP`, `BENCH_CONCURRENCY`, `BENCH_SERVER`.
+
+## Lint, format, typecheck
+
+`npm run check` runs typecheck → lint → format check → tests, and is what CI runs.
+
+- **oxlint** (`.oxlintrc.json`) with `correctness: error`, `suspicious`/`pedantic` as warnings. Rules turned
+  off are listed with a reason where it isn't obvious — `unicorn/no-useless-undefined` in particular, because
+  `undefined` carries meaning here (it is how "unset" reaches undici, and `.catch(() => undefined)` is a
+  deliberate swallow).
+- **oxfmt** (`.oxfmtrc.json`) with `bracketSpacing: false`, to match the brace style already in the repo
+  rather than reformatting every line to a new one.
+- **Two tsconfigs.** `tsconfig.json` is the *checking* config: `noEmit`, includes the spec files, and allows
+  `.ts` import specifiers (which the specs use). `tsconfig.build.json` extends it to emit `dist/` and excludes
+  the specs. **The specs were previously not type-checked at all** — the build config's `exclude` kept them
+  out of `tsc`, and type stripping doesn't check — so 2000 lines of test code had no checking. Keep
+  `npm run typecheck` pointed at the config that includes them.
+- `erasableSyntaxOnly` is on, which enforces the type-stripping constraint at compile time rather than in
+  prose. `noUncheckedIndexedAccess` is on. **`exactOptionalPropertyTypes` is deliberately off**: passing
+  `undefined` through to undici is the idiom throughout, and satisfying the flag would mean building option
+  objects conditionally — per-request work, against the whole point.
+
+## Performance notes
+
+Measured against a null dispatcher (median of 3 runs, **each in a fresh process** — comparing
+dispatchers within one process poisons inline caches badly enough to invert results, and produced a
+"both interceptors" number larger than the sum of its parts):
+
+| | ns/request |
+| --- | --- |
+| raw `undici.request` | 2115 |
+| gotlike default (no redirects) | 2588 |
+| gotlike, `followRedirect: true` | 4569 |
+| default + `decompress: false` | 2513 |
+
+**~80% of gotlike's overhead is undici's redirect interceptor**, which allocates a `RedirectHandler`
+per request (`maxRedirections: 10` ≈ 1.4µs vs ≈ 0.2µs for `0`) — which is why redirects are off by
+default. Everything gotlike itself does — option forming, header merge, response construction,
+validation — is under 500ns combined. Before optimising anything here, check the number is actually
+ours.
+
+Two non-obvious wins already taken, both worth keeping:
+- **`Response` is a class, not an object literal.** A getter in an object literal is installed per
+  object: ~190ns per response against ~7ns for a class with the getter on the prototype. Don't
+  "simplify" `GotlikeResponse` back into a literal.
+- **`accept-encoding` is folded into `defaultHeaders` at construction**, not set per request — it
+  saves a case-insensitive header scan and an assignment. Per-call headers still win, because call
+  options are spread over the defaults.
+
+Rejected: reimplementing redirect handling to get the saving *while* following redirects. It would
+buy ~2µs in exchange for owning method-rewriting and cross-origin header-stripping semantics. The
+opt-in default already gets the whole saving with no correctness risk.
 
 ## Public API surface
 

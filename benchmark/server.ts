@@ -14,15 +14,17 @@ import type {AddressInfo} from 'node:net';
  * isn't distorting the comparison.
  */
 
-const bodies: Record<string, {body: Buffer, contentType: string}> = {
+const bodies: Record<string, {body: Buffer; contentType: string}> = {
   '/small': {body: Buffer.from('hello'), contentType: 'text/plain'},
   '/json': {
-    body: Buffer.from(JSON.stringify({
-      id: 12345,
-      name: 'benchmark',
-      tags: ['a', 'b', 'c'],
-      nested: {ok: true, count: 42},
-    })),
+    body: Buffer.from(
+      JSON.stringify({
+        id: 12345,
+        name: 'benchmark',
+        tags: ['a', 'b', 'c'],
+        nested: {ok: true, count: 42},
+      }),
+    ),
     contentType: 'application/json',
   },
   '/large': {body: Buffer.from('x'.repeat(100 * 1024)), contentType: 'text/plain'},
@@ -36,10 +38,10 @@ const responses = new Map<string, Buffer>(
     Buffer.concat([
       Buffer.from(
         'HTTP/1.1 200 OK\r\n' +
-        `content-type: ${contentType}\r\n` +
-        `content-length: ${body.length}\r\n` +
-        'connection: keep-alive\r\n' +
-        '\r\n',
+          `content-type: ${contentType}\r\n` +
+          `content-length: ${body.length}\r\n` +
+          'connection: keep-alive\r\n' +
+          '\r\n',
       ),
       body,
     ]),
@@ -111,7 +113,7 @@ function createHttpServer() {
   });
 }
 
-export function startServer(port = 0): Promise<{url: string, close: () => Promise<void>}> {
+export function startServer(port = 0): Promise<{url: string; close: () => Promise<void>}> {
   const server = process.env.BENCH_SERVER === 'http' ? createHttpServer() : createRawServer();
 
   return new Promise((resolve) => {
@@ -120,10 +122,11 @@ export function startServer(port = 0): Promise<{url: string, close: () => Promis
 
       resolve({
         url: `http://127.0.0.1:${boundPort}`,
-        close: () => new Promise((done) => {
-          server.close(() => done());
-          server.unref();
-        }),
+        close: () =>
+          new Promise((done) => {
+            server.close(() => done());
+            server.unref();
+          }),
       });
     });
   });
@@ -131,5 +134,7 @@ export function startServer(port = 0): Promise<{url: string, close: () => Promis
 
 // Allow running it standalone for manual poking.
 if (process.argv[1]?.endsWith('server.ts')) {
-  startServer(8080).then(({url}) => console.log(`Listening at ${url} (${process.env.BENCH_SERVER === 'http' ? 'node:http' : 'raw'})`));
+  startServer(8080).then(({url}) =>
+    console.log(`Listening at ${url} (${process.env.BENCH_SERVER === 'http' ? 'node:http' : 'raw'})`),
+  );
 }

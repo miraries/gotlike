@@ -1,17 +1,16 @@
 {
   "name": "gotlike",
   "version": "0.2.0",
-  "description": "Barebones got-like undici-based commonjs-compatible http client for node.js",
+  "description": "Barebones got-like undici-based http client for node.js",
   "keywords": [
     "undici",
     "got",
     "fetch",
     "http",
     "https",
-    "axios",
-    "request",
-    "commonjs",
-    "function"
+    "client",
+    "esm",
+    "performance"
   ],
   "author": "Ivan Kotlaja",
   "license": "MIT",
@@ -24,26 +23,43 @@
     "url": "git+https://github.com/miraries/gotlike.git"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12"
   },
   "files": [
     "dist"
   ],
-  "type": "commonjs",
+  "type": "module",
   "main": "dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "test": "node --test -r ts-node/register ./**/*.spec.ts",
-    "test:watch": "node --test --watch -r ts-node/register ./**/*.spec.ts",
-    "build": "tsc"
+    "test": "node --test \"src/**/*.spec.ts\"",
+    "test:watch": "node --test --watch \"src/**/*.spec.ts\"",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "oxlint src benchmark",
+    "lint:fix": "oxlint --fix src benchmark",
+    "fmt": "oxfmt src benchmark",
+    "fmt:check": "oxfmt --check src benchmark",
+    "check": "npm run typecheck && npm run lint && npm run fmt:check && npm test"
   },
   "devDependencies": {
-    "@swc/core": "^1.16.2",
     "@types/node": "^22.20.2",
-    "ts-node": "^10.9.2",
-    "typescript": "^6.0.3"
+    "oxfmt": "^0.60.0",
+    "oxlint": "^1.82.0",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
     "undici": "^8.10.2"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./nock": {
+      "types": "./dist/nock.d.ts",
+      "default": "./dist/nock.js"
+    },
+    "./package.json": "./package.json"
   }
 }

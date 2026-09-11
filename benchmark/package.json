@@ -1,16 +1,16 @@
 {
   "name": "gotlike-benchmark",
   "version": "1.0.0",
-  "main": "index.js",
+  "private": true,
+  "description": "Benchmarks gotlike against got, undici and undici fetch",
+  "license": "ISC",
+  "author": "Ivan Kotlaja",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "bench": "npm --prefix .. run build && node index.ts"
   },
-  "author": "Ivan Kotlaja",
-  "license": "ISC",
-  "description": "Benchmarks gotlike against got, undici and undici fetch",
   "dependencies": {
     "got": "^14.4.1"
-  },
-  "private": true
+  }
 }

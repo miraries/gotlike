@@ -1,9 +1,7 @@
 import {Agent, request as undiciRequest, setGlobalDispatcher} from 'undici';
 import got from 'got';
-import gotlikePkg from '../dist/index.js';
+import {Gotlike} from '../dist/index.js';
 import {startServer} from './server.ts';
-
-const {Gotlike} = gotlikePkg as unknown as typeof import('../src/index.ts');
 
 /**
  * Every client gets the same connection pool settings, so what's being compared is the
@@ -28,18 +26,18 @@ const WARMUP_MS = Number(process.env.BENCH_WARMUP ?? 300);
 const ROUNDS = Number(process.env.BENCH_ROUNDS ?? 5);
 
 type Scenario = {
-  name: string
+  name: string;
   /** Skipped for clients that don't implement it. */
-  run: Record<string, ((url: string) => Promise<unknown>) | undefined>
+  run: Record<string, ((url: string) => Promise<unknown>) | undefined>;
 };
 
 type Result = {
-  client: string
-  opsPerSec: number
-  p50: number
-  p90: number
-  p99: number
-  errors: number
+  client: string;
+  opsPerSec: number;
+  p50: number;
+  p90: number;
+  p99: number;
+  errors: number;
 };
 
 function percentile(sorted: Float64Array, p: number): number {
@@ -61,7 +59,7 @@ async function measure(
   run: (url: string) => Promise<unknown>,
   url: string,
   concurrency: number,
-): Promise<{latencies: Float64Array, elapsedMs: number, errors: number}> {
+): Promise<{latencies: Float64Array; elapsedMs: number; errors: number}> {
   const latencies: number[] = [];
   let errors = 0;
   let stop = false;
@@ -80,7 +78,9 @@ async function measure(
   };
 
   const startedAt = process.hrtime.bigint();
-  const timer = setTimeout(() => { stop = true; }, DURATION_MS);
+  const timer = setTimeout(() => {
+    stop = true;
+  }, DURATION_MS);
 
   await Promise.all(Array.from({length: concurrency}, worker));
 
@@ -189,11 +189,14 @@ async function main() {
 
           return response.body.json();
         },
-        'undici fetch': async (base) => (await fetch(base + '/echo', {
-          method: 'POST',
-          body: JSON.stringify({a: 1, b: 'two'}),
-          headers: {'content-type': 'application/json'},
-        })).json(),
+        'undici fetch': async (base) =>
+          (
+            await fetch(base + '/echo', {
+              method: 'POST',
+              body: JSON.stringify({a: 1, b: 'two'}),
+              headers: {'content-type': 'application/json'},
+            })
+          ).json(),
       },
     },
     {
@@ -229,22 +232,25 @@ async function main() {
     },
   ];
 
-  const concurrencies = (process.env.BENCH_CONCURRENCY ?? '1,10,50')
-    .split(',')
-    .map(Number);
+  const concurrencies = (process.env.BENCH_CONCURRENCY ?? '1,10,50').split(',').map(Number);
 
   console.log(`node ${process.version} | server: ${process.env.BENCH_SERVER === 'http' ? 'node:http' : 'raw sockets'}`);
   console.log(
     `${DURATION_MS}ms x ${ROUNDS} rounds per client (median round reported), ` +
-    `${WARMUP_MS}ms warmup, ${CONNECTIONS} connections\n`,
+      `${WARMUP_MS}ms warmup, ${CONNECTIONS} connections\n`,
   );
 
   for (const scenario of scenarios) {
     for (const concurrency of concurrencies) {
       console.log(`\x1b[1m${scenario.name} — concurrency ${concurrency}\x1b[0m`);
       console.log(
-        'client'.padEnd(16) + 'throughput'.padStart(16) + 'vs best'.padStart(11) +
-        'p50 ms'.padStart(10) + 'p90 ms'.padStart(10) + 'p99 ms'.padStart(10) + 'errors'.padStart(9),
+        'client'.padEnd(16) +
+          'throughput'.padStart(16) +
+          'vs best'.padStart(11) +
+          'p50 ms'.padStart(10) +
+          'p90 ms'.padStart(10) +
+          'p99 ms'.padStart(10) +
+          'errors'.padStart(9),
       );
 
       const entries = Object.entries(scenario.run).filter(([, run]) => run);
@@ -264,7 +270,7 @@ async function main() {
 
           // Let the previous run's sockets and garbage settle.
           global.gc?.();
-          await new Promise(resolve => setTimeout(resolve, 50));
+          await new Promise((resolve) => setTimeout(resolve, 50));
 
           const {latencies, elapsedMs, errors} = await measure(run!, url, concurrency);
 
@@ -294,7 +300,7 @@ async function main() {
         return sorted[Math.floor(sorted.length / 2)];
       });
 
-      const fastest = Math.max(...results.map(r => r.opsPerSec));
+      const fastest = Math.max(...results.map((r) => r.opsPerSec));
 
       for (const result of [...results].sort((a, b) => b.opsPerSec - a.opsPerSec)) {
         console.log(formatRow(result, fastest));

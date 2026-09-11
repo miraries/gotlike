@@ -3,20 +3,46 @@ import assert from 'node:assert';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import {clearInterval} from 'node:timers';
-import {Duplex, Writable} from 'node:stream';
+import {Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {text} from 'node:stream/consumers';
 import {randomUUID} from 'node:crypto';
-import {getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
-import nock from './nock';
-import client, {Gotlike, HTTPError, ParseError, RequestError, TimeoutError} from './index';
+import {Agent, Dispatcher, getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
+import nock from './nock.ts';
+import client, {
+  AbortError,
+  type HandlerFunction,
+  Gotlike,
+  HTTPError,
+  ParseError,
+  RequestError,
+  TimeoutError,
+  ValidationError,
+} from './index.ts';
+
+/**
+ * Await something expected to fail and hand back the error.
+ *
+ * `promise.catch(e => e as RequestError)` types as `Response | RequestError`, and quietly
+ * yields a `Response` when the request doesn't fail at all - so a test that stops failing
+ * fails confusingly instead of clearly.
+ */
+async function failure<E extends Error = RequestError>(promise: Promise<unknown>): Promise<E> {
+  try {
+    await promise;
+  } catch (error) {
+    return error as E;
+  }
+
+  throw new assert.AssertionError({message: 'expected the request to fail, but it resolved'});
+}
 
 const requestCounts: Record<string, number> = {};
 
-const serverState: { retryCounts: Record<string, number> } = {
+const serverState: {retryCounts: Record<string, number>} = {
   retryCounts: {
     default: 0,
-  }
+  },
 };
 
 const server = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
@@ -95,6 +121,19 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  if (req.url?.startsWith('/status-empty')) {
+    res.statusCode = Number(new URL(req.url, 'http://x').searchParams.get('code') ?? 204);
+    res.end();
+
+    return;
+  }
+
+  if (req.url === '/slow') {
+    setTimeout(() => res.end('slow'), 3000).unref();
+
+    return;
+  }
+
   if (req.url === '/gzip') {
     res.setHeader('content-encoding', 'gzip');
     res.setHeader('content-type', 'application/json');
@@ -134,12 +173,14 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', () => {
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({
-        url: req.url,
-        method: req.method,
-        headers: req.headers,
-        body: Buffer.concat(chunks).toString(),
-      }));
+      res.end(
+        JSON.stringify({
+          url: req.url,
+          method: req.method,
+          headers: req.headers,
+          body: Buffer.concat(chunks).toString(),
+        }),
+      );
     });
 
     return;
@@ -154,9 +195,43 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
 
   if (req.url?.startsWith('/status')) {
     const qs = new URL(req.url, 'http://' + req.headers.host).searchParams;
-    res.statusCode = Number(qs.get('code')) ?? 200;
+    res.statusCode = Number(qs.get('code') ?? 200);
     res.statusMessage = qs.get('message') ?? 'OK';
 
+    res.end();
+
+    return;
+  }
+
+  if (req.url?.startsWith('/redirect-chain') && !req.url.startsWith('/redirect-chain-2')) {
+    res.statusCode = 302;
+    res.setHeader('location', '/redirect-chain-2');
+    res.end();
+
+    return;
+  }
+
+  if (req.url === '/redirect-chain-2') {
+    res.statusCode = 301;
+    res.setHeader('location', '/echo');
+    res.end();
+
+    return;
+  }
+
+  // Sends the browser to a different origin, which is when undici strips `authorization`.
+  // 307 preserves both method and body, so the body would have to be replayed.
+  if (req.url === '/redirect-307') {
+    res.statusCode = 307;
+    res.setHeader('location', '/echo');
+    res.end();
+
+    return;
+  }
+
+  if (req.url === '/redirect-cross-origin') {
+    res.statusCode = 302;
+    res.setHeader('location', 'http://127.0.0.1:3000/echo');
     res.end();
 
     return;
@@ -199,9 +274,8 @@ test.after(() => {
   server.close();
 });
 
-
 test('returns valid json when responseType is json', async () => {
-  const response = await client.get<{ test: string }>('http://localhost:3000/json', {
+  const response = await client.get<{test: string}>('http://localhost:3000/json', {
     responseType: 'json',
   });
 
@@ -209,34 +283,42 @@ test('returns valid json when responseType is json', async () => {
 });
 
 test('returns error on parse failure', async () => {
-  await assert.rejects(async () => {
-    await client.get('http://localhost:3000/text', {
-      responseType: 'json',
-    });
-  }, {
-    code: 'ERR_BODY_PARSE_FAILURE'
-  })
+  await assert.rejects(
+    async () => {
+      await client.get('http://localhost:3000/text', {
+        responseType: 'json',
+      });
+    },
+    {
+      code: 'ERR_BODY_PARSE_FAILURE',
+    },
+  );
 });
 
 test('body is available as string on parse failure', async () => {
-  const err = await client.get('http://localhost:3000/text', {
-    responseType: 'json',
-  }).catch(err => err);
+  const err = await failure(
+    client.get('http://localhost:3000/text', {
+      responseType: 'json',
+    }),
+  );
 
-  assert.strictEqual(err.response.body, 'hello\n');
+  assert.strictEqual(err.response?.body, 'hello\n');
 });
 
 test('throws error on timeout', async () => {
-  await assert.rejects(async () => {
-    await client.get('http://localhost:3000/timeout', {
-      responseType: 'json',
-      timeout: {
-        request: 100,
-      },
-    });
-  }, {
-    code: 'ETIMEDOUT'
-  });
+  await assert.rejects(
+    async () => {
+      await client.get('http://localhost:3000/timeout', {
+        responseType: 'json',
+        timeout: {
+          request: 100,
+        },
+      });
+    },
+    {
+      code: 'ETIMEDOUT',
+    },
+  );
 });
 
 /**
@@ -247,10 +329,9 @@ test('throws error on timeout', async () => {
 test('sub-second timeouts are floored to roughly one second', async () => {
   const start = process.hrtime.bigint();
 
-  await assert.rejects(
-    () => client.get('http://localhost:3000/timeout', {timeout: {request: 50}}),
-    {code: 'ETIMEDOUT'},
-  );
+  await assert.rejects(() => client.get('http://localhost:3000/timeout', {timeout: {request: 50}}), {
+    code: 'ETIMEDOUT',
+  });
 
   const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
 
@@ -268,15 +349,14 @@ test('does not time out a response that arrives within the timeout', async () =>
   assert.strictEqual(response.statusCode, 200);
 });
 
-
 test('extend client with headers', async () => {
   const extClient = client.extend({
     headers: {
       foo: 'bar',
-    }
+    },
   });
 
-  const response = await extClient.get<{ foo: string }>('http://localhost:3000/headers', {
+  const response = await extClient.get<{foo: string}>('http://localhost:3000/headers', {
     responseType: 'json',
   });
 
@@ -284,13 +364,15 @@ test('extend client with headers', async () => {
 });
 
 test('extend client twice', async () => {
-  const extClient = client.extend({
-    headers: {
-      foo: 'bar',
-    }
-  }).extend({
-    responseType: 'text',
-  });
+  const extClient = client
+    .extend({
+      headers: {
+        foo: 'bar',
+      },
+    })
+    .extend({
+      responseType: 'text',
+    });
 
   const response = await extClient.get('http://localhost:3000/headers');
 
@@ -301,8 +383,7 @@ test('extend client twice', async () => {
 test('extend client with handler', async () => {
   const order: string[] = [];
 
-  // @ts-ignore - fixme
-  const handler1 = (options, next) => {
+  const handler1: HandlerFunction = (options, next) => {
     order.push('before request');
 
     options.headers = {
@@ -312,24 +393,16 @@ test('extend client with handler', async () => {
     return next(options);
   };
 
-  // @ts-ignore - fixme
-  const handler2 = async (options, next) => {
-    try {
-      const response = await next(options);
+  const handler2: HandlerFunction = async (options, next) => {
+    const response = await next(options);
 
-      order.push('after request');
+    order.push('after request');
 
-      response.ok = true;
-
-      return response;
-    } catch (err) {
-
-      throw err;
-    }
+    return response;
   };
 
   const extClient = client.extend({
-    handlers: [handler1, handler2]
+    handlers: [handler1, handler2],
   });
 
   const response = await extClient.get('http://localhost:3000/json');
@@ -343,14 +416,16 @@ test('extend client with handler', async () => {
 test('extend client with hook', async () => {
   const extClient = client.extend({
     hooks: {
-      afterResponse: [(response) => {
-        if (response.headers) {
-          response.headers['test'] = 'value';
-        }
+      afterResponse: [
+        (response) => {
+          if (response.headers) {
+            response.headers['test'] = 'value';
+          }
 
-        return response;
-      }],
-    }
+          return response;
+        },
+      ],
+    },
   });
 
   const response = await extClient.get('http://localhost:3000/json');
@@ -366,12 +441,22 @@ test('hooks run serially in array order', async () => {
   const extClient = client.extend({
     hooks: {
       beforeRequest: [
-        async () => { order.push('before 1'); },
-        async () => { order.push('before 2'); },
+        async () => {
+          order.push('before 1');
+        },
+        async () => {
+          order.push('before 2');
+        },
       ],
       afterResponse: [
-        async (response) => { order.push('after 1'); return response; },
-        async (response) => { order.push('after 2'); return response; },
+        async (response) => {
+          order.push('after 1');
+          return response;
+        },
+        async (response) => {
+          order.push('after 2');
+          return response;
+        },
       ],
     },
   });
@@ -381,14 +466,26 @@ test('hooks run serially in array order', async () => {
   assert.deepStrictEqual(order, ['before 1', 'before 2', 'after 1', 'after 2']);
 });
 
-test('extend concatenates hooks with the parent client\'s', async () => {
+test("extend concatenates hooks with the parent client's", async () => {
   const order: string[] = [];
 
   const parent = client.extend({
-    hooks: {beforeRequest: [() => { order.push('parent'); }]},
+    hooks: {
+      beforeRequest: [
+        () => {
+          order.push('parent');
+        },
+      ],
+    },
   });
   const child = parent.extend({
-    hooks: {beforeRequest: [() => { order.push('child'); }]},
+    hooks: {
+      beforeRequest: [
+        () => {
+          order.push('child');
+        },
+      ],
+    },
   });
 
   await child.get('http://localhost:3000/json');
@@ -397,18 +494,20 @@ test('extend concatenates hooks with the parent client\'s', async () => {
 });
 
 test('beforeRequest can mutate headers and sees the resolved url and body', async () => {
-  const seen: {url?: unknown, body?: unknown, method?: unknown} = {};
+  const seen: {url?: unknown; body?: unknown; method?: unknown} = {};
 
   const extClient = client.extend({
     prefixUrl: 'http://localhost:3000',
     responseType: 'json',
     hooks: {
-      beforeRequest: [(options) => {
-        seen.url = options.url;
-        seen.body = options.body;
-        seen.method = options.method;
-        options.headers['x-signature'] = 'signed';
-      }],
+      beforeRequest: [
+        (options) => {
+          seen.url = options.url;
+          seen.body = options.body;
+          seen.method = options.method;
+          options.headers['x-signature'] = 'signed';
+        },
+      ],
     },
   });
 
@@ -425,18 +524,17 @@ test('afterResponse sees error statuses before throwHttpErrors applies', async (
 
   const extClient = client.extend({
     hooks: {
-      afterResponse: [(response) => {
-        seenStatus = response.statusCode;
+      afterResponse: [
+        (response) => {
+          seenStatus = response.statusCode;
 
-        return response;
-      }],
+          return response;
+        },
+      ],
     },
   });
 
-  await assert.rejects(
-    () => extClient.get('http://localhost:3000/status?code=401'),
-    {code: 'ERR_HTTP_ERROR'},
-  );
+  await assert.rejects(() => extClient.get('http://localhost:3000/status?code=401'), {code: 'ERR_HTTP_ERROR'});
 
   assert.strictEqual(seenStatus, 401);
 });
@@ -448,22 +546,24 @@ test('afterResponse can retry with merged options', async () => {
     responseType: 'json',
     context: {brandId: 7},
     hooks: {
-      afterResponse: [async (response, retryWithMergedOptions) => {
-        attempts++;
+      afterResponse: [
+        async (response, retryWithMergedOptions) => {
+          attempts++;
 
-        // The alreadyRetried flag is what stops this from looping - same shape the
-        // aggregator's providers use.
-        if (response.statusCode === 401 && !response.request.options.context.alreadyRetried) {
-          assert.strictEqual(response.request.options.context.brandId, 7);
+          // The alreadyRetried flag is what stops this from looping - same shape the
+          // aggregator's providers use.
+          if (response.statusCode === 401 && !response.request.options.context.alreadyRetried) {
+            assert.strictEqual(response.request.options.context.brandId, 7);
 
-          return retryWithMergedOptions({
-            headers: {authorization: 'Bearer refreshed'},
-            context: {...response.request.options.context, alreadyRetried: true},
-          });
-        }
+            return retryWithMergedOptions({
+              headers: {authorization: 'Bearer refreshed'},
+              context: {...response.request.options.context, alreadyRetried: true},
+            });
+          }
 
-        return response;
-      }],
+          return response;
+        },
+      ],
     },
   });
 
@@ -480,13 +580,15 @@ test('afterResponse retry keeps prefixUrl from being applied twice', async () =>
     prefixUrl: 'http://localhost:3000',
     responseType: 'json',
     hooks: {
-      afterResponse: [async (response, retryWithMergedOptions) => {
-        if (response.statusCode === 401) {
-          return retryWithMergedOptions({headers: {authorization: 'Bearer refreshed'}});
-        }
+      afterResponse: [
+        async (response, retryWithMergedOptions) => {
+          if (response.statusCode === 401) {
+            return retryWithMergedOptions({headers: {authorization: 'Bearer refreshed'}});
+          }
 
-        return response;
-      }],
+          return response;
+        },
+      ],
     },
   });
 
@@ -518,14 +620,23 @@ test('beforeError can replace the thrown error', async () => {
   );
 });
 
-test('hooks passed to a single call are ignored', async () => {
-  let called = false;
+/**
+ * Hooks are client-level. They used to be silently ignored when passed to a single call,
+ * which is the kind of thing you only discover by wondering why nothing fired.
+ */
+test('hooks passed to a single call are rejected', async () => {
+  await assert.rejects(
+    () =>
+      client.get('http://localhost:3000/json', {
+        hooks: {beforeRequest: [() => undefined]},
+      }),
+    (err: Error) => {
+      assert.ok(err instanceof ValidationError);
+      assert.match(err.message, /only be set when creating or extending/);
 
-  await client.get('http://localhost:3000/json', {
-    hooks: {beforeRequest: [() => { called = true; }]},
-  });
-
-  assert.strictEqual(called, false);
+      return true;
+    },
+  );
 });
 
 test('extend client multiple times with headers', async () => {
@@ -543,7 +654,7 @@ test('extend client multiple times with headers', async () => {
     responseType: 'json',
   });
 
-  const response = await extClient2.get<{ foo: string, foo2: string }>('http://localhost:3000/headers');
+  const response = await extClient2.get<{foo: string; foo2: string}>('http://localhost:3000/headers');
 
   assert.strictEqual(response.body.foo, 'bar');
   assert.strictEqual(response.body.foo2, 'bar2');
@@ -558,9 +669,9 @@ test('extend client with headers on call', async () => {
     responseType: 'json',
   });
 
-  const response = await extClient.get<{ foo: string, foo2: string }>('http://localhost:3000/headers', {
+  const response = await extClient.get<{foo: string; foo2: string}>('http://localhost:3000/headers', {
     headers: {
-      foo2: 'bar2'
+      foo2: 'bar2',
     },
   });
 
@@ -570,15 +681,18 @@ test('extend client with headers on call', async () => {
 });
 
 test('throw error on non-2xx if throwHttpErrors is true', () => {
-  assert.rejects(async () => {
-    await client.get('http://localhost:3000/status?code=403&message=Forbidden');
-  }, {
-    code: 'ERR_HTTP_ERROR',
-    message: 'Response code 403',
-  })
+  assert.rejects(
+    async () => {
+      await client.get('http://localhost:3000/status?code=403&message=Forbidden');
+    },
+    {
+      code: 'ERR_HTTP_ERROR',
+      message: 'Response code 403',
+    },
+  );
 });
 
-test('don\'t throw error on non-2xx if throwHttpErrors is false', async () => {
+test("don't throw error on non-2xx if throwHttpErrors is false", async () => {
   const response = await client.get('http://localhost:3000/status?code=403&message=Forbidden', {
     throwHttpErrors: false,
   });
@@ -597,10 +711,9 @@ test('prefixUrl is added before url', async () => {
 });
 
 test('followers redirects if followRedirect is true', async () => {
-  const response = await client.get('http://localhost:3000/redirect', {
-    followRedirect: true,
-    responseType: 'text',
-  });
+  const redirecting = client.extend({followRedirect: true, responseType: 'text'});
+
+  const response = await redirecting.get('http://localhost:3000/redirect');
 
   assert.strictEqual(response.statusCode, 200);
   assert.strictEqual(response.body, '{"test": "value"}\n');
@@ -699,7 +812,7 @@ test('stream accepts a request body written to the duplex', async () => {
 test('stream errors on a non-2xx when throwHttpErrors is on', async () => {
   const duplex = await client.stream('http://localhost:3000/status?code=500');
 
-  const err = await text(duplex).catch(e => e as Error);
+  const err = await failure<Error>(text(duplex));
 
   assert.ok(err instanceof HTTPError, `expected an HTTPError, got ${err}`);
   assert.strictEqual(err.code, 'ERR_HTTP_ERROR');
@@ -721,7 +834,7 @@ test('stream does not error on a non-2xx when throwHttpErrors is off', async () 
 test('stream response promise rejects when the request fails outright', async () => {
   const duplex = await client.stream('http://localhost:3999/nothing-listening');
 
-  const err = await duplex.response.catch(e => e as Error);
+  const err = await failure<Error>(duplex.response);
 
   assert.ok(err instanceof Error);
 
@@ -733,16 +846,20 @@ test('stream runs handlers and beforeRequest hooks', async () => {
   const seen: string[] = [];
 
   const extClient = client.extend({
-    handlers: [(options, next) => {
-      seen.push('handler');
+    handlers: [
+      (options, next) => {
+        seen.push('handler');
 
-      return next(options);
-    }],
+        return next(options);
+      },
+    ],
     hooks: {
-      beforeRequest: [(options) => {
-        seen.push('hook');
-        options.headers['x-streamed'] = 'yes';
-      }],
+      beforeRequest: [
+        (options) => {
+          seen.push('hook');
+          options.headers['x-streamed'] = 'yes';
+        },
+      ],
     },
   });
 
@@ -753,7 +870,6 @@ test('stream runs handlers and beforeRequest hooks', async () => {
   assert.strictEqual(echo.headers['x-streamed'], 'yes');
 });
 
-
 test('retries on 429', async () => {
   const extClient = client.extend({
     headers: {
@@ -762,7 +878,7 @@ test('retries on 429', async () => {
     retry: {
       limit: 3,
       backoffLimit: 10,
-    }
+    },
   });
 
   const response = await extClient.get('http://localhost:3000/retry');
@@ -798,10 +914,7 @@ test('exhausted retries throw when throwHttpErrors is set', async () => {
     },
   });
 
-  await assert.rejects(
-    () => extClient.get('http://localhost:3000/retry'),
-    {code: 'ERR_HTTP_ERROR'},
-  );
+  await assert.rejects(() => extClient.get('http://localhost:3000/retry'), {code: 'ERR_HTTP_ERROR'});
 });
 
 test('retry limit of 0 disables retries', async () => {
@@ -827,15 +940,12 @@ test('retry limit of 0 disables retries', async () => {
  * import order no longer matters.
  */
 test('picks up a global dispatcher installed after the client was constructed', async () => {
-  const {Gotlike} = await import('./index');
   const freshClient = new Gotlike({responseType: 'text'});
 
   const previous = getGlobalDispatcher();
   const agent = new MockAgent();
 
-  agent.get('http://localhost:3001')
-    .intercept({method: 'GET', path: '/late'})
-    .reply(200, 'from the late dispatcher');
+  agent.get('http://localhost:3001').intercept({method: 'GET', path: '/late'}).reply(200, 'from the late dispatcher');
 
   setGlobalDispatcher(agent);
 
@@ -854,7 +964,7 @@ test('http error carries the parsed body, timings and request options', async ()
     context: {brandId: 3},
   });
 
-  const err = await extClient.get('http://localhost:3000/unauthorized').catch(e => e as RequestError);
+  const err = await failure<RequestError>(extClient.get('http://localhost:3000/unauthorized'));
 
   assert.ok(err instanceof RequestError);
   assert.strictEqual(err.code, 'ERR_HTTP_ERROR');
@@ -867,9 +977,11 @@ test('http error carries the parsed body, timings and request options', async ()
 });
 
 test('parse failure error carries the raw body and preserves the cause', async () => {
-  const err = await client.get('http://localhost:3000/text', {
-    responseType: 'json',
-  }).catch(e => e as RequestError);
+  const err = await failure(
+    client.get('http://localhost:3000/text', {
+      responseType: 'json',
+    }),
+  );
 
   assert.strictEqual(err.code, 'ERR_BODY_PARSE_FAILURE');
   assert.strictEqual(err.response?.body, 'hello\n');
@@ -878,9 +990,11 @@ test('parse failure error carries the raw body and preserves the cause', async (
 });
 
 test('timeout error preserves the underlying undici error as cause', async () => {
-  const err = await client.get('http://localhost:3000/timeout', {
-    timeout: {request: 100},
-  }).catch(e => e as RequestError);
+  const err = await failure<RequestError>(
+    client.get('http://localhost:3000/timeout', {
+      timeout: {request: 100},
+    }),
+  );
 
   assert.strictEqual(err.code, 'ETIMEDOUT');
   assert.strictEqual(err.cause instanceof Error, true);
@@ -890,8 +1004,7 @@ test('timeout error preserves the underlying undici error as cause', async () =>
 });
 
 test('connection error has no response and preserves the cause', async () => {
-  const err = await client.get('http://localhost:3999/nothing-listening')
-    .catch(e => e as RequestError);
+  const err = await failure<RequestError>(client.get('http://localhost:3999/nothing-listening'));
 
   assert.strictEqual(err.code, 'ERR_REQUEST_ERROR');
   assert.strictEqual(err.response, undefined);
@@ -912,12 +1025,21 @@ test('prefixUrl joins without doubling slashes', async () => {
     responseType: 'json',
   });
 
-  for (const [prefix, path] of [['http://localhost:3000/api', 'thing'], ['http://localhost:3000/api/', '/thing']] as const) {
+  for (const [prefix, path] of [
+    ['http://localhost:3000/api', 'thing'],
+    ['http://localhost:3000/api/', '/thing'],
+  ] as const) {
     const seen: string[] = [];
     const probe = client.extend({
       prefixUrl: prefix,
       responseType: 'json',
-      hooks: {beforeRequest: [(options) => { seen.push(options.url as string); }]},
+      hooks: {
+        beforeRequest: [
+          (options) => {
+            seen.push(options.url as string);
+          },
+        ],
+      },
     });
 
     await probe.get(path).catch(() => undefined);
@@ -937,7 +1059,7 @@ test('an absolute url overrides prefixUrl instead of being appended to it', asyn
     responseType: 'json',
   });
 
-  const response = await extClient.get<{ test: string }>('http://localhost:3000/json');
+  const response = await extClient.get<{test: string}>('http://localhost:3000/json');
 
   assert.strictEqual(response.statusCode, 200);
   assert.strictEqual(response.body.test, 'value');
@@ -949,7 +1071,13 @@ test('context is shallow-merged over the instance context', async () => {
 
   const extClient = client.extend({
     context: {service: 'test', keep: true},
-    hooks: {beforeRequest: [(options) => { seen.push(options.context); }]},
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          seen.push(options.context);
+        },
+      ],
+    },
   });
 
   await extClient.get('http://localhost:3000/json', {context: {service: 'override'}});
@@ -961,7 +1089,13 @@ test('context reads as empty when none was set', async () => {
   const seen: Record<string, any>[] = [];
 
   const extClient = client.extend({
-    hooks: {beforeRequest: [(options) => { seen.push(options.context); }]},
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          seen.push(options.context);
+        },
+      ],
+    },
   });
 
   await extClient.get('http://localhost:3000/json');
@@ -987,7 +1121,7 @@ test('json sets a content-type unless the caller already did', async () => {
   assert.strictEqual(explicit.body['content-type'], 'application/vnd.api+json');
 });
 
-type Echo = {url: string, method: string, headers: Record<string, string>, body: string};
+type Echo = {url: string; method: string; headers: Record<string, string>; body: string};
 
 test('gzip responses are decompressed', async () => {
   const response = await client.get<{compressed: boolean}>('http://localhost:3000/gzip', {
@@ -1007,7 +1141,7 @@ test('accept-encoding is advertised, and overridable', async () => {
   const auto = await client.get<Echo>('http://localhost:3000/echo', {responseType: 'json'});
 
   // Built from what this runtime can decode, so the exact list depends on the node version.
-  const advertised = auto.body.headers['accept-encoding'].split(', ');
+  const advertised = (auto.body.headers['accept-encoding'] ?? '').split(', ');
 
   assert.ok(advertised.includes('gzip'));
   assert.ok(advertised.includes('deflate'));
@@ -1045,10 +1179,10 @@ test('responseType buffer resolves to a real Buffer', async () => {
 });
 
 test('resolveBodyOnly with a buffer returns the Buffer itself', async () => {
-  const body = await client.get<Buffer>('http://localhost:3000/png', {
+  const body = (await client.get<Buffer>('http://localhost:3000/png', {
     responseType: 'buffer',
     resolveBodyOnly: true,
-  }) as unknown as Buffer;
+  })) as unknown as Buffer;
 
   assert.ok(Buffer.isBuffer(body));
 });
@@ -1185,7 +1319,7 @@ test('dedupe collapses concurrent identical GETs', async () => {
     extClient.get('http://localhost:3000/counted'),
   ]);
 
-  assert.strictEqual(requestCounts['/counted'] - before, 1);
+  assert.strictEqual((requestCounts['/counted'] ?? 0) - before, 1);
 });
 
 test('without dedupe every concurrent request reaches the server', async () => {
@@ -1193,12 +1327,9 @@ test('without dedupe every concurrent request reaches the server', async () => {
 
   const extClient = new Gotlike({responseType: 'json'});
 
-  await Promise.all([
-    extClient.get('http://localhost:3000/counted'),
-    extClient.get('http://localhost:3000/counted'),
-  ]);
+  await Promise.all([extClient.get('http://localhost:3000/counted'), extClient.get('http://localhost:3000/counted')]);
 
-  assert.strictEqual(requestCounts['/counted'] - before, 2);
+  assert.strictEqual((requestCounts['/counted'] ?? 0) - before, 2);
 });
 
 test('cache serves a second request from the cache', async () => {
@@ -1209,7 +1340,7 @@ test('cache serves a second request from the cache', async () => {
   await extClient.get('http://localhost:3000/cacheable');
   await extClient.get('http://localhost:3000/cacheable');
 
-  assert.strictEqual(requestCounts['/cacheable'] - before, 1);
+  assert.strictEqual((requestCounts['/cacheable'] ?? 0) - before, 1);
 });
 
 test('pool options build a dedicated agent', async () => {
@@ -1228,7 +1359,7 @@ test('pool options build a dedicated agent', async () => {
   assert.strictEqual(response.body.test, 'value');
 });
 
-test('followRedirect false on the client skips the redirect interceptor', async () => {
+test('followRedirect false explicitly still resolves with the redirect response', async () => {
   const extClient = new Gotlike({followRedirect: false});
 
   const response = await extClient.get('http://localhost:3000/redirect');
@@ -1261,10 +1392,10 @@ test('response.ok reflects the 2xx range', async () => {
 });
 
 test('response.rawBody returns the body as a Buffer', async () => {
-  const text = await client.get('http://localhost:3000/json');
+  const asText = await client.get('http://localhost:3000/json');
 
-  assert.ok(Buffer.isBuffer(text.rawBody));
-  assert.strictEqual(text.rawBody.toString(), '{"test": "value"}\n');
+  assert.ok(Buffer.isBuffer(asText.rawBody));
+  assert.strictEqual(asText.rawBody.toString(), '{"test": "value"}\n');
 
   const parsed = await client.get('http://localhost:3000/json', {responseType: 'json'});
 
@@ -1299,7 +1430,7 @@ test('retryCount is present on an error response too', async () => {
     retry: {limit: 1, backoffLimit: 10},
   });
 
-  const err = await extClient.get('http://localhost:3000/retry').catch(e => e as RequestError);
+  const err = await failure<RequestError>(extClient.get('http://localhost:3000/retry'));
 
   assert.strictEqual(err.response?.retryCount, 1);
 });
@@ -1333,37 +1464,38 @@ test('username without a password still authenticates', async () => {
     username: 'apikey',
   });
 
-  assert.strictEqual(
-    response.body.headers['authorization'],
-    'Basic ' + Buffer.from('apikey:').toString('base64'),
-  );
+  assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from('apikey:').toString('base64'));
 });
 
 test('errors use named classes and stay instanceof RequestError', async () => {
-  const httpError = await client.get('http://localhost:3000/status?code=500').catch(e => e as Error);
+  const httpError = await failure<Error>(client.get('http://localhost:3000/status?code=500'));
 
   assert.ok(httpError instanceof HTTPError);
   assert.ok(httpError instanceof RequestError);
   assert.strictEqual(httpError.name, 'HTTPError');
   assert.strictEqual((httpError as HTTPError).code, 'ERR_HTTP_ERROR');
 
-  const timeoutError = await client.get('http://localhost:3000/timeout', {
-    timeout: {request: 100},
-  }).catch(e => e as Error);
+  const timeoutError = await failure(
+    client.get('http://localhost:3000/timeout', {
+      timeout: {request: 100},
+    }),
+  );
 
   assert.ok(timeoutError instanceof TimeoutError);
   assert.ok(timeoutError instanceof RequestError);
   assert.strictEqual(timeoutError.name, 'TimeoutError');
 
-  const parseError = await client.get('http://localhost:3000/text', {
-    responseType: 'json',
-  }).catch(e => e as Error);
+  const parseError = await failure<Error>(
+    client.get('http://localhost:3000/text', {
+      responseType: 'json',
+    }),
+  );
 
   assert.ok(parseError instanceof ParseError);
   assert.ok(parseError instanceof RequestError);
   assert.strictEqual(parseError.name, 'ParseError');
 
-  const connectionError = await client.get('http://localhost:3999/nope').catch(e => e as Error);
+  const connectionError = await failure(client.get('http://localhost:3999/nope'));
 
   assert.ok(connectionError instanceof RequestError);
   assert.ok(!(connectionError instanceof HTTPError));
@@ -1371,15 +1503,17 @@ test('errors use named classes and stay instanceof RequestError', async () => {
 });
 
 test('beforeRetry fires for each retry with the failed attempt details', async () => {
-  const seen: {statusCode?: number, retryCount: number}[] = [];
+  const seen: {statusCode?: number; retryCount: number}[] = [];
 
   const extClient = client.extend({
     headers: {'test-id': randomUUID()},
     retry: {limit: 3, backoffLimit: 10},
     hooks: {
-      beforeRetry: [(_error, statusCode, retryCount) => {
-        seen.push({statusCode, retryCount});
-      }],
+      beforeRetry: [
+        (_error, statusCode, retryCount) => {
+          seen.push({statusCode, retryCount});
+        },
+      ],
     },
   });
 
@@ -1398,7 +1532,13 @@ test('beforeRetry reports the error for a transport failure', async () => {
 
   const extClient = client.extend({
     retry: {limit: 1, backoffLimit: 10, errorCodes: ['ECONNREFUSED']},
-    hooks: {beforeRetry: [(error) => { seen.push(error); }]},
+    hooks: {
+      beforeRetry: [
+        (error) => {
+          seen.push(error);
+        },
+      ],
+    },
   });
 
   await extClient.get('http://localhost:3999/nope').catch(() => undefined);
@@ -1412,7 +1552,13 @@ test('beforeRetry does not fire when nothing is retried', async () => {
 
   const extClient = client.extend({
     retry: {limit: 3, backoffLimit: 10},
-    hooks: {beforeRetry: [() => { calls++; }]},
+    hooks: {
+      beforeRetry: [
+        () => {
+          calls++;
+        },
+      ],
+    },
   });
 
   await extClient.get('http://localhost:3000/json');
@@ -1425,9 +1571,11 @@ test('beforeRetry does not fire when nothing is retried', async () => {
  * error body is exactly what error handling needs to read, so the default is overridden.
  */
 test('error responses are decompressed too', async () => {
-  const err = await client.get('http://localhost:3000/gzip-error', {
-    responseType: 'json',
-  }).catch(e => e as RequestError);
+  const err = await failure(
+    client.get('http://localhost:3000/gzip-error', {
+      responseType: 'json',
+    }),
+  );
 
   assert.strictEqual(err.code, 'ERR_HTTP_ERROR');
   assert.deepStrictEqual(err.response?.body, {error: 'OP_ERROR_INVALID_TOKEN'});
@@ -1456,19 +1604,21 @@ test('handlers still see a full response under resolveBodyOnly', async () => {
 
   const extClient = client.extend({
     responseType: 'json',
-    handlers: [async (options, next) => {
-      const response = await next(options);
+    handlers: [
+      async (options, next) => {
+        const response = await next(options);
 
-      seen.push(response.timings.phases.total);
-      seen.push(response.statusCode);
+        seen.push(response.timings.phases.total);
+        seen.push(response.statusCode);
 
-      return response;
-    }],
+        return response;
+      },
+    ],
   });
 
-  const body = await extClient.get('http://localhost:3000/json', {
+  const body = (await extClient.get('http://localhost:3000/json', {
     resolveBodyOnly: true,
-  }) as unknown as {test: string};
+  })) as unknown as {test: string};
 
   assert.strictEqual(seen.length, 2);
   assert.strictEqual(typeof seen[0], 'number');
@@ -1482,35 +1632,645 @@ test('afterResponse hooks see a full response under resolveBodyOnly', async () =
   const extClient = client.extend({
     responseType: 'json',
     hooks: {
-      afterResponse: [(response) => {
-        statusCode = response.statusCode;
+      afterResponse: [
+        (response) => {
+          statusCode = response.statusCode;
 
-        return response;
-      }],
+          return response;
+        },
+      ],
     },
   });
 
-  const body = await extClient.get('http://localhost:3000/json', {
+  const body = (await extClient.get('http://localhost:3000/json', {
     resolveBodyOnly: true,
-  }) as unknown as {test: string};
+  })) as unknown as {test: string};
 
   assert.strictEqual(statusCode, 200);
   assert.deepStrictEqual(body, {test: 'value'});
 });
 
-test('nock mocks request once', async () => {
-  nock('http://localhost:3000')
-    .get('/json')
-    .reply(201, '{"test": "newvalue"}');
+test('the client can be called directly', async () => {
+  const response = await client<{test: string}>('http://localhost:3000/json', {
+    responseType: 'json',
+  });
 
-  const response = await client.get<{ test: string }>('http://localhost:3000/json', {
+  assert.strictEqual(response.statusCode, 200);
+  assert.deepStrictEqual(response.body, {test: 'value'});
+});
+
+test('a called client defaults to GET and honours instance options', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    headers: {'x-from': 'instance'},
+  });
+
+  const response = await extClient<Echo>('echo');
+
+  assert.strictEqual(response.body.method, 'GET');
+  assert.strictEqual(response.body.headers['x-from'], 'instance');
+});
+
+test('the ThumbnailService shape works: callable + buffer + resolveBodyOnly', async () => {
+  const body = (await client<Buffer>('http://localhost:3000/png', {
+    responseType: 'buffer',
+    resolveBodyOnly: true,
+  })) as unknown as Buffer;
+
+  assert.ok(Buffer.isBuffer(body));
+  assert.strictEqual(body.subarray(1, 4).toString(), 'PNG');
+});
+
+test('a callable client keeps every method and stays callable through extend', async () => {
+  const extended = client.extend({responseType: 'json'});
+
+  assert.strictEqual(typeof extended, 'function');
+  assert.strictEqual(typeof extended.get, 'function');
+  assert.strictEqual(typeof extended.post, 'function');
+  assert.strictEqual(typeof extended.stream, 'function');
+  assert.strictEqual(typeof extended.extend, 'function');
+
+  const twice = extended.extend({headers: {'x-twice': '1'}});
+
+  assert.strictEqual(typeof twice, 'function');
+
+  const viaCall = await twice<Echo>('http://localhost:3000/echo');
+  const viaMethod = await twice.get<Echo>('http://localhost:3000/echo');
+
+  assert.strictEqual(viaCall.body.headers['x-twice'], '1');
+  assert.strictEqual(viaMethod.body.headers['x-twice'], '1');
+});
+
+/**
+ * The `agent` getter reads private `#composed` fields, so methods have to stay bound to the
+ * real instance rather than to the wrapping function.
+ */
+test('a callable client exposes getters and fields that touch private state', async () => {
+  const extended = client.extend({responseType: 'json'});
+
+  assert.ok(extended.agent, 'agent getter should resolve through the callable');
+  assert.strictEqual(extended.agent, extended.agent, 'composition should still be memoised');
+  assert.strictEqual(extended.baseOptions?.responseType, 'json');
+  assert.strictEqual(extended.validate, true);
+});
+
+test('validation rejects unknown and malformed options', async () => {
+  const cases: [Record<string, unknown>, RegExp][] = [
+    [{responseTyp: 'json'}, /Unknown option `responseTyp`/],
+    [{responseType: 'jsn'}, /`responseType` must be one of/],
+    [{method: 'FETCH'}, /`method` must be a valid HTTP method/],
+    [{timeout: 5000}, /`timeout` must be an object/],
+    [{timeout: {request: -1}}, /`timeout.request` must be a non-negative number/],
+    [{headers: []}, /`headers` must be an object/],
+    [{prefixUrl: 123}, /`prefixUrl` must be a string/],
+    [{searchParams: 5}, /`searchParams` must be a string/],
+    [{form: 'a=1'}, /`form` must be a URLSearchParams/],
+    [{retry: {limit: 1}}, /can only be set when creating or extending/],
+  ];
+
+  for (const [options, expected] of cases) {
+    await assert.rejects(
+      () => client.get('http://localhost:3000/json', options as never),
+      (err: Error) => {
+        assert.ok(err instanceof ValidationError, `expected ValidationError for ${JSON.stringify(options)}`);
+        assert.match(err.message, expected);
+
+        return true;
+      },
+      `expected ${JSON.stringify(options)} to be rejected`,
+    );
+  }
+});
+
+test('validation runs on create and extend, throwing synchronously', () => {
+  assert.throws(() => new Gotlike({responseType: 'nope' as never}), ValidationError);
+  assert.throws(() => new Gotlike({hooks: {beforeRequest: (() => undefined) as never}}), /must be an array/);
+  assert.throws(() => client.extend({timeout: 1000 as never}), ValidationError);
+
+  // client-only options are fine here - that is the whole point of `atCreation`
+  assert.doesNotThrow(() => client.extend({retry: {limit: 2}, hooks: {beforeRequest: []}}));
+});
+
+test('validate itself is client-only', async () => {
+  // Read from the instance, so a per-request value would have done nothing at all.
+  await assert.rejects(
+    () => client.get('http://localhost:3000/json', {validate: false}),
+    (err: Error) => {
+      assert.ok(err instanceof ValidationError);
+      assert.match(err.message, /only be set when creating or extending/);
+
+      return true;
+    },
+  );
+});
+
+test('validate false skips the per-request check but not the client one', async () => {
+  const lax = new Gotlike({responseType: 'text', validate: false});
+
+  // would be rejected as an unknown option otherwise
+  const response = await lax.get('http://localhost:3000/json', {nonsense: true} as never);
+
+  assert.strictEqual(response.statusCode, 200);
+
+  assert.throws(() => new Gotlike({validate: false, responseType: 'nope' as never}), ValidationError);
+});
+
+test('beforeRedirect fires for each hop with the redirecting response', async () => {
+  const seen: {path: string; statusCode: number; location?: string}[] = [];
+
+  const extClient = client.extend({
+    responseType: 'json',
+    followRedirect: true,
+    hooks: {
+      beforeRedirect: [
+        (request, response) => {
+          seen.push({
+            path: request.path,
+            statusCode: response.statusCode,
+            location: response.headers['location'] as string | undefined,
+          });
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://localhost:3000/redirect-chain');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.deepStrictEqual(seen, [
+    {path: '/redirect-chain-2', statusCode: 302, location: '/redirect-chain-2'},
+    {path: '/echo', statusCode: 301, location: '/echo'},
+  ]);
+});
+
+/**
+ * The reason this hook exists: undici drops `authorization` when a redirect crosses origins,
+ * and `beforeRedirect` is where you decide to put it back.
+ */
+test('beforeRedirect can restore a header stripped on a cross-origin redirect', async () => {
+  const redirecting = client.extend({followRedirect: true, responseType: 'json'});
+
+  const withoutHook = await redirecting.get<Echo>('http://localhost:3000/redirect-cross-origin', {
+    headers: {authorization: 'Bearer secret'},
+  });
+
+  assert.strictEqual(withoutHook.body.headers['authorization'], undefined, 'undici should strip it');
+
+  const extClient = redirecting.extend({
+    hooks: {
+      beforeRedirect: [
+        (request) => {
+          request.headers['authorization'] = 'Bearer restored';
+        },
+      ],
+    },
+  });
+
+  const withHook = await extClient.get<Echo>('http://localhost:3000/redirect-cross-origin', {
+    headers: {authorization: 'Bearer secret'},
+  });
+
+  assert.strictEqual(withHook.body.headers['authorization'], 'Bearer restored');
+});
+
+test('beforeRedirect does not fire when nothing redirects', async () => {
+  let calls = 0;
+
+  const extClient = client.extend({
+    hooks: {
+      beforeRedirect: [
+        () => {
+          calls++;
+        },
+      ],
+    },
+  });
+
+  await extClient.get('http://localhost:3000/json');
+
+  assert.strictEqual(calls, 0);
+});
+
+test('beforeRedirect does not fire when followRedirect is off', async () => {
+  let calls = 0;
+
+  const extClient = client.extend({
+    followRedirect: false,
+    throwHttpErrors: false,
+    hooks: {
+      beforeRedirect: [
+        () => {
+          calls++;
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get('http://localhost:3000/redirect-chain');
+
+  assert.strictEqual(response.statusCode, 302);
+  assert.strictEqual(calls, 0);
+});
+
+test('beforeRedirect concatenates through extend and works on streams', async () => {
+  const seen: string[] = [];
+
+  const parent = client.extend({
+    followRedirect: true,
+    hooks: {
+      beforeRedirect: [
+        () => {
+          seen.push('parent');
+        },
+      ],
+    },
+  });
+  const child = parent.extend({
+    hooks: {
+      beforeRedirect: [
+        () => {
+          seen.push('child');
+        },
+      ],
+    },
+  });
+
+  const duplex = await child.stream('http://localhost:3000/redirect');
+
+  const head = await duplex.response;
+
+  await text(duplex);
+
+  assert.strictEqual(head.statusCode, 200, 'the redirect should have been followed');
+  assert.deepStrictEqual(seen, ['parent', 'child']);
+});
+
+test('redirect hops are not counted as retries', async () => {
+  const extClient = client.extend({
+    headers: {'test-id': randomUUID()},
+    followRedirect: true,
+    retry: {limit: 2, backoffLimit: 10},
+    hooks: {beforeRedirect: [() => undefined]},
+  });
+
+  const response = await extClient.get('http://localhost:3000/redirect-chain');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.retryCount, 0);
+});
+
+/**
+ * `undici.pipeline` makes the duplex's writable side the request body, and undici won't
+ * follow a redirect whose body it can't replay - so a piped GET used to hand back the 302
+ * itself with an empty body. Requests with no body take a path where redirects work.
+ */
+test('a bodyless stream follows redirects', async () => {
+  const duplex = await client.extend({followRedirect: true}).stream('http://localhost:3000/redirect-chain');
+
+  const head = await duplex.response;
+  const body = JSON.parse(await text(duplex)) as Echo;
+
+  assert.strictEqual(head.statusCode, 200);
+  assert.strictEqual(body.url, '/echo');
+});
+
+test('a streamed POST follows a 302, which drops the body anyway', async () => {
+  const duplex = await client.extend({followRedirect: true}).stream('http://localhost:3000/redirect-chain', {
+    method: 'POST',
+    throwHttpErrors: false,
+  });
+
+  duplex.end('dropped-by-the-302');
+
+  const head = await duplex.response;
+  const echo = JSON.parse(await text(duplex)) as Echo;
+
+  // 301/302 on POST rewrites to GET and discards the body, so there is nothing to replay.
+  assert.strictEqual(head.statusCode, 200);
+  assert.strictEqual(echo.method, 'GET');
+  assert.strictEqual(echo.body, '');
+});
+
+/**
+ * The actual limitation: a 307 preserves method and body, so the body would have to be
+ * replayed - and undici will not replay a stream. The request resolves with the 307 itself.
+ */
+test('a streamed body is not replayed across a 307', async () => {
+  const duplex = await client.extend({followRedirect: true}).stream('http://localhost:3000/redirect-307', {
+    method: 'POST',
+    throwHttpErrors: false,
+  });
+
+  duplex.end('cannot-be-replayed');
+
+  const head = await duplex.response;
+
+  assert.strictEqual(head.statusCode, 307);
+
+  await text(duplex);
+});
+
+test('a non-streamed body is replayed across a 307', async () => {
+  const response = await client.extend({followRedirect: true}).post<Echo>('http://localhost:3000/redirect-307', {
+    responseType: 'json',
+    body: 'can-be-replayed',
+  });
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.body.method, 'POST');
+  assert.strictEqual(response.body.body, 'can-be-replayed');
+});
+
+/**
+ * A bodyless request gets the response stream unwrapped: there is nothing to write to a GET,
+ * and wrapping it in a duplex costs about 10% of stream throughput. A method that can carry
+ * a body still gets the writable half.
+ */
+test('a bodyless stream is a plain readable, an upload stream is writable', async () => {
+  const download = await client.stream('http://localhost:3000/json');
+
+  assert.strictEqual(typeof (download as unknown as {write?: unknown}).write, 'undefined');
+  assert.strictEqual(typeof download.pipe, 'function');
+  assert.strictEqual(await text(download), '{"test": "value"}\n');
+
+  const upload = await client.stream('http://localhost:3000/echo', {method: 'POST'});
+
+  assert.strictEqual(typeof upload.write, 'function');
+  upload.end('written');
+
+  const echo = JSON.parse(await text(upload)) as Echo;
+
+  assert.strictEqual(echo.body, 'written');
+});
+
+/**
+ * The `agent` option is the transport seam: gotlike never looks inside a dispatcher, so any
+ * `Dispatcher` works - a ProxyAgent, an H2CClient, or one that doesn't exist yet. This is
+ * the whole of what "supporting a new transport" would mean here, HTTP/3 included.
+ */
+test('an arbitrary custom dispatcher can back the client', async () => {
+  class CustomTransport extends Dispatcher {
+    #inner = new Agent();
+    dispatched = 0;
+
+    override dispatch(options: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+      this.dispatched++;
+      options.headers = {...(options.headers as object), 'x-transport': 'custom'};
+
+      return this.#inner.dispatch(options, handler);
+    }
+
+    override close() {
+      return this.#inner.close();
+    }
+
+    override destroy() {
+      return this.#inner.destroy();
+    }
+  }
+
+  const transport = new CustomTransport();
+  const extClient = new Gotlike({agent: transport, responseType: 'json'});
+
+  const response = await extClient.get<Echo>('http://localhost:3000/echo');
+
+  assert.strictEqual(response.body.headers['x-transport'], 'custom');
+  assert.strictEqual(transport.dispatched, 1);
+
+  // The interceptor chain still composes on top of whatever transport is underneath.
+  assert.notStrictEqual(extClient.agent, transport);
+
+  await transport.close();
+});
+
+/**
+ * Redirects are opt-in: undici allocates a RedirectHandler per request once its interceptor is
+ * composed, which measured at ~80% of this client's whole per-request overhead. This is a
+ * deliberate divergence from got, so it is pinned down here.
+ */
+test('redirects are not followed by default', async () => {
+  const response = await client.get('http://localhost:3000/redirect', {throwHttpErrors: false});
+
+  assert.strictEqual(response.statusCode, 302);
+  assert.strictEqual(response.headers['location'], '/json');
+  assert.strictEqual(response.ok, false);
+});
+
+test('followRedirect true on the client follows them', async () => {
+  const redirecting = client.extend({followRedirect: true, responseType: 'json'});
+
+  const response = await redirecting.get<{test: string}>('http://localhost:3000/redirect');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.deepStrictEqual(response.body, {test: 'value'});
+});
+
+/**
+ * Enabling redirects means composing an interceptor, which can only happen at create/extend
+ * time - so a per-request `true` could never work. Rejecting beats ignoring it.
+ */
+test('followRedirect true per request is rejected, false is allowed', async () => {
+  await assert.rejects(
+    () => client.get('http://localhost:3000/redirect', {followRedirect: true}),
+    (err: Error) => {
+      assert.ok(err instanceof ValidationError);
+      assert.match(err.message, /only be set when creating or extending/);
+
+      return true;
+    },
+  );
+
+  // Turning them off per request is fine on a client that has them on.
+  const redirecting = client.extend({followRedirect: true});
+
+  const response = await redirecting.get('http://localhost:3000/redirect', {
+    followRedirect: false,
+    throwHttpErrors: false,
+  });
+
+  assert.strictEqual(response.statusCode, 302);
+});
+
+test('a client without redirects composes no redirect interceptor', () => {
+  const plain = new Gotlike({decompress: false});
+  const redirecting = new Gotlike({decompress: false, followRedirect: true});
+
+  assert.strictEqual(plain.followsRedirects, false);
+  assert.strictEqual(plain.agent, getGlobalDispatcher(), 'nothing to compose');
+
+  assert.strictEqual(redirecting.followsRedirects, true);
+  assert.notStrictEqual(redirecting.agent, getGlobalDispatcher());
+});
+
+/**
+ * Bodies that cannot exist. Parsing them anyway turned every empty 204 into a failure, and
+ * the failure was misfiled as a generic request error rather than a parse error.
+ */
+test('status codes that cannot carry a body are not parsed', async () => {
+  for (const code of [204, 205, 304]) {
+    const json = await client.get(`http://localhost:3000/status-empty?code=${code}`, {
+      responseType: 'json',
+      throwHttpErrors: false,
+    });
+
+    assert.strictEqual(json.statusCode, code);
+    assert.strictEqual(json.body, undefined, `${code} json body`);
+
+    const text = await client.get(`http://localhost:3000/status-empty?code=${code}`, {
+      throwHttpErrors: false,
+    });
+
+    assert.strictEqual(text.body, '', `${code} text body`);
+
+    const buffer = await client.get<Buffer>(`http://localhost:3000/status-empty?code=${code}`, {
+      responseType: 'buffer',
+      throwHttpErrors: false,
+    });
+
+    assert.ok(Buffer.isBuffer(buffer.body));
+    assert.strictEqual(buffer.body.length, 0, `${code} buffer body`);
+  }
+});
+
+test('a HEAD response is not parsed as json', async () => {
+  const response = await client.handle({
+    url: 'http://localhost:3000/json',
+    method: 'HEAD',
+    responseType: 'json',
+  });
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.body, undefined);
+});
+
+/**
+ * V8 words JSON failures differently depending on the input - "Unexpected end of JSON input"
+ * for an empty body against "... is not valid JSON" for garbage. Matching on the wording
+ * misfiled empty bodies as `ERR_REQUEST_ERROR`.
+ */
+test('an empty body is a parse error, not a generic request error', async () => {
+  const err = await failure(
+    client.get('http://localhost:3000/status?code=200', {
+      responseType: 'json',
+    }),
+  );
+
+  assert.ok(err instanceof ParseError, `expected a ParseError, got ${err.name}`);
+  assert.strictEqual(err.code, 'ERR_BODY_PARSE_FAILURE');
+  assert.strictEqual(err.response?.body, '');
+});
+
+test('aborting an in-flight request gives an AbortError', async () => {
+  const controller = new AbortController();
+
+  const request = client.get('http://localhost:3000/slow', {signal: controller.signal});
+
+  setTimeout(() => controller.abort(), 50);
+
+  const err = await failure(request);
+
+  assert.ok(err instanceof AbortError, `expected an AbortError, got ${err.name}`);
+  assert.ok(err instanceof RequestError);
+  assert.strictEqual(err.code, 'ERR_ABORTED');
+});
+
+test('an already-aborted signal fails immediately', async () => {
+  const err = await failure(client.get('http://localhost:3000/json', {signal: AbortSignal.abort()}));
+
+  assert.strictEqual(err.code, 'ERR_ABORTED');
+});
+
+/**
+ * A signal reports its reason as a DOMException named `AbortError` for `abort()` but
+ * `TimeoutError` for `AbortSignal.timeout()`. The latter lands on the same class and code as
+ * `timeout.request`, since it is a timeout either way.
+ */
+test('AbortSignal.timeout surfaces as a TimeoutError', async () => {
+  const err = await failure(
+    client.get('http://localhost:3000/slow', {
+      signal: AbortSignal.timeout(50),
+    }),
+  );
+
+  assert.ok(err instanceof TimeoutError, `expected a TimeoutError, got ${err.name}`);
+  assert.strictEqual(err.code, 'ETIMEDOUT');
+});
+
+test('a signal that never fires does not affect the request', async () => {
+  const controller = new AbortController();
+
+  const response = await client.get('http://localhost:3000/json', {signal: controller.signal});
+
+  assert.strictEqual(response.statusCode, 200);
+});
+
+test('headers set to undefined are omitted rather than sent', async () => {
+  const response = await client.get<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+    headers: {'x-present': 'yes', 'x-absent': undefined},
+  });
+
+  assert.strictEqual(response.body.headers['x-present'], 'yes');
+  assert.ok(!('x-absent' in response.body.headers));
+});
+
+test('json accepts values other than plain objects', async () => {
+  const cases: [unknown, string][] = [
+    [[1, 2], '[1,2]'],
+    ['hi', '"hi"'],
+    [42, '42'],
+    [null, 'null'],
+  ];
+
+  for (const [json, expected] of cases) {
+    const response = await client.post<Echo>('http://localhost:3000/echo', {
+      responseType: 'json',
+      json,
+    });
+
+    assert.strictEqual(response.body.body, expected);
+  }
+});
+
+test('POST is not retried by default', async () => {
+  const testId = randomUUID();
+
+  const extClient = client.extend({
+    headers: {'test-id': testId},
+    retry: {limit: 3, backoffLimit: 10},
+    throwHttpErrors: false,
+  });
+
+  // /retry answers 429 twice before succeeding; a retried POST would reach 200.
+  const response = await extClient.post('http://localhost:3000/retry');
+
+  assert.strictEqual(response.statusCode, 429);
+  assert.strictEqual(response.retryCount, 0);
+});
+
+test('searchParams survive a redirect', async () => {
+  const redirecting = client.extend({followRedirect: true, responseType: 'json'});
+
+  const response = await redirecting.get<Echo>('http://localhost:3000/redirect-chain', {
+    searchParams: {carried: 'yes'},
+  });
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.body.url, '/echo');
+});
+
+test('nock mocks request once', async () => {
+  nock('http://localhost:3000').get('/json').reply(201, '{"test": "newvalue"}');
+
+  const response = await client.get<{test: string}>('http://localhost:3000/json', {
     responseType: 'json',
   });
 
   assert.strictEqual(response.statusCode, 201);
   assert.strictEqual(response.body.test, 'newvalue');
 
-  const response2 = await client.get<{ test: string }>('http://localhost:3000/json', {
+  const response2 = await client.get<{test: string}>('http://localhost:3000/json', {
     responseType: 'json',
   });
 
