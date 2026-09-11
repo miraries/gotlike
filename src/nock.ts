@@ -82,22 +82,32 @@ function stripQuery(path: string): string {
  *
  * undici matches a string `path` against the request path *including* its query string, so
  * anything that has to ignore the query becomes a function matcher.
+ *
+ * `expectedQuery` is only passed when undici can't apply the query itself - it folds `query`
+ * into the stored path and compares strings, which it can only do when the path *is* a string.
+ * Behind a function matcher the query would otherwise be dropped, and the interceptor would
+ * match every query there is.
  */
 function buildPathMatcher(
   basePath: string,
   path: PathMatcher,
   ignoreQuery: boolean,
+  expectedQuery?: Record<string, any>,
 ): string | ((path: string) => boolean) {
-  if (typeof path === 'string' && !ignoreQuery && !basePath) {
+  if (typeof path === 'string' && !ignoreQuery && !expectedQuery && !basePath) {
     return path;
   }
 
-  if (typeof path === 'string' && !ignoreQuery) {
+  if (typeof path === 'string' && !ignoreQuery && !expectedQuery) {
     return basePath + path;
   }
 
   return (requestPath: string) => {
-    const candidate = ignoreQuery ? stripQuery(requestPath) : requestPath;
+    if (expectedQuery && !queryMatches(requestPath, expectedQuery)) {
+      return false;
+    }
+
+    const candidate = ignoreQuery || expectedQuery ? stripQuery(requestPath) : requestPath;
 
     if (basePath) {
       if (!candidate.startsWith(basePath)) {
@@ -122,6 +132,19 @@ function matchPath(matcher: PathMatcher, path: string): boolean {
   }
 
   return matcher.test(path);
+}
+
+/** nock's default is an exact match: every param the interceptor named, and nothing else. */
+function queryMatches(requestPath: string, expected: Record<string, any>): boolean {
+  const index = requestPath.indexOf('?');
+  const actual = new URLSearchParams(index === -1 ? '' : requestPath.slice(index + 1));
+  const names = Object.keys(expected);
+
+  if (actual.size !== names.length) {
+    return false;
+  }
+
+  return names.every((name) => actual.get(name) === String(expected[name]));
 }
 
 function queryToObject(query: Record<string, any> | URLSearchParams): Record<string, any> {
@@ -208,20 +231,28 @@ class Interceptor {
   }
 
   #intercept(): MockInterceptor {
-    // Only `.query(true)` needs a query-ignoring matcher. For an object query undici folds
-    // the params into the interceptor's path string and compares that, which a function
-    // matcher would defeat - so those keep an ordinary string path.
+    // Only `.query(true)` needs a query-ignoring matcher.
     const ignoreQuery = this.#query === true;
+    const query =
+      this.#query !== undefined && this.#query !== true && this.#query !== false
+        ? queryToObject(this.#query)
+        : undefined;
+
+    // For an object query undici folds the params into the interceptor's path string and
+    // compares that, which a function matcher would defeat - so those keep an ordinary string
+    // path. It can only do that when the path *is* a string, though: behind the function
+    // matcher a regex or function path needs, it drops the query and matches every one of them.
+    const undiciAppliesQuery = typeof this.#path === 'string' && !ignoreQuery;
 
     const options: MockInterceptor.Options = {
       method: this.#method,
-      path: buildPathMatcher(this.#basePath, this.#path, ignoreQuery),
+      path: buildPathMatcher(this.#basePath, this.#path, ignoreQuery, undiciAppliesQuery ? undefined : query),
       body: this.#body,
       headers: Object.keys(this.#headers).length > 0 ? this.#headers : undefined,
     };
 
-    if (this.#query !== undefined && this.#query !== true && this.#query !== false) {
-      options.query = queryToObject(this.#query);
+    if (query && undiciAppliesQuery) {
+      options.query = query;
     }
 
     return this.#pool.intercept(options);
@@ -314,6 +345,10 @@ class Interceptor {
 class Scope {
   #pool: Interceptable;
   #basePath: string;
+  #origin: string;
+
+  /** Set by `persist()`, and inherited by every interceptor registered after it. */
+  #persist = false;
 
   constructor(origin: string, basePath: string) {
     let pool = pools.get(origin);
@@ -325,10 +360,23 @@ class Scope {
 
     this.#pool = pool;
     this.#basePath = basePath;
+    this.#origin = origin;
   }
 
   #verb(method: string, path: PathMatcher, body?: BodyMatcher, options?: Options): Interceptor {
-    return new Interceptor(this, this.#pool, this.#basePath, method, path, body, options);
+    const interceptor = new Interceptor(this, this.#pool, this.#basePath, method, path, body, options);
+
+    return this.#persist ? interceptor.persist() : interceptor;
+  }
+
+  /**
+   * Replay every interceptor on this scope indefinitely. nock's own docs put `persist()` on the
+   * scope - `nock(host).persist().get('/')` - so the per-interceptor form alone isn't enough.
+   */
+  persist(): this {
+    this.#persist = true;
+
+    return this;
   }
 
   get(path: PathMatcher, body?: BodyMatcher, options?: Options) {
@@ -359,9 +407,23 @@ class Scope {
     return this.#verb('OPTIONS', path, body, options);
   }
 
-  /** True once every interceptor registered on this scope has been consumed. */
+  /**
+   * True once every interceptor registered on this scope has been consumed.
+   *
+   * Scoped to this origin: asking one scope used to answer for every origin at once, so an
+   * unrelated scope with something still pending made this report `false`. Two scopes on the
+   * same origin but different base paths do still share an answer - a pending interceptor
+   * reports its origin, and its path may be a function, so there is nothing finer to filter on.
+   */
   isDone(): boolean {
-    return mockAgent.pendingInterceptors().length === 0;
+    return !mockAgent.pendingInterceptors().some((interceptor) => interceptor.origin === this.#origin);
+  }
+
+  /** nock's assertion form of `isDone()`. */
+  done(): void {
+    if (!this.isDone()) {
+      throw new Error(`Mocks for ${this.#origin} are not all done`);
+    }
   }
 }
 

@@ -306,6 +306,36 @@ function retriesFrom(attempts?: {count: number}): number {
   return attempts ? Math.max(attempts.count - 1, 0) : 0;
 }
 
+/**
+ * Fold header names to lower case. Header names are case-insensitive on the wire, but an
+ * object merge is not: `{...{Authorization: old}, ...{authorization: new}}` keeps both, undici
+ * sends both, and which one the server honours is anyone's guess.
+ */
+function lowercaseHeaders(headers?: IncomingHttpHeaders): IncomingHttpHeaders {
+  const normalised: IncomingHttpHeaders = {};
+
+  for (const key in headers) {
+    normalised[key.toLowerCase()] = headers[key];
+  }
+
+  return normalised;
+}
+
+/**
+ * Merge per-call headers over a set that is already lower-cased, folding the override's names
+ * as they go in. Only the override is walked - the instance defaults are normalised once, at
+ * construction, so re-folding them on every request would be wasted work on the hot path.
+ */
+function mergeHeaders(base: IncomingHttpHeaders, override?: IncomingHttpHeaders): IncomingHttpHeaders {
+  const merged: IncomingHttpHeaders = {...base};
+
+  for (const key in override) {
+    merged[key.toLowerCase()] = override[key];
+  }
+
+  return merged;
+}
+
 /** Shallow-merge two optional records, without allocating when only one is present. */
 function mergeRecords<T extends object>(base?: T, override?: T): T | undefined {
   if (!base) {
@@ -629,10 +659,10 @@ export type DecompressOptions = NonNullable<Parameters<typeof interceptors.decom
  */
 export type RetryWithMergedOptions<T = any> = (newOptions: RequestOptions<T>) => Promise<Response<T>>;
 
-/** The outgoing request for a redirect hop. `headers` is mutable. */
 /** Methods that can carry a request body, and so get a writable stream half. */
-export type BodyMethod = 'POST' | 'PUT' | 'PATCH' | 'DELETE';
+export type BodyMethod = (typeof bodyMethods)[number];
 
+/** The outgoing request for a redirect hop. `headers` is mutable. */
 export type RedirectRequest = {
   origin: string;
   path: string;
@@ -791,6 +821,20 @@ const defaultOptions = {
 
 const responseTypes = ['text', 'json', 'buffer'];
 const httpMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'TRACE', 'CONNECT'];
+
+/**
+ * The methods `stream()` hands a writable half to. `BodyMethod` is derived from this list, so
+ * the two can't drift.
+ *
+ * Everything else is streamed through `undici.request` instead: `undici.pipeline` doesn't send
+ * the request until the writable side ends, and for a method the caller can't write to there
+ * would be nothing to end it.
+ */
+const bodyMethods = ['POST', 'PUT', 'PATCH', 'DELETE'] as const;
+
+function isBodyMethod(method?: string): boolean {
+  return bodyMethods.includes(method as BodyMethod);
+}
 
 /**
  * Options that only mean anything when a client is built. Passing one per request is
@@ -1019,7 +1063,9 @@ export class Gotlike {
     this.validate = options?.validate !== false;
     this.decompress = options?.decompress !== false;
 
-    this.defaultHeaders = options?.headers ? {...options.headers} : {};
+    // Lower-cased once here so the per-request merge can fold a per-call name in with a single
+    // `toLowerCase()` and be sure nothing collides with a differently-cased default.
+    this.defaultHeaders = lowercaseHeaders(options?.headers);
 
     // undici's decompress interceptor acts on the response's content-encoding but never asks
     // for one, so support has to be advertised here.
@@ -1162,8 +1208,10 @@ export class Gotlike {
     const formed = (base ? {...base, ...options} : {...options}) as FormedOptions;
 
     // Always a fresh object: handlers and `beforeRequest` hooks routinely write to
-    // `options.headers`, and the instance defaults must not pick those up.
-    formed.headers = {...this.defaultHeaders, ...options.headers};
+    // `options.headers`, and the instance defaults must not pick those up. Per-call names are
+    // folded to lower case on the way in, so `{Authorization: ...}` replaces an instance
+    // `authorization` rather than joining it.
+    formed.headers = mergeHeaders(this.defaultHeaders, options.headers);
 
     if (base?.context && options.context) {
       formed.context = {...base.context, ...options.context};
@@ -1172,6 +1220,11 @@ export class Gotlike {
       // throw when no context was set, without allocating an object per request. Frozen
       // so that a hook writing to it fails loudly instead of leaking across requests.
       formed.context = emptyContext;
+    } else {
+      // Only one side carried a context, so `formed` is aliasing whichever object that was.
+      // Hooks write to `options.context`, and that write must not land on the client's own
+      // context (where it would leak into every later request) or on the caller's object.
+      formed.context = {...formed.context};
     }
 
     if (url !== undefined) {
@@ -1180,6 +1233,12 @@ export class Gotlike {
 
     if (method !== undefined) {
       formed.method = method;
+    } else if (formed.method === undefined) {
+      // `stream()` and the callable form pass no method, and a client built without the
+      // exported defaults carries none either. undici would fill this in, but `call()` routes
+      // the two stream paths on it - a missing method used to land a GET on the upload path,
+      // where nothing ends the writable half and the request is never even sent.
+      formed.method = 'GET';
     }
 
     return formed;
@@ -1351,9 +1410,7 @@ export class Gotlike {
       if (options.isStream) {
         const hasBody = options.body !== undefined && options.body !== null;
         const stream =
-          !hasBody && (options.method === 'GET' || options.method === 'HEAD')
-            ? await this.callBodylessStream(options)
-            : this.callStream(options);
+          !hasBody && !isBodyMethod(options.method) ? await this.callBodylessStream(options) : this.callStream(options);
 
         return stream as unknown as Response<T>;
       }
@@ -1611,12 +1668,12 @@ export class Gotlike {
     duplex.on('error', (error: Error) => rejectHead(error));
 
     // `undici.pipeline` takes the request body from the duplex's writable side, not from
-    // `opts.body` - so a body supplied through the options has to be written here. Methods
-    // that never carry a body are ended straight away; anything else is left open for the
+    // `opts.body` - so a body supplied through the options has to be written here. A method
+    // that can't carry a body is ended straight away; anything else is left open for the
     // caller to write to and end themselves.
     if (options.body !== undefined && options.body !== null) {
       duplex.end(options.body);
-    } else if (options.method === 'GET' || options.method === 'HEAD') {
+    } else if (!isBodyMethod(options.method)) {
       duplex.end();
     }
 
@@ -1636,7 +1693,9 @@ export class Gotlike {
     const merged = {...options, ...newOptions} as FormedOptions;
 
     if (newOptions.headers) {
-      merged.headers = {...options.headers, ...newOptions.headers};
+      // The first attempt's headers may carry whatever case a hook or handler wrote, so
+      // normalise both sides here - a refreshed `authorization` has to replace the stale one.
+      merged.headers = mergeHeaders(lowercaseHeaders(options.headers), newOptions.headers);
     }
 
     if (newOptions.context) {
@@ -1655,7 +1714,9 @@ export class Gotlike {
     return new Gotlike({
       ...base,
       ...options,
-      headers: mergeRecords(base?.headers, options.headers),
+      // Case-insensitively, like the per-request merge: extending with `Authorization` must
+      // replace an inherited `authorization` rather than leave the client sending both.
+      headers: mergeHeaders(lowercaseHeaders(base?.headers), options.headers),
       context: mergeRecords(base?.context, options.context),
       // Handlers and hooks accumulate, so an extended client keeps the parent's.
       handlers: concatHooks(base?.handlers, options.handlers),

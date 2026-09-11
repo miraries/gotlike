@@ -148,6 +148,37 @@ test('query(object) matches only those params', async () => {
   assertUnmatched(missed, 'a different query should not match');
 });
 
+/**
+ * A non-string path has to be matched by a function, and undici only folds `query` into the
+ * stored path when that path is a string - so the constraint was dropped and the interceptor
+ * matched every query. Same class of bug as the string-path case above.
+ */
+test('query(object) constrains a regex path too', async () => {
+  nock('http://mock.test')
+    .get(/^\/items/)
+    .query({page: '1'})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/items', {searchParams: {page: '99'}}));
+
+  assertUnmatched(missed, 'a different query should not match');
+
+  const matched = await client.get('http://mock.test/items', {searchParams: {page: '1'}});
+
+  assert.strictEqual(matched.body, 'matched');
+});
+
+test('query(object) on a regex path requires every param to line up', async () => {
+  nock('http://mock.test')
+    .get(/^\/items/)
+    .query({page: '1'})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/items', {searchParams: {page: '1', extra: 'x'}}));
+
+  assertUnmatched(missed, 'an extra param should not match');
+});
+
 test('a plain path does not match a request carrying a query', async () => {
   nock('http://mock.test').get('/strict').reply(200, 'matched');
 
@@ -319,4 +350,43 @@ test('interceptors are consumed once by default', async () => {
   const second = await failure(client.get('http://mock.test/once'));
 
   assertUnmatched(second, 'the interceptor should be consumed');
+});
+
+/** nock's `isDone()` answers for its own scope; ours used to answer for every origin at once. */
+test('isDone reports on the scope it was called on', async () => {
+  const mine = nock('http://mine.test');
+  const theirs = nock('http://theirs.test');
+
+  mine.get('/done').reply(200, 'ok');
+  theirs.get('/pending').reply(200, 'never used');
+
+  assert.strictEqual(mine.isDone(), false, 'nothing has been consumed yet');
+
+  await client.get('http://mine.test/done');
+
+  assert.strictEqual(mine.isDone(), true, 'this scope is done');
+  assert.strictEqual(theirs.isDone(), false, 'the other scope is not, and must not say so');
+});
+
+/** `nock(host).persist()` and `scope.done()` are the spellings nock's own docs use. */
+test('persist on the scope applies to every interceptor registered after it', async () => {
+  const scope = nock('http://mock.test').persist();
+
+  scope.get('/always').reply(200, 'always');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual((await client.get('http://mock.test/always')).body, 'always');
+  }
+});
+
+test('done throws while the scope has interceptors left', async () => {
+  const scope = nock('http://mock.test');
+
+  scope.get('/expected').reply(200, 'ok');
+
+  assert.throws(() => scope.done(), /not all/i);
+
+  await client.get('http://mock.test/expected');
+
+  scope.done();
 });

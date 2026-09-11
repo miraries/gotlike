@@ -11,6 +11,7 @@ import {Agent, Dispatcher, getGlobalDispatcher, MockAgent, setGlobalDispatcher} 
 import nock from './nock.ts';
 import client, {
   AbortError,
+  createClient,
   type HandlerFunction,
   Gotlike,
   HTTPError,
@@ -680,8 +681,83 @@ test('extend client with headers on call', async () => {
   assert.strictEqual(response.statusCode, 200);
 });
 
-test('throw error on non-2xx if throwHttpErrors is true', () => {
-  assert.rejects(
+/**
+ * Header names are case-insensitive on the wire, so a per-call `Authorization` has to replace
+ * an instance `authorization` rather than join it. Merging by exact key sent both, and the
+ * server picked whichever came first - which was the stale one.
+ */
+test('a per-call header overrides an instance header of a different case', async () => {
+  const extClient = client.extend({
+    headers: {Authorization: 'Bearer OLD'},
+    responseType: 'json',
+  });
+
+  const response = await extClient.get<Record<string, string>>('http://localhost:3000/headers', {
+    headers: {authorization: 'Bearer NEW'},
+  });
+
+  assert.strictEqual(response.body.authorization, 'Bearer NEW');
+});
+
+/** `accept-encoding` is folded into the instance headers, so opting out per call has to win. */
+test('a per-call accept-encoding replaces the one folded in at construction', async () => {
+  const response = await client.get<Record<string, string>>('http://localhost:3000/headers', {
+    responseType: 'json',
+    headers: {'Accept-Encoding': 'identity'},
+  });
+
+  assert.strictEqual(response.body['accept-encoding'], 'identity');
+});
+
+test('extend merges headers case-insensitively too', async () => {
+  const extClient = client
+    .extend({headers: {'X-Token': 'old'}, responseType: 'json'})
+    .extend({headers: {'x-token': 'new'}});
+
+  const response = await extClient.get<Record<string, string>>('http://localhost:3000/headers');
+
+  assert.strictEqual(response.body['x-token'], 'new');
+});
+
+/**
+ * The refresh flow with the replacement header spelled differently from the one already on the
+ * request. A handler runs once, before `call()`; the retry re-enters `call()` directly, so the
+ * merge there is the only thing that can replace what the handler wrote.
+ */
+test('a retried request replaces a re-cased header rather than sending both', async () => {
+  let refreshed = false;
+
+  const setHeader: HandlerFunction = (options, next) => {
+    options.headers['Authorization'] = 'Bearer OLD';
+
+    return next(options);
+  };
+
+  const extClient = client.extend({
+    handlers: [setHeader],
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (refreshed) {
+            return response;
+          }
+
+          refreshed = true;
+
+          return retryWithMergedOptions({headers: {authorization: 'Bearer REFRESHED'}});
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://localhost:3000/echo');
+
+  assert.strictEqual(response.body.headers.authorization, 'Bearer REFRESHED');
+});
+
+test('throw error on non-2xx if throwHttpErrors is true', async () => {
+  await assert.rejects(
     async () => {
       await client.get('http://localhost:3000/status?code=403&message=Forbidden');
     },
@@ -1102,6 +1178,54 @@ test('context reads as empty when none was set', async () => {
 
   assert.deepStrictEqual(seen[0], {});
   assert.strictEqual(seen[0].anything, undefined);
+});
+
+/**
+ * The context handed to a request is always its own object. When only the instance carried
+ * one, `formOptions` used to pass the instance's object straight through, so a hook writing
+ * to it wrote into every later request.
+ */
+test('a hook writing to the context cannot leak into the next request', async () => {
+  const seen: Record<string, any>[] = [];
+
+  const extClient = client.extend({
+    context: {tenant: 1},
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.context.touched = (options.context.touched ?? 0) + 1;
+          seen.push(options.context);
+        },
+      ],
+    },
+  });
+
+  await extClient.get('http://localhost:3000/json');
+  await extClient.get('http://localhost:3000/json');
+
+  assert.deepStrictEqual(seen[0], {tenant: 1, touched: 1});
+  assert.deepStrictEqual(seen[1], {tenant: 1, touched: 1});
+  assert.notStrictEqual(seen[0], seen[1], 'each request should get its own context object');
+  assert.deepStrictEqual(extClient.baseOptions?.context, {tenant: 1}, 'the client options should be untouched');
+});
+
+/** The same invariant from the other side: a caller's own object must not be written to. */
+test('a per-call context object is not mutated by a hook', async () => {
+  const context: Record<string, any> = {request: 1};
+
+  const extClient = client.extend({
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.context.touched = true;
+        },
+      ],
+    },
+  });
+
+  await extClient.get('http://localhost:3000/json', {context});
+
+  assert.deepStrictEqual(context, {request: 1});
 });
 
 test('json sets a content-type unless the caller already did', async () => {
@@ -1715,6 +1839,26 @@ test('a callable client exposes getters and fields that touch private state', as
   assert.strictEqual(extended.validate, true);
 });
 
+/**
+ * Fields are forwarded by walking the instance's own keys, and a field only assigned inside an
+ * `if` isn't one of them - so on a client that took no agent, `callable.ownAgent = ...` used to
+ * set a dead property on the function while the `agent` getter kept using the global dispatcher.
+ */
+test('a callable client forwards fields that were left unset at construction', async () => {
+  const callable = createClient({decompress: false});
+  const agent = new Agent();
+
+  for (const key of ['ownAgent', 'retryOptions', 'decompressOptions'] as const) {
+    assert.ok(Object.getOwnPropertyDescriptor(callable, key)?.get, `${key} should forward to the instance`);
+  }
+
+  callable.ownAgent = agent;
+
+  assert.strictEqual(callable.agent, agent, 'the agent getter should see the assignment');
+
+  await agent.close();
+});
+
 test('validation rejects unknown and malformed options', async () => {
   const cases: [Record<string, unknown>, RegExp][] = [
     [{responseTyp: 'json'}, /Unknown option `responseTyp`/],
@@ -2002,6 +2146,29 @@ test('a bodyless stream is a plain readable, an upload stream is writable', asyn
   const echo = JSON.parse(await text(upload)) as Echo;
 
   assert.strictEqual(echo.body, 'written');
+});
+
+/**
+ * `stream()` passes no method of its own, and only the exported singletons carry one in their
+ * base options. Without a default the request fell through to the `undici.pipeline` path,
+ * whose writable half is only ended for GET and HEAD - so it was never sent and the caller
+ * waited forever.
+ */
+test('stream defaults to GET on a client that carries no method', {timeout: 10_000}, async () => {
+  const bare = new Gotlike({responseType: 'text'});
+  const download = await bare.stream('http://localhost:3000/json');
+
+  assert.strictEqual(typeof (download as unknown as {write?: unknown}).write, 'undefined');
+  assert.strictEqual(await text(download), '{"test": "value"}\n');
+});
+
+/** A method that cannot carry a body types as a plain readable, so nothing can end it. */
+test('a bodyless method other than GET still streams', {timeout: 10_000}, async () => {
+  const download = await client.stream('http://localhost:3000/echo', {method: 'OPTIONS'});
+
+  const echo = JSON.parse(await text(download)) as Echo;
+
+  assert.strictEqual(echo.method, 'OPTIONS');
 });
 
 /**

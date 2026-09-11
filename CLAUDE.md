@@ -10,7 +10,9 @@ The goal is to be a drop-in replacement for `got` + `nock` in the common cases w
 only the features actually needed are implemented, and it deliberately trades safety/completeness for speed
 (no options validation, partial retry/timings support).
 
-Ships CommonJS (`type: "commonjs"`, `module: "commonjs"`), targets Node >= 22, `strict` TS.
+Ships ESM (`type: "module"`, `module: "nodenext"`), targets Node >= 22.12, `strict` TS. There is no
+`require` condition in `exports` and none is needed: node supports `require()` of ESM from 22.12, which
+is what keeps CommonJS consumers like the aggregator working.
 
 The consumer this package exists to serve is `../igd-aggregator-api`, which currently uses
 `got-cjs@12` + `nock@14`. Feature decisions are scoped to what that repo actually uses, not to got
@@ -56,13 +58,23 @@ the terminal `next`.
 Two invariants worth preserving here:
 - **Never mutate the caller's options.** The verb methods pass `url`/`method` to `handle()` as arguments rather
   than assigning them onto the options object, and `formOptions` always allocates. Handlers and `beforeRequest`
-  hooks *do* write to the formed options (the aggregator's handler sets `headers['X-Log-Id']`), so `headers` is
-  always a fresh object — aliasing the instance defaults would leak writes across every request.
+  hooks *do* write to the formed options (the aggregator's handler sets `headers['X-Log-Id']`), so `headers` and
+  `context` are always fresh objects — aliasing the instance defaults would leak writes across every request.
+  `context` needs a copy even when only one side supplied one; a plain spread aliases whichever object that was.
+- **Header names are folded to lower case at every merge point.** The instance defaults are lower-cased once in
+  the constructor and per-call/extend/retry names go in through `mergeHeaders`, so a per-call `Authorization`
+  *replaces* an instance `authorization`. Merging by exact key kept both, undici sent both, and the server
+  picked one — usually the stale one. Only the override side is walked on the hot path; the defaults are
+  already normalised.
 - **Everything that would need deep merging is resolved at create/extend time** (`hooks`, `handlers`, `retry`,
   `agent`). That's what makes a shallow spread sufficient. `formOptions` costs ~46ns; a request costs ~60µs.
 
 `options.context` defaults to a shared frozen empty object so `options.context.foo` reads as `undefined` without
-allocating per request, and a stray write fails loudly instead of leaking.
+allocating per request, and a stray write fails loudly instead of leaking. When a context *is* set, the request
+gets its own shallow copy of it.
+
+`formOptions` also fills in `method: 'GET'` when nothing set one. `stream()` and the callable form pass no method,
+and only the exported singletons carry one in their base options — and `call()` routes the two stream paths on it.
 
 `call()` does the actual undici request, in this order: resolve the URL (`resolveUrl` joins `prefixUrl` without
 doubling slashes and writes the result back to `options.url`), serialize `json` into `options.body`, run
@@ -242,10 +254,15 @@ throwing, which would hand callers compressed bytes silently.
 
 There are **two** stream paths, and which one runs depends on whether the request has a body:
 
-- **bodyless (GET/HEAD, no body)** → `callBodylessStream`, via `undici.request`. Returns the response
-  `Readable` unwrapped.
+- **no body, and a method that can't carry one** → `callBodylessStream`, via `undici.request`. Returns the
+  response `Readable` unwrapped.
 - **anything else** → `callStream`, via `undici.pipeline`, returning a `Duplex` whose writable half is the
   request body.
+
+The split is on `bodyMethods` (`POST`/`PUT`/`PATCH`/`DELETE`), which `BodyMethod` is derived from so the list
+and the type can't drift. It used to test `method === 'GET' || 'HEAD'`, which put every other bodyless method —
+`OPTIONS`, and anything on a client with no `method` in its base options — on the pipeline path, where nothing
+ends the writable half and `undici.pipeline` never sends the request at all. That hung forever.
 
 The split exists because `undici.pipeline` makes the duplex's writable side the request body, and
 `RedirectHandler` refuses to follow a redirect whose body it cannot replay — so a piped GET silently
@@ -307,7 +324,14 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
 - **Object queries must NOT use a function matcher.** undici folds `query` into the interceptor's stored path
   string (`serializePathWithQuery`) and compares strings; a function matcher silently defeats that and matches
   every query. This was a real bug — the test `query(object) matches only those params` guards it.
+- **A non-string path can't carry an object query either.** undici only folds `query` into the stored path when
+  that path is a string, so behind the function matcher a regex or function path uses for `.query({...})` the
+  constraint was dropped entirely and every query matched. `queryMatches` checks it inside the matcher instead;
+  `options.query` is only handed to undici when undici is the one that can apply it.
 - **`responseOptions` must always be an object**, never `undefined`, or undici throws `UND_ERR_INVALID_ARG`.
+- **`persist()`, `done()` and `isDone()` live on the `Scope`**, which is where nock's docs put them —
+  `nock(host).persist().get('/')` and `scope.done()`. `isDone()` filters `pendingInterceptors()` by the scope's
+  origin; it used to ask about every origin at once, so an unrelated scope's pending mock made it answer `false`.
 - **Reply callbacks** are translated from undici's `(opts) => {statusCode, data, responseOptions}` to nock's
   `function (uri, requestBody) => [status, body, headers]` with `this.req.headers`. The request body is
   JSON-parsed when the content-type says so, as nock does.
