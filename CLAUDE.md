@@ -75,9 +75,17 @@ Two invariants worth preserving here:
 - **Everything that would need deep merging is resolved at create/extend time** (`hooks`, `handlers`, `retry`,
   `agent`). That's what makes a shallow spread sufficient. `formOptions` costs ~46ns; a request costs ~60µs.
 
+Header names written by a handler or a `beforeRequest` hook are folded again at dispatch, but only for clients that
+have one (`mayRewriteHeaders`) and only when a scan (`hasUnfoldedName`, which allocates nothing) actually finds an
+upper-case name. A hook writing `headers.Authorization` over an existing `authorization` otherwise left undici sending
+both.
+
 `options.context` defaults to a shared frozen empty object so `options.context.foo` reads as `undefined` without
 allocating per request, and a stray write fails loudly instead of leaking. When a context *is* set, the request
 gets its own shallow copy of it.
+
+**Option validation walks own properties only.** `for...in` climbs the prototype chain, so any library that put an
+enumerable property on `Object.prototype` made every request fail with `Unknown option`.
 
 **`defaultOptions` is applied by the constructor, not by the exported singleton.** It used to be passed only to
 `createClient(defaultOptions)`, which meant a hand-built `new Gotlike(...)` or `createClient(...)` silently had
@@ -101,6 +109,12 @@ that triggers them. Reordering these breaks every provider auth flow in the aggr
 
 The URL is resolved and written back *before* hooks run because request signing needs the full URL
 (`igd-aggregator-api`'s N2d provider signs `options.url`).
+
+**And read back *after* they run.** The dispatch used a local captured before the hook loop, so a hook that
+rewrote `options.url` - which is what signing a url into the path looks like - was read by nothing and the
+original url went out anyway. A url the hook leaves absolute is taken verbatim: re-resolving it would lay
+`searchParams` back over the top and wipe the query it had just built. A relative one is resolved again, so a
+hook can still rewrite the path under `prefixUrl`.
 
 Three things `resolveUrl` has to get right, each of which was silently wrong:
 - **The fragment comes off before the query is located.** `joined.indexOf('?')` alone appended `searchParams`
@@ -230,6 +244,10 @@ on `statusCode` only: got also requires a non-null `body`, which here would reje
 body of a 204 read as json. An error already in `normalisedErrors` is rethrown untouched so the hooks don't fire
 twice for one failure.
 
+**`prefixUrl` comes back when the hook supplies a `url`.** It was cleared unconditionally, on the reasoning that
+`options.url` had already been resolved against it - true, but a `url` the hook supplies has *not* been, so a
+relative path was dispatched as-is and failed as an invalid url. An absolute one ignores the prefix anyway.
+
 It **always reallocates `headers`**, even when the hook passed none. Aliasing the first attempt's header object
 meant `call()`'s own writes on the retry — a `content-type` for a body the retry added — landed on the options
 the *first* response reports having been sent with.
@@ -263,6 +281,13 @@ a caller matching on `instanceof RequestError` missed it entirely.
 `hasNoBody()` short-circuits parsing for `204`/`205`/`304` and `HEAD` — the body is `undefined` for `json`,
 `''` for `text`, an empty `Buffer` otherwise. Without it every empty 204 became a failure.
 
+**A parse failure on an error status is not a parse failure.** An upstream answering a 500 with an HTML error
+page used to raise `ERR_BODY_PARSE_FAILURE` *before* the `afterResponse` hooks ran, so a refresh hook never saw
+the status that triggers it. The body is left as the text that arrived, the hooks look at it, and
+`throwHttpErrors` decides. Measured against got 14: the hooks run and `HTTPError` is thrown, and with
+`throwHttpErrors: false` it *resolves* with the raw body - got never raises a parse error there. Only a parse
+failure on an otherwise-ok status is a `ParseError`.
+
 Parse failures are flagged (`parseFailed`) at the `JSON.parse` call, **not recognised by message**. V8 words
 them differently depending on input — "Unexpected end of JSON input" for an empty body versus "… is not valid
 JSON" for garbage — and the old `message.endsWith('not valid JSON')` check misfiled empty bodies as
@@ -271,6 +296,12 @@ JSON" for garbage — and the old `message.endsWith('not valid JSON')` check mis
 A signal reports its reason as a `DOMException`: `AbortError` from `abort()`, `TimeoutError` from
 `AbortSignal.timeout()`. The first maps to `AbortError`/`ERR_ABORTED`, the second to `TimeoutError`/`ETIMEDOUT`
 so that both kinds of timeout look the same to callers.
+
+**`abort(reason)` is the third case**, and the one the name test alone missed: undici rethrows the caller's
+reason verbatim, so a deliberate `abort(new Error('cancelled'))` arrived as a plain `Error` and was reported as
+a generic `ERR_REQUEST_ERROR`. `options.signal?.aborted` is consulted as well as the name. The timeout test
+(`isTimeoutReason`, which looks at the signal's reason too) runs **first**, since the abort test is the broader
+of the two and would otherwise swallow an `AbortSignal.timeout` the caller passed in.
 
 ### Shared internals worth not re-duplicating
 
@@ -423,6 +454,12 @@ throwing from inside the pipeline handler. Throwing there was synchronous, which
 paths now build the error through `toRequestError`. The `response` promise gets a `.catch(() => undefined)`
 attached at creation — nothing is obliged to await it, and an unhandled rejection would take the process down.
 
+**`failedUploadStream`'s writable half fails the write** rather than accepting and discarding it. Swallowing writes
+was deliberate once - a caller piping in shouldn't get a second, less useful error - but it made
+`await pipeline(source, upload)` *resolve successfully* for a request that was never sent, which is a far worse way to
+find out. (Note this only covers the synchronous-rejection path; for a real pipeline duplex, `pipeline()` can still
+finish the writable side before a connection error arrives, so `await stream.response` remains the reliable check.)
+
 `undici.pipeline` can also reject its arguments synchronously; that is caught and reported on the stream
 (`failedUploadStream`) rather than by rejecting `stream()`, so both paths fail the same way.
 
@@ -495,6 +532,9 @@ Leaving the option off is how you get no timeout.
 arrays concatenated. Because the constructor re-evaluates the agent options, extending with `retry`/`http2`/etc.
 creates a fresh dispatcher.
 
+`retry` is shallow-merged rather than replaced: `extend({retry: {limit: 5}})` used to drop the parent's
+`statusCodes`/`methods` with it, silently widening what got retried.
+
 **The merge helpers always allocate, even when only one side has a value.** `mergeRecords`, `concatHooks` and
 `mergeHooks` used to return `base` unchanged when the override was absent, which handed the child the parent's own
 `context` object, `handlers` array and `hooks` object — so a write through `child.baseOptions` mutated the parent
@@ -537,6 +577,12 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   MockAgent serialises the body but sets no content-type at all, so anything under test that branches on the
   response's content-type behaved differently against the mock than against the real server — which is the one
   thing a mocking shim must not do. An explicit content-type is left alone.
+- **A repeated key in a `URLSearchParams` query has to survive as an array.** `Object.fromEntries` keeps only the
+  last, so `.query(new URLSearchParams('a=1&a=2'))` quietly became `{a: '2'}` and matched the wrong requests.
+- **A bare host is accepted**, as it is in nock: `nock('mock.test')` threw `ERR_INVALID_URL` out of `new URL`.
+  Only a target with no scheme gets `http://` put in front of it.
+- **`reply(200, null)` means a body of `null`.** `body ?? ''` coerced it to an empty string, which then failed
+  to parse as json.
 - **`responseOptions` must always be an object**, never `undefined`, or undici throws `UND_ERR_INVALID_ARG`.
 - **`persist()`, `done()` and `isDone()` live on the `Scope`**, which is where nock's docs put them —
   `nock(host).persist().get('/')` and `scope.done()`. `isDone()` filters `pendingInterceptors()` by the scope's

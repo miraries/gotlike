@@ -586,3 +586,47 @@ test('a body that is not json at all does not match an object matcher', async ()
 
   assertUnmatched(error, 'an unparseable body must not match');
 });
+
+// `Object.fromEntries` keeps only the last of a repeated key, so this silently became
+// `{a: '2'}` and matched requests it should not have.
+test('query(URLSearchParams) keeps repeated keys', async () => {
+  nock('http://mock.test').get('/rep').query(new URLSearchParams('a=1&a=2')).reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/rep?a=1&a=2');
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('query(URLSearchParams) with repeated keys rejects a single occurrence', async () => {
+  nock('http://mock.test').get('/rep').query(new URLSearchParams('a=1&a=2')).reply(200, 'matched');
+
+  const error = await failure(client.get('http://mock.test/rep?a=1'));
+
+  assertUnmatched(error, 'one value must not satisfy a two-value expectation');
+});
+
+// nock accepts a bare host; `new URL` does not, so this threw ERR_INVALID_URL.
+test('accepts an origin without a scheme and defaults to http', async () => {
+  nock('mock.test').get('/bare').reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/bare');
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a scheme-less origin keeps its base path', async () => {
+  nock('mock.test/base').get('/under').reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/base/under');
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+// `body ?? ''` turned an explicit null reply into an empty body, which then failed to parse.
+test('replies with a json null', async () => {
+  nock('http://mock.test').get('/null').reply(200, null);
+
+  const response = await json.get('http://mock.test/null');
+
+  assert.strictEqual(response.body, null);
+});

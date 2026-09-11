@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import {clearInterval} from 'node:timers';
-import {Writable} from 'node:stream';
+import {Readable, Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {text} from 'node:stream/consumers';
 import {randomUUID} from 'node:crypto';
@@ -224,6 +224,20 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
   if (req.url === '/headers') {
     res.write(JSON.stringify(req.headers));
     res.end();
+
+    return;
+  }
+
+  /*
+   * An error status whose body is not the json the caller asked for - a proxy's HTML error
+   * page in front of an API, which is what makes this worth a route of its own.
+   */
+  if (req.url?.startsWith('/html-error')) {
+    const qs = new URL(req.url, 'http://' + req.headers.host).searchParams;
+
+    res.statusCode = Number(qs.get('code') ?? 500);
+    res.setHeader('content-type', 'text/html');
+    res.end('<html><body>Gateway problem</body></html>');
 
     return;
   }
@@ -3557,6 +3571,335 @@ test('a header explicitly set to undefined does not suppress the derived content
   });
 
   assert.strictEqual(response.body.headers['content-type'], 'application/json');
+});
+
+/*
+ * `call()` captured the resolved url into a local *before* running the `beforeRequest` hooks
+ * and handed that local to undici, so a hook rewriting `options.url` - which is exactly what
+ * request signing does - was read by nothing and the original url went out anyway.
+ */
+test('a beforeRequest hook rewriting options.url changes where the request goes', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://localhost:3000/echo/rewritten';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://localhost:3000/json');
+
+  assert.strictEqual(response.body.url, '/echo/rewritten');
+});
+
+// A hook that leaves a relative url still gets `prefixUrl` applied.
+test('a beforeRequest hook can rewrite to a path under prefixUrl', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'echo/from-prefix';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('json');
+
+  assert.strictEqual(response.body.url, '/echo/from-prefix');
+});
+
+/*
+ * A url a hook built for itself is taken exactly as written. Re-resolving it would lay
+ * `searchParams` back over the top and wipe the query the hook had just signed.
+ */
+test('a rewritten absolute url keeps its own query against searchParams', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = String(options.url) + '&signature=abc';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://localhost:3000/echo', {searchParams: {a: '1'}});
+
+  assert.strictEqual(response.body.url, '/echo?a=1&signature=abc');
+});
+
+/*
+ * An upstream answering an error status with a body that isn't the json that was asked for -
+ * a proxy's HTML error page - used to fail as `ERR_BODY_PARSE_FAILURE` *before* the
+ * `afterResponse` hooks ran, so a refresh hook never saw the status that triggers it.
+ *
+ * Measured against got 14: the hooks run, the body stays as the text that arrived, and the
+ * HTTP error is what is thrown.
+ */
+test('an unparseable body on an error status runs afterResponse and throws HTTPError', async () => {
+  const seen: number[] = [];
+
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response) => {
+          seen.push(response.statusCode);
+
+          return response;
+        },
+      ],
+    },
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/html-error?code=500'));
+
+  assert.deepStrictEqual(seen, [500], 'the afterResponse hook must see the error status');
+  assert.strictEqual(error.code, 'ERR_HTTP_ERROR');
+  assert.strictEqual(error.name, 'HTTPError');
+  assert.match(String(error.response?.body), /Gateway problem/);
+});
+
+// got resolves this one rather than raising a parse failure - the status was the problem, and
+// with throwHttpErrors off the caller said they would handle it.
+test('an unparseable body on an error status resolves with the raw text when not throwing', async () => {
+  const extClient = client.extend({responseType: 'json', throwHttpErrors: false});
+
+  const response = await extClient.get('http://localhost:3000/html-error?code=500');
+
+  assert.strictEqual(response.statusCode, 500);
+  assert.match(String(response.body), /Gateway problem/);
+});
+
+// On a status that is otherwise fine, a parse failure is still a ParseError.
+test('an unparseable body on a 200 is still a ParseError', async () => {
+  const error = await failure(client.get('http://localhost:3000/png', {responseType: 'json'}));
+
+  assert.strictEqual(error.code, 'ERR_BODY_PARSE_FAILURE');
+  assert.strictEqual(error.name, 'ParseError');
+});
+
+/*
+ * A retry that supplies a url has not had `prefixUrl` applied to it yet, so clearing the prefix
+ * unconditionally left a relative path to be dispatched as-is and fail as an invalid url.
+ */
+test('an afterResponse retry can use a path relative to prefixUrl', async () => {
+  let retried = false;
+
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (!retried) {
+            retried = true;
+
+            return retryWithMergedOptions({url: 'echo/second-try'});
+          }
+
+          return response;
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('json');
+
+  assert.strictEqual(response.body.url, '/echo/second-try');
+});
+
+test('an afterResponse retry can supply a new prefixUrl', async () => {
+  let retried = false;
+
+  const extClient = client.extend({
+    prefixUrl: 'http://127.0.0.1:3000',
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (!retried) {
+            retried = true;
+
+            return retryWithMergedOptions({prefixUrl: 'http://localhost:3000', url: 'echo/new-prefix'});
+          }
+
+          return response;
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('json');
+
+  assert.strictEqual(response.body.url, '/echo/new-prefix');
+});
+
+/*
+ * A hook writing `options.headers.Authorization` on top of an `authorization` that is already
+ * there left undici sending both, and which one the server honours is anyone's guess.
+ */
+test('a header a hook writes with different casing replaces the existing one', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    headers: {authorization: 'Bearer stale'},
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.headers['Authorization'] = 'Bearer fresh';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://localhost:3000/echo');
+
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer fresh');
+});
+
+// `(error as Error).message` threw a TypeError of its own when the thrown value wasn't an Error.
+test('a beforeRequest hook throwing a non-Error still fails as a RequestError', async () => {
+  const extClient = client.extend({
+    hooks: {
+      beforeRequest: [
+        () => {
+          throw 'plain string failure';
+        },
+      ],
+    },
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/json'));
+
+  assert.ok(error instanceof RequestError);
+  assert.strictEqual(error.message, 'plain string failure');
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+});
+
+test('a beforeRequest hook throwing null still fails as a RequestError', async () => {
+  const extClient = client.extend({
+    hooks: {
+      beforeRequest: [
+        () => {
+          // eslint-disable-next-line no-throw-literal
+          throw null;
+        },
+      ],
+    },
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/json'));
+
+  assert.ok(error instanceof RequestError);
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+});
+
+// Replacing the object dropped the parent's `statusCodes`/`methods` along with it, silently
+// widening what got retried.
+test('extend merges retry options rather than replacing them', () => {
+  const parent = new Gotlike({retry: {limit: 3, statusCodes: [503], backoffLimit: 10}});
+  const childClient = parent.extend({retry: {limit: 1}});
+
+  assert.strictEqual(childClient.retryOptions?.maxRetries, 1);
+  assert.deepStrictEqual(childClient.retryOptions?.statusCodes, [503]);
+  assert.strictEqual(childClient.retryOptions?.maxTimeout, 10);
+});
+
+/*
+ * `abort(reason)` makes undici throw that reason verbatim, so the error is whatever the caller
+ * passed and the name test alone reported a deliberate cancellation as a generic transport
+ * failure.
+ */
+test('aborting with a custom reason is still an AbortError', async () => {
+  const controller = new AbortController();
+
+  const promise = client.get('http://localhost:3000/slow', {signal: controller.signal});
+
+  controller.abort(new Error('cancelled by caller'));
+
+  const error = await failure(promise);
+
+  assert.strictEqual(error.name, 'AbortError');
+  assert.strictEqual(error.code, 'ERR_ABORTED');
+});
+
+test('aborting with no reason is an AbortError', async () => {
+  const controller = new AbortController();
+
+  const promise = client.get('http://localhost:3000/slow', {signal: controller.signal});
+
+  controller.abort();
+
+  const error = await failure(promise);
+
+  assert.strictEqual(error.name, 'AbortError');
+  assert.strictEqual(error.code, 'ERR_ABORTED');
+});
+
+// An AbortSignal.timeout still has to read as a timeout, not as a plain abort - the abort test
+// is the broader of the two and would otherwise swallow it.
+test('a caller AbortSignal.timeout is still reported as a timeout', async () => {
+  const error = await failure(client.get('http://localhost:3000/slow', {signal: AbortSignal.timeout(50)}));
+
+  assert.strictEqual(error.name, 'TimeoutError');
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+});
+
+/*
+ * The writable half used to accept and discard every chunk, so `pipeline(source, upload)`
+ * *resolved successfully* for a request that was never sent.
+ */
+test('a failed upload stream fails writes instead of quietly discarding them', async () => {
+  // An invalid url is rejected by `undici.pipeline` synchronously, which is the path that
+  // hands back a stand-in duplex rather than a real one.
+  const upload = await client.stream('http://::invalid-url::', {method: 'POST'});
+
+  const error = await failure(pipeline(Readable.from(['chunk']), upload));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error?.constructor?.name}`);
+});
+
+test('a failed upload stream still reports on its response promise', async () => {
+  const upload = await client.stream('http://::invalid-url::', {method: 'POST'});
+
+  // Not read here: `response` rejects on its own, and reading would destroy the stream with
+  // the same error, which needs a listener of its own like any other node stream.
+  const error = await failure(upload.response);
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error?.constructor?.name}`);
+});
+
+// `for...in` walks the prototype chain, so anything adding an enumerable property to
+// `Object.prototype` failed every request with `Unknown option`.
+test('validation ignores inherited enumerable properties', async () => {
+  Object.defineProperty(Object.prototype, 'injectedBySomeLibrary', {
+    value: 'x',
+    enumerable: true,
+    configurable: true,
+  });
+
+  try {
+    const response = await client.get('http://localhost:3000/json');
+
+    assert.strictEqual(response.statusCode, 200);
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)['injectedBySomeLibrary'];
+  }
+});
+
+// got's export takes `got({url, ...})` as well as `got(url, options)`.
+test('the client can be called with an options object alone', async () => {
+  const response = await client({url: 'http://localhost:3000/echo', method: 'POST', responseType: 'json'});
+
+  assert.strictEqual((response.body as Echo).url, '/echo');
+  assert.strictEqual((response.body as Echo).method, 'POST');
 });
 
 /*

@@ -302,7 +302,24 @@ function isSerialisableQuery(query?: Record<string, any>): boolean {
 
 function queryToObject(query: Record<string, any> | URLSearchParams): Record<string, any> {
   if (query instanceof URLSearchParams) {
-    return Object.fromEntries(query.entries());
+    const object: Record<string, string | string[]> = {};
+
+    // Not `Object.fromEntries`, which keeps only the last of a repeated key - so
+    // `.query(new URLSearchParams('a=1&a=2'))` silently became `{a: '2'}` and matched the wrong
+    // requests. `queryValueMatches` already understands an array.
+    for (const [key, value] of query.entries()) {
+      const existing = object[key];
+
+      if (existing === undefined) {
+        object[key] = value;
+      } else if (Array.isArray(existing)) {
+        existing.push(value);
+      } else {
+        object[key] = [existing, value];
+      }
+    }
+
+    return object;
   }
 
   return query;
@@ -471,7 +488,13 @@ class Interceptor {
     }
 
     return this.#applyScopeOptions(
-      interceptor.reply(responseCodeOrFunction, (body ?? '') as any, replyOptions(body, headers) as any),
+      // `=== undefined`, not `??`: `reply(200, null)` means a body of `null`, and coercing it
+      // to `''` turned a mocked null response into a parse failure.
+      interceptor.reply(
+        responseCodeOrFunction,
+        (body === undefined ? '' : body) as any,
+        replyOptions(body, headers) as any,
+      ),
     );
   }
 
@@ -486,7 +509,11 @@ class Interceptor {
           parseRequestBody(opts.body, context.req.headers),
         );
 
-        return {statusCode, data: data ?? '', responseOptions: replyOptions(data, replyHeaders) as any};
+        return {
+          statusCode,
+          data: (data === undefined ? '' : data) as any,
+          responseOptions: replyOptions(data, replyHeaders) as any,
+        };
       }),
     );
   }
@@ -598,7 +625,10 @@ function splitOrigin(basePath: string | RegExp | Url | URL): {origin: string; pa
   }
 
   if (typeof basePath === 'string') {
-    const url = new URL(basePath);
+    // `nock('mock.test')` is legal there and threw `ERR_INVALID_URL` here. Any scheme is left
+    // alone; only a bare host gets one.
+    const absolute = /^[a-z][a-z\d+\-.]*:\/\//i.test(basePath) ? basePath : `http://${basePath}`;
+    const url = new URL(absolute);
 
     return {origin: url.origin, path: trimTrailingSlash(url.pathname)};
   }

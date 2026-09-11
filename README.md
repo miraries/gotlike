@@ -84,7 +84,7 @@ Supports:
 - [x] HTTP2 *(over TLS; cleartext h2c needs an `agent`)*
 - [x] Pipelining
 - [x] Options validation
-- [x] Callable client - `gotlike(url, options)`
+- [x] Callable client - `gotlike(url, options)` and `gotlike({ url, ... })`
 
 ## Differences from got
 
@@ -224,6 +224,9 @@ const client = gotlike.extend({
 });
 ```
 
+A `beforeRequest` hook may rewrite `options.url`, and the request goes to the url it left. An absolute one is
+used exactly as written, so a signed query survives; a relative one is resolved against `prefixUrl` again.
+
 `beforeError` runs for streamed requests too - for *every* stream failure, not just an error status
 - and a stream's `HTTPError` carries the same `error.response` a non-streamed one does.
 
@@ -351,7 +354,7 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 | --- | --- | --- |
 | `HTTPError` | `ERR_HTTP_ERROR` | `throwHttpErrors` is on and the status is outside 2xx - plus a 3xx that reached you *while following redirects*, which means the chain outran `maxRedirects`. A 3xx with `followRedirect` off is not an error, and a 304 never is |
 | `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request`, or an `AbortSignal.timeout()` fired |
-| `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType` |
+| `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType`, on a status that was otherwise fine. On an error status the status wins: the body is left as the text that arrived, the hooks still see it, and `throwHttpErrors` decides - so a 500 carrying a proxy's HTML page is an `HTTPError`, not a parse failure |
 | `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
 | `RequestError` | `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
 

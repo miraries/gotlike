@@ -113,9 +113,11 @@ function normaliseStreamErrors<T extends Readable>(stream: T, normalise: (error:
 /**
  * A `stream()` duplex for a request that failed before it could be dispatched.
  *
- * The writable half accepts and discards writes so a caller that pipes into it doesn't fail
- * with a second, less useful error; the readable half raises the real one at read time, the
- * way `asStream` does.
+ * Both halves report the failure. The writable one used to accept and discard writes, on the
+ * reasoning that a caller piping into it shouldn't get a second, less useful error - but that
+ * made `await pipeline(readable, upload)` *resolve successfully* for a request that was never
+ * sent, which is a far worse way to find out. The write callback is given the real error, so a
+ * pipe rejects with it; the readable half still raises it at read time the way `asStream` does.
  */
 function failedUploadStream(error: Promise<Error>): GotlikeUploadStream {
   error.catch(noop);
@@ -132,10 +134,12 @@ function failedUploadStream(error: Promise<Error>): GotlikeUploadStream {
       error.then((failure) => this.destroy(failure), noop);
     },
     write(_chunk, _encoding, callback) {
-      callback();
+      // `error` always resolves - `toStreamError` returns the error rather than throwing it -
+      // but a rejection handler keeps a write from hanging if that ever stops being true.
+      error.then(callback, callback);
     },
     final(callback) {
-      callback();
+      error.then(callback, callback);
     },
   }) as GotlikeUploadStream;
 
@@ -321,14 +325,18 @@ function makeRedirectTracker(hooks?: Hooks['beforeRedirect']): Dispatcher.Dispat
 
       // The hop about to be dispatched. The last one recorded is where the response came
       // from, which is what `response.url` and `StreamHead.url` report.
-      (state as RedirectState).lastUrl = String(opts.origin ?? '') + opts.path;
+      const origin = String(opts.origin ?? '');
+      const path = String(opts.path ?? '');
+
+      (state as RedirectState).lastUrl =
+        origin.endsWith('/') && path.startsWith('/') ? origin + path.slice(1) : origin + path;
 
       if (!hooks) {
         return;
       }
 
       const request: RedirectRequest = {
-        origin: String(opts.origin ?? ''),
+        origin,
         path: opts.path,
         method: opts.method ?? 'GET',
         headers: headersToObject(opts.headers),
@@ -600,10 +608,37 @@ function lowercaseHeaders(headers?: IncomingHttpHeaders): IncomingHttpHeaders {
   const normalised: IncomingHttpHeaders = {};
 
   for (const key in headers) {
-    normalised[key.toLowerCase()] = headers[key];
+    // Dropped rather than copied when unset, so `{'Content-Type': undefined}` doesn't survive
+    // as a key that `hasHeader` would have to keep second-guessing.
+    if (headers[key] !== undefined) {
+      normalised[key.toLowerCase()] = headers[key];
+    }
   }
 
   return normalised;
+}
+
+/**
+ * Whether any header name still carries an upper-case letter.
+ *
+ * `formOptions` folds everything it merges, so the only way one gets in is a handler or a
+ * `beforeRequest` hook writing `options.headers.Authorization` directly - and then undici sends
+ * both that and the `authorization` already there, leaving the server to pick. Checked by
+ * scanning rather than by folding blindly: the scan allocates nothing, and the answer is almost
+ * always no.
+ */
+function hasUnfoldedName(headers: IncomingHttpHeaders): boolean {
+  for (const key in headers) {
+    for (let i = 0; i < key.length; i++) {
+      const code = key.charCodeAt(i);
+
+      if (code >= 65 && code <= 90) {
+        return true;
+      }
+    }
+  }
+
+  return false;
 }
 
 /**
@@ -624,7 +659,10 @@ function mergeHeaders(base: IncomingHttpHeaders, override?: IncomingHttpHeaders)
 /** Shallow-merge two optional records into a fresh object. */
 function mergeRecords<T extends object>(base?: T, override?: T): T | undefined {
   if (!base) {
-    return override;
+    // Copied, not handed back: returning `override` made the client's `context`/`retry` the
+    // caller's own object, so mutating what was passed to `extend()` afterwards changed the
+    // client. The same reasoning as the base-only case below, from the other side.
+    return override && {...override};
   }
 
   // Copied even when only the base is present. Returning `base` itself made an extended
@@ -705,7 +743,27 @@ function requestSignal(options: FormedOptions): AbortSignal | undefined {
  * `fallback` covers an error thrown with an empty message, and a non-`Error` thrown value -
  * which is rare but perfectly legal, and would otherwise produce `message: undefined`.
  */
+/**
+ * Whether a failure is a timeout rather than a plain abort.
+ *
+ * Both arrive through the same seam - an aborted signal - so the reason has to be consulted:
+ * `AbortSignal.timeout()` gives a `TimeoutError` DOMException, `abort()` an `AbortError`, and
+ * `abort(reason)` whatever the caller passed. Checking the signal as well as the thrown value
+ * covers the case where undici rethrows the reason verbatim.
+ */
+function isTimeoutReason(error: unknown, signal?: AbortSignal): boolean {
+  return (
+    (error as Error | undefined)?.name === 'TimeoutError' ||
+    (signal?.aborted === true && (signal.reason as Error | undefined)?.name === 'TimeoutError')
+  );
+}
+
 function messageOf(error: unknown, fallback: string): string {
+  // `throw 'boom'` is legal and says something; reporting the generic label instead loses it.
+  if (typeof error === 'string' && error !== '') {
+    return error;
+  }
+
   const message = (error as Error | undefined)?.message;
 
   return typeof message === 'string' && message !== '' ? message : fallback;
@@ -1361,6 +1419,12 @@ function invalid(message: string): never {
  */
 export function validateOptions(options: RequestOptions, atCreation: boolean): void {
   for (const key in options) {
+    // Own properties only. `for...in` walks the prototype chain, so anything that had added an
+    // enumerable property to `Object.prototype` failed every request with `Unknown option`.
+    if (!Object.hasOwn(options, key)) {
+      continue;
+    }
+
     if (!knownOptions.has(key)) {
       invalid(`Unknown option \`${key}\``);
     }
@@ -1491,6 +1555,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   /** Whether the client defaults carry a `json`/`body`/`form`, which must not be inherited. */
   baseHasBody: boolean;
 
+  /** Whether anything runs between `formOptions` and the dispatch that could write a header. */
+  mayRewriteHeaders: boolean;
+
   decompressOptions?: DecompressOptions;
 
   /**
@@ -1531,6 +1598,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // Checked once, so `formOptions` can skip three property reads per request in the usual
     // case where no client carries one.
     this.baseHasBody = merged.json !== undefined || merged.body !== undefined || merged.form !== undefined;
+
+    // Handlers and `beforeRequest` hooks are the only things that write to `options.headers`
+    // after it has been folded, so they are the only reason to check it again per request.
+    this.mayRewriteHeaders = Boolean(merged.handlers?.length || merged.hooks?.beforeRequest?.length);
 
     // Lower-cased once here so the per-request merge can fold a per-call name in with a single
     // `toLowerCase()` and be sure nothing collides with a differently-cased default.
@@ -1841,6 +1912,12 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * built this same literal three times over, which is three places to forget a field.
    */
   dispatchOptions(options: FormedOptions): SharedDispatchOptions {
+    // Only clients with a handler or a `beforeRequest` hook can have picked up an unfolded
+    // name since `formOptions` folded them; everyone else skips even the scan.
+    if (this.mayRewriteHeaders && hasUnfoldedName(options.headers)) {
+      options.headers = lowercaseHeaders(options.headers);
+    }
+
     return {
       dispatcher: this.agent,
       headers: options.headers,
@@ -1995,11 +2072,28 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         for (const hook of this.beforeRequestHooks) {
           await hook(options);
         }
+
+        /*
+         * A hook may rewrite `options.url` - request signing does exactly that. The dispatch
+         * used a local captured *before* the hooks ran, so the rewrite was read by nothing and
+         * the original url went out regardless.
+         *
+         * A url the hook left absolute is taken exactly as written: re-resolving it would put
+         * `searchParams` back over the top and wipe a query the hook had just built, which is
+         * the whole point of signing it. Only a relative one is resolved again, so a hook can
+         * still rewrite the path and have `prefixUrl` applied.
+         */
+        if (options.url !== url) {
+          const rewritten = String(options.url ?? '');
+
+          url = options.url = absoluteUrl.test(rewritten) ? rewritten : this.resolveUrl(options);
+        }
       }
     } catch (error) {
       // The hook's own message, not a generic one - it is the only thing that says what
-      // actually went wrong.
-      throw await this.toRequestError((error as Error).message, 'ERR_REQUEST_ERROR', error as Error, options);
+      // actually went wrong. Via `messageOf`, since `throw 'string'` and `throw null` are both
+      // legal and `(error as Error).message` threw a TypeError of its own on the second.
+      throw await this.toRequestError(messageOf(error, 'Request error'), 'ERR_REQUEST_ERROR', error as Error, options);
     }
 
     // make request
@@ -2048,12 +2142,27 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         try {
           responseBody = JSON.parse(text);
         } catch (error) {
-          // Flagged rather than recognised by message. V8 words this differently depending
-          // on the input ("Unexpected end of JSON input" vs "... is not valid JSON"), and
-          // matching on the wording misfiled empty bodies as generic request errors.
-          parseFailed = true;
+          /*
+           * On an error status the parse failure is not the story - the status is. An upstream
+           * answering a 500 with an HTML error page used to fail with `ERR_BODY_PARSE_FAILURE`
+           * *before* the `afterResponse` hooks ran, so a token-refresh hook never saw the 401
+           * that a proxy had wrapped in HTML. The body is left as the text that arrived, the
+           * hooks get to look at it, and `throwHttpErrors` decides from there.
+           *
+           * Measured against got 14: a 500 with an unparseable body runs the hooks and throws
+           * `HTTPError`, and with `throwHttpErrors: false` it *resolves*, body and all. Only a
+           * parse failure on an otherwise-ok response is a `ParseError`.
+           */
+          if (!isHttpError(undiciResponse.statusCode, this.follows(options))) {
+            // Flagged rather than recognised by message. V8 words this differently depending
+            // on the input ("Unexpected end of JSON input" vs "... is not valid JSON"), and
+            // matching on the wording misfiled empty bodies as generic request errors.
+            parseFailed = true;
 
-          throw error;
+            throw error;
+          }
+
+          // Otherwise `responseBody` keeps the text assigned above, which is what arrived.
         }
       } else if (options.responseType === 'text') {
         responseBody = await undiciResponse.body.text();
@@ -2101,28 +2210,36 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         );
       }
 
-      // A signal reports its reason as a DOMException: `AbortError` from `abort()`, and
-      // `TimeoutError` from `AbortSignal.timeout()`. The latter is a timeout by any useful
-      // definition, so it lands on the same class and code as `timeout.request`.
-      if ((err as Error)?.name === 'AbortError') {
+      /*
+       * A signal reports its reason as a DOMException: `AbortError` from `abort()`, and
+       * `TimeoutError` from `AbortSignal.timeout()`. The latter is a timeout by any useful
+       * definition, so it lands on the same class and code as `timeout.request` - and it is
+       * tested first, since the abort test below is the broader of the two.
+       */
+      if (isTimeoutReason(err, options.signal)) {
         throw await this.toRequestError(
-          (err as Error).message,
-          'ERR_ABORTED',
-          err as Error,
-          options,
-          response,
-          AbortError,
-        );
-      }
-
-      if ((err as Error)?.name === 'TimeoutError') {
-        throw await this.toRequestError(
-          (err as Error).message,
+          messageOf(err, 'Request timed out'),
           'ETIMEDOUT',
           err as Error,
           options,
           response,
           TimeoutError,
+        );
+      }
+
+      /*
+       * `options.signal?.aborted` as well as the name: `abort(new Error('cancelled'))` makes
+       * undici throw that reason verbatim, so the error is a plain `Error` and the name test
+       * alone reported a cancelled request as a generic `ERR_REQUEST_ERROR`.
+       */
+      if ((err as Error)?.name === 'AbortError' || options.signal?.aborted) {
+        throw await this.toRequestError(
+          messageOf(err, 'Request aborted'),
+          'ERR_ABORTED',
+          err as Error,
+          options,
+          response,
+          AbortError,
         );
       }
 
@@ -2307,12 +2424,26 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       return this.toRequestError(error.message, 'ETIMEDOUT', error, options, undefined, TimeoutError);
     }
 
-    if (error?.name === 'AbortError') {
-      return this.toRequestError(error.message, 'ERR_ABORTED', error, options, undefined, AbortError);
+    if (isTimeoutReason(error, options.signal)) {
+      return this.toRequestError(
+        messageOf(error, 'Request timed out'),
+        'ETIMEDOUT',
+        error,
+        options,
+        undefined,
+        TimeoutError,
+      );
     }
 
-    if (error?.name === 'TimeoutError') {
-      return this.toRequestError(error.message, 'ETIMEDOUT', error, options, undefined, TimeoutError);
+    if (error?.name === 'AbortError' || options.signal?.aborted) {
+      return this.toRequestError(
+        messageOf(error, 'Request aborted'),
+        'ERR_ABORTED',
+        error,
+        options,
+        undefined,
+        AbortError,
+      );
     }
 
     return this.toRequestError(messageOf(error, 'Request error'), 'ERR_REQUEST_ERROR', error, options);
@@ -2519,8 +2650,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // changed what the first response reports having been sent with.
     merged.context = {...options.context, ...newOptions.context};
 
-    // `url` was already resolved against `prefixUrl` for the first attempt.
-    merged.prefixUrl = undefined;
+    if (newOptions.url === undefined) {
+      // `url` was already resolved against `prefixUrl` for the first attempt.
+      merged.prefixUrl = undefined;
+    } else {
+      // A url the hook supplied has not been resolved yet, so the prefix has to come back or a
+      // relative path is dispatched as-is and fails as an invalid url. An absolute one ignores
+      // the prefix anyway, so this is safe either way.
+      merged.prefixUrl = newOptions.prefixUrl ?? options.prefixUrl ?? this.baseOptions.prefixUrl;
+    }
     (merged as RetryDepth)[retryDepth] = depth;
 
     if (hookIndex === undefined) {
@@ -2547,6 +2685,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // replace an inherited `authorization` rather than leave the client sending both.
       headers: mergeHeaders(lowercaseHeaders(base?.headers), options.headers),
       context: mergeRecords(base?.context, options.context),
+      // Merged, not replaced: `extend({retry: {limit: 5}})` used to drop the parent's
+      // `statusCodes`/`methods` along with it, silently widening what got retried.
+      retry: mergeRecords(base?.retry, options.retry),
       // Handlers and hooks accumulate, so an extended client keeps the parent's.
       handlers: concatHooks(base?.handlers, options.handlers),
       hooks: mergeHooks(base?.hooks, options.hooks),
@@ -2643,6 +2784,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
  * can, while keeping every method and field of the underlying `Gotlike`.
  */
 export type CallableClient<O extends ClientOptions = ClientOptions> = Omit<Gotlike<O>, 'extend'> & {
+  /* `client({url, ...})`, the options-only form got's export also accepts. */
+  (options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  (options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  (options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  (options: TextCall & BodyOnly): Promise<string>;
+  (options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  (options: BufferCall & BodyOnly): Promise<Buffer>;
+  <T>(options: RequestOptions & BodyOnly): Promise<T>;
+  <T>(options: RequestOptions): Promise<ClientResult<O, T>>;
   (url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   (url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   (url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -2669,8 +2819,18 @@ export type CallableClient<O extends ClientOptions = ClientOptions> = Omit<Gotli
  * All of this happens once per client; the per-request path is untouched.
  */
 function asCallable<O extends ClientOptions>(instance: Gotlike<O>): CallableClient<O> {
-  const callable = function callableClient<T>(url: string | URL, options: RequestOptions = {}) {
-    return instance.handle<T>(options, url);
+  const callable = function callableClient<T>(
+    urlOrOptions: string | URL | RequestOptions,
+    options: RequestOptions = {},
+  ) {
+    // `client({url: ...})` as well as `client(url, options)` - got's export takes both. A
+    // `URL` is an object too, so it has to be excluded explicitly, and `null` reaches the
+    // url path where it fails as a bad url rather than as a confusing property read.
+    if (urlOrOptions !== null && typeof urlOrOptions === 'object' && !(urlOrOptions instanceof URL)) {
+      return instance.handle<T>(urlOrOptions, urlOrOptions.url);
+    }
+
+    return instance.handle<T>(options, urlOrOptions);
   } as unknown as CallableClient<O>;
 
   for (const key of Object.getOwnPropertyNames(Gotlike.prototype)) {
