@@ -70,7 +70,7 @@ Supports:
 - [x] Retries *(partial - maps onto undici's `retry` interceptor; honours `Retry-After`)*
 - [x] `searchParams`, `form`
 - [x] Decompression - gzip, deflate, br, zstd, compress
-- [x] Basic auth - `username` / `password`
+- [x] Basic auth - `username` / `password`, or credentials in the url (`https://user:pass@host`)
 - [x] `response.ok` / `rawBody` / `retryCount`
 - [x] Named error classes - `HTTPError`, `TimeoutError`, `ParseError`
 - [x] Streams *(with response head + timings; no progress events)*
@@ -96,9 +96,11 @@ Supports:
 | option merging | per-option merge table, every request | **one shallow spread**; `headers` and `context` merge one level deep |
 | `response.rawBody` | always materialised | **computed on first access** - the bytes as received, so a `json` response still hands back the original text |
 | `options.url` | normalised to a `URL` | **left a string**, rewritten to the full `prefixUrl`-resolved URL before handlers and hooks see it. Use `String(options.url)`, not `options.url.href` |
+| `response.url` | the final url | **same** - the last hop's url when redirects were followed, and the requested one otherwise. `options.url` stays the url that was *requested*, so a retry from a hook goes back through the redirect |
 | `options.context` | fresh `{}` per request | a **shared frozen** `{}` when unset - reads are safe, writes throw rather than leak. Pass a `context` to get a writable one |
 | `validate` | n/a | client-only, like the options above - it is read from the instance, so a per-request value would do nothing |
 | `followRedirect` | `true` | **`false`** - redirects cost ~2µs/request to support, whether or not one happens. Enable per client with `extend({ followRedirect: true })`; a per-request `true` is a `ValidationError`, since composing the interceptor is a create/extend-time decision |
+| `maxRedirects` | configurable | **fixed at 10**, got's own default. A chain longer than that is an `HTTPError` carrying the 3xx, as it is in got - not a success whose body is the redirect page |
 | `stream()` for a bodyless request | always a `Duplex` | a **`Readable`** - nothing can be written to a GET, and the duplex wrapper cost ~10% of stream throughput |
 | `stream()` and `afterResponse` | promise API only | **same** - there is no parsed body to hand over and no way to replay a streamed request. Every other hook does fire for streams |
 | `prefixUrl` with an absolute `url` | throws | the **absolute url wins**, silently. `prefixUrl` therefore does *not* pin the host: if `url` can be influenced from outside, validate it yourself |
@@ -237,6 +239,14 @@ are for logging, metrics, and (for `beforeRedirect`) adjusting `request.headers`
 with (`headers` and `context` merge one level deep, everything else is replaced). It goes straight
 back to the request - handlers already ran and are not re-entered.
 
+The retried response is passed to the hooks *before* the one that retried, and no further - so a
+refresh hook never sees its own retry, and an earlier logging hook runs once per attempt. This is
+got's behaviour (it cuts the array at the retrying hook), and it is what makes a hook that always
+retries terminate instead of recursing.
+
+A hook that throws, or that forgets to return a response, fails the request as a `RequestError`
+with the `beforeError` hooks applied - the same as any other failure, rather than escaping raw.
+
 A body is *replaced*, not merged: passing any of `json`, `body` or `form` drops the other two and
 the `content-type` that described the old one, so a retry can change a json body to a form. Passing
 none keeps the first attempt's body and its `content-type`, which is what a token refresh wants.
@@ -265,6 +275,10 @@ Also supported: `.persist()`, `.delay()`, `.matchHeader()`, `.replyWithError()`,
 
 Note that, as in nock, a plain string path does **not** match a request that carries a query
 string - add `.query(true)` for that.
+
+Body matchers take a string, a RegExp, a predicate, or an object/array compared against the
+request body parsed as JSON (a RegExp or function as a leaf value matches that field), as nock's
+do. An object reply body is sent as `application/json`, again as nock sends it.
 
 ## Streams
 
@@ -335,7 +349,7 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 
 | class | `code` | when |
 | --- | --- | --- |
-| `HTTPError` | `ERR_HTTP_ERROR` | non-2xx/3xx and `throwHttpErrors` is on |
+| `HTTPError` | `ERR_HTTP_ERROR` | `throwHttpErrors` is on and the status is outside 2xx - plus a 3xx that reached you *while following redirects*, which means the chain outran `maxRedirects`. A 3xx with `followRedirect` off is not an error, and a 304 never is |
 | `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request`, or an `AbortSignal.timeout()` fired |
 | `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType` |
 | `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
@@ -344,6 +358,8 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 `error.message` is the underlying failure's own - `connect ECONNREFUSED 127.0.0.1:443`,
 `getaddrinfo ENOTFOUND …` - not a generic label, so a log line or an APM grouping can tell one
 transport failure from another. The originating error is also kept as `error.cause`.
+
+Hooks are inside this: anything a `beforeRequest`, `afterResponse` or `beforeError` hook throws comes back as a `RequestError` carrying the hook's own message, not as the raw error.
 
 `error.response` is a full response - parsed `body`, `headers`, `statusCode`, `ok`, `retryCount`,
 `timings` and `request.options` - and is `undefined` only when the request failed before a response

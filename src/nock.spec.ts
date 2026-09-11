@@ -482,3 +482,107 @@ test('nock scope.query allows chaining interceptor.query for URL query params', 
 
   assert.deepStrictEqual(response.body, {items: ['a']});
 });
+
+/*
+ * nock labels an object reply `application/json`; undici's MockAgent serialises the body but
+ * sets no content-type at all. Anything under test that branches on the response content-type
+ * therefore behaved differently against the mock than against the real server, which is the
+ * one thing a mocking shim must not do.
+ */
+test('an object reply body is labelled application/json', async () => {
+  nock('http://mock.test').get('/j').reply(200, {a: 1});
+
+  const response = await client.get('http://mock.test/j');
+
+  assert.strictEqual(response.headers['content-type'], 'application/json');
+});
+
+test('an array reply body is labelled too', async () => {
+  nock('http://mock.test').get('/arr').reply(200, [1, 2]);
+
+  const response = await client.get('http://mock.test/arr');
+
+  assert.strictEqual(response.headers['content-type'], 'application/json');
+});
+
+test('an explicit content-type on an object reply is left alone', async () => {
+  nock('http://mock.test').get('/custom').reply(200, {a: 1}, {'Content-Type': 'application/problem+json'});
+
+  const response = await client.get('http://mock.test/custom');
+
+  assert.strictEqual(response.headers['content-type'], 'application/problem+json');
+});
+
+test('a string reply body is not labelled json', async () => {
+  nock('http://mock.test').get('/s').reply(200, 'plain');
+
+  const response = await client.get('http://mock.test/s');
+
+  assert.strictEqual(response.headers['content-type'], undefined);
+});
+
+test('a reply callback returning an object is labelled json as well', async () => {
+  nock('http://mock.test')
+    .get('/cb')
+    .reply((): ReplyFunctionResult => [200, {a: 1}]);
+
+  const response = await client.get('http://mock.test/cb');
+
+  assert.strictEqual(response.headers['content-type'], 'application/json');
+});
+
+/*
+ * undici compares a non-RegExp, non-function body matcher with `===`, so nock's object form -
+ * `nock(host).post('/p', {a: 1})`, its most common shape - never matched anything at all.
+ */
+test('an object body matcher matches the parsed request body', async () => {
+  nock('http://mock.test').post('/p', {a: 1, b: 'two'}).reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/p', {json: {a: 1, b: 'two'}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('an object body matcher does not match a different body', async () => {
+  nock('http://mock.test').post('/p', {a: 1}).reply(200, 'matched');
+
+  const error = await failure(client.post('http://mock.test/p', {json: {a: 2}}));
+
+  assertUnmatched(error, 'a body with a different value must not match');
+});
+
+test('an object body matcher requires every field and no extras', async () => {
+  nock('http://mock.test').post('/exact', {a: 1}).reply(200, 'matched');
+
+  const error = await failure(client.post('http://mock.test/exact', {json: {a: 1, extra: true}}));
+
+  assertUnmatched(error, 'an extra field must not match');
+});
+
+test('an object body matcher accepts a regex and a predicate leaf', async () => {
+  nock('http://mock.test')
+    .post('/leaves', {id: /^ord-\d+$/, amount: (value: unknown) => typeof value === 'number' && value > 10})
+    .reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/leaves', {json: {id: 'ord-42', amount: 99}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a nested object body matcher compares nested fields', async () => {
+  nock('http://mock.test')
+    .post('/nested', {outer: {inner: [1, 2]}})
+    .reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/nested', {json: {outer: {inner: [1, 2]}}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a body that is not json at all does not match an object matcher', async () => {
+  nock('http://mock.test').post('/notjson', {a: 1}).reply(200, 'matched');
+
+  const error = await failure(client.post('http://mock.test/notjson', {body: 'plain text'}));
+
+  assertUnmatched(error, 'an unparseable body must not match');
+});

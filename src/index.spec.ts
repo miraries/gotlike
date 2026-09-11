@@ -272,6 +272,27 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  /*
+   * A redirect chain of arbitrary length: `/hop/0` walks up to `/hop/20`, which answers 200.
+   * Starting below `20 - maxRedirections` is how a chain undici gives up on is provoked.
+   */
+  if (req.url?.startsWith('/hop/')) {
+    const hop = Number(req.url.slice('/hop/'.length));
+
+    if (hop < 20) {
+      res.statusCode = 302;
+      res.setHeader('location', `/hop/${hop + 1}`);
+      res.end('redirecting');
+
+      return;
+    }
+
+    res.statusCode = 200;
+    res.end('arrived');
+
+    return;
+  }
+
   if (req.url === '/redirect') {
     res.statusCode = 302;
     res.statusMessage = 'Found';
@@ -687,7 +708,9 @@ test('afterResponse can retry with merged options', async () => {
 
   const response = await extClient.get<Record<string, string>>('http://localhost:3000/unauthorized');
 
-  assert.strictEqual(attempts, 2);
+  // Once, not twice: the hook that retried does not run again for the response its own retry
+  // produced. got does the same - a lone retrying hook is called exactly once.
+  assert.strictEqual(attempts, 1);
   assert.strictEqual(response.statusCode, 200);
   assert.strictEqual(response.body['authorization'], 'Bearer refreshed');
   assert.strictEqual(response.request.options.context.alreadyRetried, true);
@@ -2968,7 +2991,14 @@ test('an afterResponse retry that names no body keeps the first attempt’s', as
   assert.strictEqual(response.body.headers['authorization'], 'Bearer new');
 });
 
-test('an afterResponse hook that always retries fails instead of recursing forever', async () => {
+/*
+ * A hook that retries unconditionally used to recurse until the process died, and was then
+ * capped by `maxAfterResponseRetries`. It can no longer recurse at all: a retry re-runs only
+ * the hooks *before* the one that retried, so each retry has strictly fewer hooks to run than
+ * the last and the chain is bounded by the array's own length. Verified against got, which
+ * calls a lone retrying hook exactly once.
+ */
+test('an afterResponse hook that always retries cannot recurse', async () => {
   let calls = 0;
 
   const extClient = client.extend({
@@ -2983,10 +3013,48 @@ test('an afterResponse hook that always retries fails instead of recursing forev
     },
   });
 
-  const error = await failure(extClient.get('http://localhost:3000/json'));
+  const response = await extClient.get('http://localhost:3000/json');
 
-  assert.strictEqual(error.code, 'ERR_TOO_MANY_RETRIES');
-  assert.ok(calls < 50, `expected a bounded number of retries, got ${calls}`);
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(calls, 1);
+});
+
+/*
+ * The ordering got actually produces, measured: with `[h1, h2]` and `h2` retrying, got runs
+ * `h1, h2` on the first response and `h1` alone on the retried one. `h2` never sees its own
+ * retry, and `h1` runs again because it ran before the retry was decided.
+ */
+test('a retry re-runs only the afterResponse hooks before the one that retried', async () => {
+  const order: string[] = [];
+  let retried = false;
+
+  const extClient = client.extend({
+    hooks: {
+      afterResponse: [
+        (response) => {
+          order.push(`h1:${response.statusCode}`);
+
+          return response;
+        },
+        (response, retryWithMergedOptions) => {
+          order.push(`h2:${response.statusCode}`);
+
+          if (!retried) {
+            retried = true;
+
+            return retryWithMergedOptions({headers: {authorization: 'Bearer refreshed'}});
+          }
+
+          return response;
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get('http://localhost:3000/unauthorized');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.deepStrictEqual(order, ['h1:401', 'h2:401', 'h1:200']);
 });
 
 test('beforeError runs for a stream, and the error carries the response', async () => {
@@ -3194,6 +3262,301 @@ test('beforeRetry fires and retryCount is reported on a stream', async () => {
   assert.strictEqual(head.statusCode, 200);
   assert.strictEqual(head.retryCount, 2);
   assert.deepStrictEqual(seen, [1, 2]);
+});
+
+/*
+ * undici follows redirects inside its own interceptor and never says where it ended up, so
+ * `response.url` reported the url that *redirected* rather than the one that answered. got
+ * documents `response.url` as the final url, and anything resolving a relative link or
+ * logging provenance against it was silently given the wrong one.
+ */
+test('response.url is the final url after a followed redirect', async () => {
+  const redirecting = client.extend({followRedirect: true, responseType: 'json'});
+
+  const response = await redirecting.get<Echo>('http://localhost:3000/redirect-chain');
+
+  assert.strictEqual(response.body.url, '/echo');
+  assert.strictEqual(String(response.url), 'http://localhost:3000/echo');
+});
+
+test('response.url is the requested url when nothing redirected', async () => {
+  const redirecting = client.extend({followRedirect: true});
+
+  const response = await redirecting.get('http://localhost:3000/json');
+
+  assert.strictEqual(String(response.url), 'http://localhost:3000/json');
+});
+
+test('a stream reports the final url too', async () => {
+  const redirecting = client.extend({followRedirect: true});
+
+  const stream = await redirecting.stream('http://localhost:3000/redirect-chain');
+  const head = await stream.response;
+
+  await text(stream);
+
+  assert.strictEqual(String(head.url), 'http://localhost:3000/echo');
+});
+
+/*
+ * A chain longer than `maxRedirections` leaves undici handing back the redirect itself. That
+ * used to resolve as a *success* whose body was the redirect page - the caller got
+ * `body: 'redirecting'` and no error at all. got throws here: its ok-range stops at 299 once
+ * redirects are being followed.
+ */
+test('a redirect chain that exceeds the limit is an HTTPError', async () => {
+  const redirecting = client.extend({followRedirect: true});
+
+  const error = await failure(redirecting.get('http://localhost:3000/hop/0'));
+
+  assert.strictEqual(error.code, 'ERR_HTTP_ERROR');
+  assert.strictEqual(error.name, 'HTTPError');
+  assert.strictEqual(error.response?.statusCode, 302);
+});
+
+test('an exceeded redirect chain still resolves with throwHttpErrors off', async () => {
+  const redirecting = client.extend({followRedirect: true, throwHttpErrors: false});
+
+  const response = await redirecting.get('http://localhost:3000/hop/0');
+
+  assert.strictEqual(response.statusCode, 302);
+  assert.strictEqual(response.ok, false);
+});
+
+test('a chain within the limit is followed to the end', async () => {
+  const redirecting = client.extend({followRedirect: true});
+
+  const response = await redirecting.get('http://localhost:3000/hop/15');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.body, 'arrived');
+  assert.strictEqual(String(response.url), 'http://localhost:3000/hop/20');
+});
+
+// A 3xx is only an error when redirects were being followed; not following them is how you
+// ask to see the 302 yourself, and got draws the line the same way.
+test('a 302 is not an error when redirects are not being followed', async () => {
+  const response = await client.get('http://localhost:3000/redirect', {followRedirect: false});
+
+  assert.strictEqual(response.statusCode, 302);
+});
+
+// got treats a 304 as ok whether or not it is following redirects - a conditional request
+// answered "not modified" succeeded.
+test('a 304 is not an error even when following redirects', async () => {
+  const redirecting = client.extend({followRedirect: true});
+
+  const response = await redirecting.get('http://localhost:3000/status-empty?code=304');
+
+  assert.strictEqual(response.statusCode, 304);
+});
+
+/*
+ * got keeps `username`/`password` on a `URL`, which node turns into an `Authorization` header.
+ * undici does no such thing, so credentials written into the url were dropped and the request
+ * went out anonymous - all the caller saw was a 401.
+ */
+test('credentials in the url become Basic auth', async () => {
+  const response = await client.get<Echo>('http://alice:s3cret@localhost:3000/echo', {responseType: 'json'});
+
+  assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from('alice:s3cret').toString('base64'));
+
+  // and the credentials are off the url by the time anything can read it back
+  assert.strictEqual(String(response.url), 'http://localhost:3000/echo');
+});
+
+test('percent-encoded credentials in the url are decoded before being encoded', async () => {
+  const response = await client.get<Echo>('http://al%40ice:p%3Aass@localhost:3000/echo', {responseType: 'json'});
+
+  assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from('al@ice:p:ass').toString('base64'));
+});
+
+test('an explicit username wins over the url', async () => {
+  const response = await client.get<Echo>('http://alice:s3cret@localhost:3000/echo', {
+    responseType: 'json',
+    username: 'bob',
+    password: 'other',
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from('bob:other').toString('base64'));
+});
+
+test('an `@` in the path is not mistaken for credentials', async () => {
+  const response = await client.get<Echo>('http://localhost:3000/echo/@me', {responseType: 'json'});
+
+  assert.strictEqual(response.body.url, '/echo/@me');
+  assert.strictEqual(response.body.headers['authorization'], undefined);
+});
+
+/*
+ * The `afterResponse` loop used to sit outside both of `call()`'s trys, so a hook that threw
+ * escaped as its own raw error - no `RequestError`, no `beforeError` hooks, invisible to any
+ * caller matching on `instanceof RequestError`. got wraps this same loop.
+ */
+test('an afterResponse hook that throws becomes a RequestError with beforeError applied', async () => {
+  const seen: string[] = [];
+
+  const extClient = client.extend({
+    hooks: {
+      afterResponse: [
+        () => {
+          throw new TypeError('hook blew up');
+        },
+      ],
+      beforeError: [
+        (error) => {
+          seen.push(error.code);
+
+          return error;
+        },
+      ],
+    },
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/json'));
+
+  assert.ok(error instanceof RequestError);
+  assert.strictEqual(error.message, 'hook blew up');
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+});
+
+// Forgetting the `return` used to fail with `Cannot read properties of undefined (reading
+// 'statusCode')`, naming neither the hook nor the request.
+test('an afterResponse hook that returns nothing is reported clearly', async () => {
+  const extClient = client.extend({
+    hooks: {afterResponse: [() => undefined as unknown as GotlikeResponse]},
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/json'));
+
+  assert.ok(error instanceof RequestError);
+  assert.match(error.message, /afterResponse.+invalid value/);
+});
+
+// An error the retry already normalised is rethrown as-is; wrapping it again would fire the
+// `beforeError` hooks a second time for one failure.
+test('a failure inside an afterResponse retry runs beforeError exactly once', async () => {
+  const seen: string[] = [];
+
+  const extClient = client.extend({
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) =>
+          response.statusCode === 200 ? retryWithMergedOptions({url: 'http://127.0.0.1:1'}) : response,
+      ],
+      beforeError: [
+        (error) => {
+          seen.push(error.code);
+
+          return error;
+        },
+      ],
+    },
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/json'));
+
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+  assert.strictEqual(seen.length, 1);
+});
+
+// The retry used to share the first attempt's context object, so a write on the retry changed
+// what the first response reports having been sent with. Driven from the second hook, since
+// only the hooks *before* the retrying one run again for the retried response.
+test('an afterResponse retry gets its own context', async () => {
+  const seen: Record<string, any>[] = [];
+
+  const extClient = client.extend({
+    context: {shared: 1},
+    hooks: {
+      afterResponse: [
+        (response) => {
+          seen.push(response.request.options.context);
+
+          return response;
+        },
+        (response, retryWithMergedOptions) =>
+          seen.length === 1 ? retryWithMergedOptions({context: {retried: true}}) : response,
+      ],
+    },
+  });
+
+  await extClient.get('http://localhost:3000/json');
+
+  assert.strictEqual(seen.length, 2);
+  assert.notStrictEqual(seen[0], seen[1]);
+  assert.deepStrictEqual(seen[0], {shared: 1});
+  assert.deepStrictEqual(seen[1], {shared: 1, retried: true});
+});
+
+// `handle()` read `resolveBodyOnly` off the options the *caller* passed, so a handler that
+// turned it on was ignored.
+test('a handler can turn on resolveBodyOnly', async () => {
+  const extClient = client.extend({
+    handlers: [(options, next) => next({...options, resolveBodyOnly: true})],
+  });
+
+  const body = (await extClient.get('http://localhost:3000/json')) as unknown as string;
+
+  // The body itself, not a Response - which is the whole point.
+  assert.strictEqual(typeof body, 'string');
+  assert.strictEqual(JSON.parse(body).test, 'value');
+});
+
+// One shared counter meant a handler calling `next` twice advanced past the handler after it.
+test('a handler calling next twice does not skip the next handler', async () => {
+  const seen: string[] = [];
+
+  const extClient = client.extend({
+    handlers: [
+      async (options, next) => {
+        const first = await next(options);
+
+        seen.push('first');
+
+        await next(options);
+
+        seen.push('second');
+
+        return first;
+      },
+      (options, next) => {
+        seen.push('inner');
+
+        return next(options);
+      },
+    ],
+  });
+
+  await extClient.get('http://localhost:3000/json');
+
+  assert.deepStrictEqual(seen, ['inner', 'first', 'inner', 'second']);
+});
+
+// `String({})` produced `a=%5Bobject+Object%5D` - a wrong query string, sent without complaint.
+test('an object searchParams value is rejected rather than stringified', async () => {
+  const error = await failure(client.get('http://localhost:3000/echo', {searchParams: {a: {b: 1} as never}}));
+
+  assert.match(error.message, /must be a string, number, boolean/);
+});
+
+test('an object form value is rejected too', async () => {
+  const error = await failure(client.post('http://localhost:3000/echo', {form: {a: {b: 1} as never}}));
+
+  assert.match(error.message, /must be a string, number, boolean/);
+});
+
+// `{'content-type': undefined}` is how "unset" reaches undici everywhere else, and counting it
+// as already-set sent a json body with no content-type at all.
+test('a header explicitly set to undefined does not suppress the derived content-type', async () => {
+  const response = await client.post<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+    json: {a: 1},
+    headers: {'content-type': undefined},
+  });
+
+  assert.strictEqual(response.body.headers['content-type'], 'application/json');
 });
 
 /*

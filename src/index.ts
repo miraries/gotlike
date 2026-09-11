@@ -177,7 +177,15 @@ type DispatchState = {
   lastError?: Error;
 };
 
-type RedirectState = DispatchState;
+type RedirectState = DispatchState & {
+  /**
+   * The url of the most recent hop - which, once the chain has finished, is the url the
+   * response actually came from. undici follows redirects inside its own interceptor and
+   * never reports where it ended up, so `response.url` used to name the url that redirected
+   * rather than the one that answered. got documents `response.url` as the *final* url.
+   */
+  lastUrl?: string;
+};
 
 type AttemptState = DispatchState & {
   onRetry?: (error: Error | undefined, statusCode: number | undefined, retryCount: number) => void;
@@ -291,19 +299,31 @@ const countAttempts = trackDispatches(
 );
 
 /**
- * Fires `beforeRedirect` hooks. The hop's outgoing options are still mutable at this point,
- * which is what lets a hook re-add a header undici stripped on a cross-origin redirect.
+ * Records where a redirect chain ended up, and fires `beforeRedirect` hooks. The hop's
+ * outgoing options are still mutable at this point, which is what lets a hook re-add a header
+ * undici stripped on a cross-origin redirect.
+ *
+ * Composed whenever the client follows redirects at all, not only when it has hooks: the
+ * final url is needed either way, since undici never reports it and `response.url` has to.
  *
  * The state holder has to arrive with the dispatch options rather than be attached on the
  * first hop: `RedirectHandler` copies the options in its constructor - before hop 1 reaches
  * here - and re-dispatches later hops with that copy, so anything attached on hop 1 is
  * invisible to hop 2.
  */
-function makeRedirectTracker(hooks: NonNullable<Hooks['beforeRedirect']>): Dispatcher.DispatcherComposeInterceptor {
+function makeRedirectTracker(hooks?: Hooks['beforeRedirect']): Dispatcher.DispatcherComposeInterceptor {
   return trackDispatches(
     (opts) => opts.redirects,
     (state, opts) => {
       if (state.lastStatusCode === undefined) {
+        return;
+      }
+
+      // The hop about to be dispatched. The last one recorded is where the response came
+      // from, which is what `response.url` and `StreamHead.url` report.
+      (state as RedirectState).lastUrl = String(opts.origin ?? '') + opts.path;
+
+      if (!hooks) {
         return;
       }
 
@@ -357,11 +377,73 @@ const absoluteUrl = /^[a-z][a-z\d+\-.]*:\/\//i;
 
 const leadingSlashes = /^\/+/;
 
+/** Credentials carried in a url's authority, and the url with them removed. */
+type Userinfo = {
+  url: string;
+  username: string;
+  password: string;
+};
+
+/**
+ * Pull `user:pass@` out of `http://user:pass@host/path`.
+ *
+ * got promotes a url's userinfo to Basic auth - it keeps `username`/`password` *on* the `URL`
+ * object, and node's `urlToHttpOptions` turns those into the `Authorization` header. undici
+ * does no such thing, so the credentials were dropped and the request went out anonymous; all
+ * the caller saw was a 401 with nothing pointing at the cause.
+ *
+ * Scans rather than parses: the authority is located by index and `@` is only looked for
+ * inside it, so a url with an `@` in its path (`/users/@me`) costs no more than the two
+ * `indexOf`s every url already pays, and nothing is allocated unless credentials are there.
+ */
+function splitUserinfo(url: string): Userinfo | undefined {
+  const scheme = url.indexOf('://');
+
+  if (scheme === -1) {
+    return undefined;
+  }
+
+  const start = scheme + 3;
+  let end = url.length;
+
+  // The authority runs to the first `/`, `?` or `#`. A query directly on the host
+  // (`http://host?a=1`) is legal, so all three have to bound it.
+  for (let i = start; i < url.length; i++) {
+    const char = url[i];
+
+    if (char === '/' || char === '?' || char === '#') {
+      end = i;
+      break;
+    }
+  }
+
+  // Last `@`, since the password may legally contain one.
+  const at = url.lastIndexOf('@', end - 1);
+
+  if (at < start) {
+    return undefined;
+  }
+
+  const userinfo = url.slice(start, at);
+  const separator = userinfo.indexOf(':');
+
+  return {
+    url: url.slice(0, start) + url.slice(at + 1),
+    // Percent-decoded, the way node decodes `url.username`/`url.password` before base64ing
+    // them - so a credential containing `@` or `:` round-trips as got's does.
+    username: decodeURIComponent(separator === -1 ? userinfo : userinfo.slice(0, separator)),
+    password: separator === -1 ? '' : decodeURIComponent(userinfo.slice(separator + 1)),
+  };
+}
+
 /** A single `searchParams` / `form` value. Arrays of these repeat the key. */
 export type QueryValue = string | number | boolean | null | undefined;
 
 /** got's default. undici's is 5, which is a lot more load on an upstream that is already failing. */
 const defaultRetryLimit = 2;
+
+/** Hops followed before undici gives up and hands back the redirect itself. got's default too. */
+const maxRedirections = 10;
 
 /**
  * How many times an `afterResponse` hook may call `retryWithMergedOptions` for one request.
@@ -375,7 +457,17 @@ const maxAfterResponseRetries = 20;
  * copy it while `for...in` validation and `Object.keys` never see it. */
 const retryDepth = Symbol('gotlike.retryDepth');
 
-type RetryDepth = {[retryDepth]?: number};
+/**
+ * How far into the `afterResponse` array a hook-driven retry should run, carried the same way.
+ *
+ * A retry re-enters `call()`, which used to run *every* `afterResponse` hook again from the
+ * start - so with `[log, refreshAuth]` a refreshed request logged twice, and `refreshAuth` saw
+ * its own retry and could go round again. got cuts the array at the hook that retried
+ * (`hooks.afterResponse.slice(0, index)`), so the hooks before it run again and it does not.
+ */
+const afterResponseLimit = Symbol('gotlike.afterResponseLimit');
+
+type RetryDepth = {[retryDepth]?: number; [afterResponseLimit]?: number};
 
 /**
  * Serialise `searchParams` / `form` values. Entries that are `null` or `undefined` are
@@ -406,17 +498,32 @@ function stringifyQuery(input: NonNullable<RequestOptions['searchParams']>): str
     if (Array.isArray(value)) {
       for (const item of value) {
         if (item !== null && item !== undefined) {
-          params.append(key, String(item));
+          params.append(key, queryValue(key, item));
         }
       }
 
       continue;
     }
 
-    params.append(key, String(value));
+    params.append(key, queryValue(key, value));
   }
 
   return params.toString();
+}
+
+/**
+ * One query/form value as a string.
+ *
+ * An object has no sensible serialisation here and `String(value)` produced the literal
+ * `a=%5Bobject+Object%5D` - a wrong query string, sent without complaint. got rejects the same
+ * input; one `typeof` per value is nothing against the request it is about to make.
+ */
+function queryValue(key: string, value: unknown): string {
+  if (typeof value === 'object') {
+    invalid(`\`${key}\` must be a string, number, boolean or an array of those, got an object`);
+  }
+
+  return String(value);
 }
 
 /** Status codes that cannot carry a response body, per RFC 9110. */
@@ -426,9 +533,22 @@ function isOk(statusCode: number): boolean {
   return statusCode >= 200 && statusCode < 300;
 }
 
-/** What `throwHttpErrors` acts on: anything outside 2xx/3xx. */
-function isHttpError(statusCode: number): boolean {
-  return statusCode < 200 || statusCode >= 400;
+/**
+ * What `throwHttpErrors` acts on.
+ *
+ * A 3xx is an error only when the client was *following* redirects: reaching the caller then
+ * means undici gave up - a chain longer than `maxRedirections` - and the response is the
+ * redirect itself rather than the thing it points at. That used to resolve as a success with
+ * the redirect page as its body. got draws the line in exactly the same place (`limitStatusCode`
+ * is 299 when following and 399 when not), 304 excepted, since a conditional request that is
+ * answered "not modified" succeeded.
+ */
+function isHttpError(statusCode: number, followsRedirects: boolean): boolean {
+  if (statusCode === 304) {
+    return false;
+  }
+
+  return statusCode < 200 || statusCode >= (followsRedirects ? 300 : 400);
 }
 
 function hasNoBody(statusCode: number, method: string): boolean {
@@ -441,12 +561,29 @@ function hasHeader(headers: IncomingHttpHeaders, name: string): boolean {
   }
 
   for (const key in headers) {
-    if (key.toLowerCase() === name) {
+    // The value has to be defined, not just the key present. `{'content-type': undefined}` is
+    // how "unset" reaches undici everywhere else here, and counting it as a header that was
+    // already set sent a json body with no `content-type` at all.
+    if (headers[key] !== undefined && key.toLowerCase() === name) {
       return true;
     }
   }
 
   return false;
+}
+
+/**
+ * Whether an `afterResponse` hook handed back something usable.
+ *
+ * A hook that falls off the end returns `undefined`, and the next thing to touch it was
+ * `response.statusCode` - so the whole request failed with `Cannot read properties of
+ * undefined`, naming neither the hook nor the request. got makes the same check.
+ *
+ * Only `statusCode` is tested, deliberately: got also insists on a non-null `body`, which
+ * here would reject the perfectly good `undefined` body of a 204 read as json.
+ */
+function isResponseLike(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && typeof (value as Response).statusCode === 'number';
 }
 
 /** Dispatches minus the first attempt. */
@@ -484,7 +621,7 @@ function mergeHeaders(base: IncomingHttpHeaders, override?: IncomingHttpHeaders)
   return merged;
 }
 
-/** Shallow-merge two optional records, without allocating when only one is present. */
+/** Shallow-merge two optional records into a fresh object. */
 function mergeRecords<T extends object>(base?: T, override?: T): T | undefined {
   if (!base) {
     return override;
@@ -1048,6 +1185,7 @@ class GotlikeResponse<T> implements Response<T> {
 
   #rawBody?: Buffer;
   #rawText?: string;
+  #url?: string;
 
   constructor(
     body: T,
@@ -1063,6 +1201,11 @@ class GotlikeResponse<T> implements Response<T> {
      * checked over `rawBody`.
      */
     rawText?: string,
+    /**
+     * Where the response actually came from, when redirects moved it. Only the redirect
+     * tracker supplies this; without one `options.url` is already the right answer.
+     */
+    finalUrl?: string,
   ) {
     this.body = body;
     this.headers = headers;
@@ -1072,10 +1215,12 @@ class GotlikeResponse<T> implements Response<T> {
     this.timings = {phases: {total}};
     this.request = {options};
     this.#rawText = rawText;
+    this.#url = finalUrl;
   }
 
+  /** The url the response came from - the last hop's, when redirects were followed. */
   get url(): string | URL {
-    return this.request.options.url as string | URL;
+    return this.#url ?? (this.request.options.url as string | URL);
   }
 
   get rawBody(): Buffer {
@@ -1506,12 +1651,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // rest-spreads the dispatch options on every request before it can bail out.
       if (this.followsRedirects) {
         // Must sit before `redirect` in the array: compose() wraps in order, so an earlier
-        // entry ends up inside, and only something inside is re-entered per hop.
-        if (this.beforeRedirectHooks) {
-          chain.push(makeRedirectTracker(this.beforeRedirectHooks));
-        }
-
-        chain.push(interceptors.redirect());
+        // entry ends up inside, and only something inside is re-entered per hop. Composed
+        // whether or not there are hooks - it is also what records the final url.
+        chain.push(makeRedirectTracker(this.beforeRedirectHooks), interceptors.redirect());
       }
 
       if (options.dedupe) {
@@ -1637,21 +1779,39 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // handler merging only supported during client create or extend
     const handlers = formed.handlers;
 
-    let result: Promise<Response<T>>;
-
     if (handlers) {
-      let iteration = 0;
+      /*
+       * The options the request is finally made with. A handler may change anything on the way
+       * down, `resolveBodyOnly` included, and the unwrap has to read the decision that reached
+       * `call()` rather than the one the caller started with.
+       */
+      let dispatched = formed;
 
-      const iterateHandlers = (newOptions: FormedOptions) => {
-        const handler = handlers[iteration++] ?? this.call.bind(this);
+      /*
+       * The index travels with the call instead of living in one shared counter: a handler
+       * that called `next` twice used to advance the counter twice and silently skip the
+       * handler after it.
+       */
+      const iterateHandlers = (newOptions: FormedOptions, index: number): Promise<Response> => {
+        const handler = handlers[index];
 
-        return handler(newOptions, iterateHandlers);
+        if (!handler) {
+          dispatched = newOptions;
+
+          return this.call(newOptions);
+        }
+
+        return handler(newOptions, (nextOptions) => iterateHandlers(nextOptions, index + 1));
       };
 
-      result = iterateHandlers(formed) as Promise<Response<T>>;
-    } else {
-      result = this.call<T>(formed);
+      // Read once the chain has resolved, not before it starts: a handler may await something
+      // of its own, so `dispatched` isn't settled until the request has actually been made.
+      return iterateHandlers(formed, 0).then((response) =>
+        dispatched.resolveBodyOnly && !dispatched.isStream ? response.body : response,
+      );
     }
+
+    const result = this.call<T>(formed);
 
     // Unwrapped out here rather than in `call()` so that handlers and `afterResponse` hooks
     // always see a full Response. Unwrapping earlier means a handler doing
@@ -1661,6 +1821,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     return result;
+  }
+
+  /**
+   * Whether *this* request follows redirects: the interceptor has to be composed (a
+   * create/extend-time decision) and the call must not have opted out.
+   *
+   * `this.followsRedirects` alone is not enough - undici rejects `maxRedirections` outright
+   * when the interceptor isn't in the chain, so with `validate: false` a per-request `true`
+   * used to slip past the ValidationError and fail every request with an opaque
+   * `UND_ERR_INVALID_ARG`. It also decides whether a 3xx reaching the caller is an error.
+   */
+  follows(options: FormedOptions): boolean {
+    return this.followsRedirects && Boolean(options.followRedirect);
   }
 
   /**
@@ -1675,13 +1848,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       bodyTimeout: options.timeout?.request,
       headersTimeout: options.timeout?.request,
       signal: requestSignal(options),
-      // `this.followsRedirects` decides whether the interceptor is in the chain at all, and
-      // undici rejects `maxRedirections` outright when it isn't. Reading only
-      // `options.followRedirect` meant that a per-request `followRedirect: true` slipped
-      // through whenever `validate` was off and failed every request with an opaque
-      // `UND_ERR_INVALID_ARG` instead of being the ValidationError it is with validation on.
-      maxRedirections: this.followsRedirects && options.followRedirect ? 10 : 0,
-      redirects: this.beforeRedirectHooks ? {count: 0} : undefined,
+      maxRedirections: this.follows(options) ? maxRedirections : 0,
+      // Only when redirects are actually in play. Allocating it for any client that merely
+      // *had* a `beforeRedirect` hook meant a per-request object the tracker never read.
+      redirects: this.follows(options) ? {count: 0} : undefined,
       // Handed to every dispatch, streams included: this is what drives `retryCount` and
       // fires `beforeRetry`.
       attempts: this.attemptState(),
@@ -1768,6 +1938,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     let rawText;
     let startTime;
     let attempts: AttemptState | undefined;
+    let redirects: RedirectState | undefined;
     let parseFailed = false;
     let url = '';
 
@@ -1781,6 +1952,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // The resolved URL is what hooks and handlers should see and what request signing
       // needs, so write it back before anything gets a look at the options.
       url = options.url = this.resolveUrl(options);
+
+      // `http://user:pass@host/` carries credentials that undici ignores, so they have to
+      // come off the url and go into the header here - before hooks see either. got gets this
+      // for free by keeping them on a `URL`, which node then turns into `Authorization`.
+      const userinfo = splitUserinfo(url);
+
+      if (userinfo) {
+        url = options.url = userinfo.url;
+      }
 
       // Serialise up front so `beforeRequest` hooks can read and re-sign `options.body`
       // regardless of whether the caller passed `json` or `body`.
@@ -1800,11 +1980,13 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         }
       }
 
-      if (
-        (options.username !== undefined || options.password !== undefined) &&
-        !hasHeader(options.headers, 'authorization')
-      ) {
-        const credentials = `${options.username ?? ''}:${options.password ?? ''}`;
+      // Explicit options win over the url's own userinfo, as they do in got - setting
+      // `username` there overwrites whatever the url carried.
+      const username = options.username ?? userinfo?.username;
+      const password = options.password ?? userinfo?.password;
+
+      if ((username !== undefined || password !== undefined) && !hasHeader(options.headers, 'authorization')) {
+        const credentials = `${username ?? ''}:${password ?? ''}`;
 
         options.headers['authorization'] = 'Basic ' + Buffer.from(credentials).toString('base64');
       }
@@ -1838,6 +2020,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
       // Only allocated for clients that actually retry; everyone else reports 0.
       attempts = dispatch.attempts;
+      // Only allocated when redirects are being followed; records where the chain ended.
+      redirects = dispatch.redirects;
 
       const requestOptions: UndiciRequestOptions = {
         ...dispatch,
@@ -1899,6 +2083,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
           elapsedMs(startTime),
           options,
           rawText,
+          redirects?.lastUrl,
         );
 
       if (err instanceof HeadersTimeoutError || err instanceof BodyTimeoutError) {
@@ -1962,17 +2147,60 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       elapsedMs(startTime),
       options,
       rawText,
+      redirects?.lastUrl,
     );
 
     // Runs before `throwHttpErrors` on purpose: got-style token refresh hooks need to see
     // the 401 that triggers them.
     if (this.afterResponseHooks) {
-      for (const hook of this.afterResponseHooks) {
-        response = await hook(response, (newOptions) => this.retryWithMergedOptions<T>(options, newOptions));
+      const hooks = this.afterResponseHooks;
+
+      /*
+       * How far to go. A hook-driven retry re-enters `call()`, and running the whole array
+       * again from the start meant a refreshed request re-ran every earlier hook and let the
+       * retrying hook see its own retry. got cuts the array at the hook that retried; this
+       * symbol is how that index reaches the retried call.
+       */
+      const limit = (options as RetryDepth)[afterResponseLimit] ?? hooks.length;
+
+      /*
+       * The loop has its own try, like the pre-request work above. A hook that throws - or
+       * one that simply forgets to return the response - used to escape as a raw error,
+       * skipping the `RequestError` wrapper and the `beforeError` hooks entirely, so a caller
+       * matching on `instanceof RequestError` missed it. got wraps this same loop.
+       */
+      try {
+        for (let index = 0; index < limit; index++) {
+          const hook = hooks[index]!;
+          const returned = await hook(response, (newOptions) =>
+            this.retryWithMergedOptions<T>(options, newOptions, index),
+          );
+
+          if (!isResponseLike(returned)) {
+            throw new TypeError('The `afterResponse` hook returned an invalid value');
+          }
+
+          response = returned;
+        }
+      } catch (error) {
+        // Anything raised through `toRequestError` - the retry's own failure, an exhausted
+        // retry budget - is already normalised and has already run the hooks. Re-wrapping it
+        // would fire them a second time.
+        if (normalisedErrors.has(error as object)) {
+          throw error;
+        }
+
+        throw await this.toRequestError(
+          messageOf(error, 'afterResponse hook failed'),
+          'ERR_REQUEST_ERROR',
+          error as Error,
+          options,
+          response,
+        );
       }
     }
 
-    if (options.throwHttpErrors && isHttpError(response.statusCode)) {
+    if (options.throwHttpErrors && isHttpError(response.statusCode, this.follows(options))) {
       throw await this.toRequestError(
         `Response code ${response.statusCode}`,
         'ERR_HTTP_ERROR',
@@ -2011,12 +2239,14 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     const retryCount = retriesFrom(dispatch.attempts);
+    // Where the response came from, which is not `options.url` once redirects moved it.
+    const finalUrl = dispatch.redirects?.lastUrl;
 
     const streamHead: StreamHead = {
       statusCode: undiciResponse.statusCode,
       ok: isOk(undiciResponse.statusCode),
       headers: undiciResponse.headers,
-      url: options.url as string | URL,
+      url: finalUrl ?? (options.url as string | URL),
       retryCount,
       timings: {
         phases: {
@@ -2025,7 +2255,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       },
     };
 
-    if (!options.throwHttpErrors || !isHttpError(undiciResponse.statusCode)) {
+    if (!options.throwHttpErrors || !isHttpError(undiciResponse.statusCode, this.follows(options))) {
       // The head arrived, but the body can still fail: a socket reset part-way through a
       // download used to surface undici's raw `SocketError` and skip the `beforeError` hooks.
       return asStream(this.normaliseBodyErrors(undiciResponse.body, options), streamHead);
@@ -2049,11 +2279,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         retryCount,
         streamHead.timings.phases.total,
         options,
+        undefined,
+        finalUrl,
       ),
       HTTPError,
     );
 
-    return asStream(undiciResponse.body, streamHead, error);
+    // The body was dumped just above, so there is nothing left to present - the error readable
+    // `asStream` builds for a failure is what the caller reads.
+    return asStream(Readable.from([]), streamHead, error);
   }
 
   /**
@@ -2112,11 +2346,14 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
     try {
       duplex = undici.pipeline(options.url as string, dispatch, ({statusCode, headers, body}) => {
+        // Where the response came from, which is not `options.url` once redirects moved it.
+        const finalUrl = dispatch.redirects?.lastUrl;
+
         const streamHead: StreamHead = {
           statusCode,
           ok: isOk(statusCode),
           headers,
-          url: options.url as string | URL,
+          url: finalUrl ?? (options.url as string | URL),
           retryCount: retriesFrom(dispatch.attempts),
           timings: {
             phases: {
@@ -2128,7 +2365,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         resolveHead(streamHead);
         duplex.emit('response', streamHead);
 
-        if (!options.throwHttpErrors || !isHttpError(statusCode)) {
+        if (!options.throwHttpErrors || !isHttpError(statusCode, this.follows(options))) {
           return body;
         }
 
@@ -2154,6 +2391,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
             streamHead.retryCount,
             streamHead.timings.phases.total,
             options,
+            undefined,
+            finalUrl,
           ),
           HTTPError,
         );
@@ -2217,7 +2456,12 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * The retry goes straight to `call()`: handlers already ran for this request, and running
    * them again would re-log and re-wrap a request the caller only made once.
    */
-  async retryWithMergedOptions<T>(options: FormedOptions, newOptions: RequestOptions): Promise<Response<T>> {
+  async retryWithMergedOptions<T>(
+    options: FormedOptions,
+    newOptions: RequestOptions,
+    /** Index of the `afterResponse` hook driving this retry; absent when called directly. */
+    hookIndex?: number,
+  ): Promise<Response<T>> {
     const depth = ((options as RetryDepth)[retryDepth] ?? 0) + 1;
 
     if (depth > maxAfterResponseRetries) {
@@ -2270,13 +2514,25 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       }
     }
 
-    if (newOptions.context) {
-      merged.context = {...options.context, ...newOptions.context};
-    }
+    // Always a fresh object, for the same reason `headers` is: without it the retry shares
+    // the first attempt's context, so a hook writing to `options.context` on the retry
+    // changed what the first response reports having been sent with.
+    merged.context = {...options.context, ...newOptions.context};
 
     // `url` was already resolved against `prefixUrl` for the first attempt.
     merged.prefixUrl = undefined;
     (merged as RetryDepth)[retryDepth] = depth;
+
+    if (hookIndex === undefined) {
+      // Called directly rather than handed to a hook, so there is no hook to cut the array at
+      // and the retry runs the hooks it normally would. The spread may have carried a limit in
+      // from an earlier retry, so it has to be cleared rather than left.
+      delete (merged as RetryDepth)[afterResponseLimit];
+    } else {
+      // The retried request runs the hooks *before* the one that retried, and stops there - so
+      // a refresh hook doesn't see its own retry and earlier hooks don't fire twice over.
+      (merged as RetryDepth)[afterResponseLimit] = hookIndex;
+    }
 
     return this.call<T>(merged);
   }

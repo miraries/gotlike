@@ -50,6 +50,12 @@ Three source files, all in `src/`:
 
 `get`/`post`/`put`/`patch`/`delete`/`query`/`stream` are thin wrappers that set `url`/`method` and call `handle()`.
 
+**`handle()` unwraps `resolveBodyOnly` from the options that reached `call()`, not the ones the caller passed**,
+and reads them after the chain resolves — a handler may await something of its own, so the decision isn't
+settled synchronously. A handler turning `resolveBodyOnly` on used to be ignored. The handler index also travels
+with the call instead of living in one shared counter, so a handler calling `next` twice no longer skips the
+handler after it.
+
 `handle()` calls `formOptions()` — one spread of `{...baseOptions, ...options}` into a **fresh** object, with
 `headers` and `context` merged one level deep — then either runs the handler chain or goes straight to `call()`.
 Handlers are got-style middleware: `iterateHandlers` walks `options.handlers` in order with `this.call` bound as
@@ -107,9 +113,22 @@ Three things `resolveUrl` has to get right, each of which was silently wrong:
   landed mid-url (`http://h/base?x=1` + `p` → `http://h/base?x=1/p`), and adding `searchParams` then cut
   everything from the `?` onwards and dropped the path segment entirely. Rejected rather than mangled.
 
+**Credentials in the url become Basic auth** (`splitUserinfo`). got keeps `username`/`password` on a `URL` and
+node's `urlToHttpOptions` turns those into the `Authorization` header; undici does no such thing, so
+`http://user:pass@host/` went out anonymous and all the caller saw was a 401. The userinfo is stripped off
+`options.url` before hooks see it, and percent-decoded first so a credential containing `@` or `:` round-trips
+as got's does. Explicit `username`/`password` options win. It scans for the authority by index rather than
+parsing, so a url with an `@` in its *path* (`/users/@me`) costs two `indexOf`s and allocates nothing.
+
 Every failure is normalized into a `RequestError` carrying `options` and the undici response, with `code` one of
 `ETIMEDOUT` (headers/body timeout), `ERR_BODY_PARSE_FAILURE` (JSON parse — the raw text is attached to
-`response.body` so callers can inspect it), `ERR_HTTP_ERROR` (non-2xx/3xx), or `ERR_REQUEST_ERROR`. Timeout and
+`response.body` so callers can inspect it), `ERR_HTTP_ERROR`, or `ERR_REQUEST_ERROR`.
+
+**`isHttpError` takes whether the request was following redirects.** A 3xx is an error only when it was: reaching
+the caller then means undici gave up on a chain longer than `maxRedirections`, and that used to resolve as a
+*success* whose body was the redirect page. got draws the line in the same place (`limitStatusCode` is 299 when
+following, 399 when not), 304 excepted. `follows(options)` is the one place that answers "is this request
+following redirects", and `dispatchOptions` gates `maxRedirections` on it too. Timeout and
 retry errors are detected with the public `errors` export from undici 8 (undici 6/7 had no types for these, so
 older code reached into `undici/lib/core/errors` — that internal import is gone).
 
@@ -195,6 +214,22 @@ the request was sent with and calls `call()` **directly, not `handle()`** — ha
 request, and re-entering them would re-log and re-wrap a request the caller made once. It also clears
 `prefixUrl`, since `options.url` was already resolved against it on the first attempt.
 
+**The retried request runs only the hooks *before* the one that retried** (`afterResponseLimit`, a symbol on the
+options, same trick as `retryDepth`). Re-running the whole array meant a refreshed request re-fired every earlier
+hook and let the retrying hook see its own retry. got does `hooks.afterResponse.slice(0, index)` for the same
+reason — measured against got-cjs: `[h1, h2]` with `h2` retrying gives `h1, h2, h1`. A side effect worth knowing:
+each retry has strictly fewer hooks left than the last, so the chain is bounded by the array's own length and
+`ERR_TOO_MANY_RETRIES` is now unreachable through the hook path. `maxAfterResponseRetries` is kept as a guard on
+`retryWithMergedOptions` being driven directly.
+
+**The hook loop has its own `try`, like the pre-request work.** A hook that threw — or one that simply forgot to
+`return response`, which failed with `Cannot read properties of undefined (reading 'statusCode')` — escaped as a
+raw error, skipping the `RequestError` wrapper and the `beforeError` hooks, so a caller matching on
+`instanceof RequestError` missed it. The hook's return value is checked (`isResponseLike`) the way got checks it,
+on `statusCode` only: got also requires a non-null `body`, which here would reject the legitimate `undefined`
+body of a 204 read as json. An error already in `normalisedErrors` is rethrown untouched so the hooks don't fire
+twice for one failure.
+
 It **always reallocates `headers`**, even when the hook passed none. Aliasing the first attempt's header object
 meant `call()`'s own writes on the retry — a `content-type` for a body the retry added — landed on the options
 the *first* response reports having been sent with.
@@ -210,11 +245,13 @@ content-type, which is what a token refresh wants.
 
 It is also **bounded** (`maxAfterResponseRetries`, 20), tracked through a symbol key on the options so option
 spreads carry it while `for...in` validation and `Object.keys` never see it. A hook that always retries on a
-status it never stops seeing — an auth refresh that silently fails — used to recurse until the process died;
-it now fails with `ERR_TOO_MANY_RETRIES`.
+status it never stops seeing — an auth refresh that silently fails — used to recurse until the process died.
+Cutting the hook array at the retrying hook (above) is what actually rules that out now, since each retry has
+strictly fewer hooks left to run; the depth bound stays as a guard for `retryWithMergedOptions` called directly.
 
 `beforeError` hooks may return a replacement error; anything that isn't an `Error` is ignored. They run for
-**every** failure path, streams included — see Streams — and for anything a `beforeRequest` hook throws.
+**every** failure path, streams included — see Streams — and for anything a `beforeRequest` or `afterResponse`
+hook throws. The `afterResponse` loop was the last uncovered path; it has its own `try` now.
 
 **The pre-request work in `call()` has its own `try`.** The url resolution, body serialisation and the
 `beforeRequest` hook loop all sit inside it, so a throwing hook (or a circular `json`) becomes a `RequestError`
@@ -287,6 +324,14 @@ documented divergence from got, not an oversight.
 `beforeRedirect` uses the same shape: `makeRedirectTracker` is composed **inside** undici's redirect
 interceptor, so it is re-entered per hop, and the hop's options are still mutable there — which is what lets
 a hook put back an `authorization` header that undici stripped on a cross-origin redirect.
+
+**The tracker is composed whenever the client follows redirects, not only when it has hooks**, because it is also
+what records `lastUrl`. undici follows a chain inside its own interceptor and never reports where it ended up, so
+`response.url` named the url that *redirected* rather than the one that answered — wrong for anything resolving a
+relative link or logging provenance, and got documents `response.url` as the final url. `GotlikeResponse` takes it
+as an eighth constructor argument and the `url` getter prefers it; both stream paths put it on `StreamHead.url`.
+`options.url` deliberately stays the url that was *requested*, so an `afterResponse` retry goes back through the
+redirect rather than jumping to its destination.
 
 Two things that cost real debugging and are easy to undo:
 - **The state holder must be handed in with the dispatch options, not attached on first entry.**
@@ -482,6 +527,16 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   shape, and `isSerialisableQuery` keeps a RegExp or predicate value away from undici, which would serialise it
   into its stored path. The entry count is compared against the flattened expectation, so a repeated key is only
   satisfied by an array of the same length.
+- **An object/array body matcher has to become a function matcher.** undici compares a non-RegExp, non-function
+  `body` with `===`, so nock's most common form — `nock(host).post('/p', {a: 1})` — never matched anything, and
+  because an unmatched interceptor falls through to the *real network*, a test written that way quietly made a
+  live outbound request. `toBodyMatcher` JSON-parses the request body and `bodyValueMatches` deep-compares it,
+  with nock's leaf matchers (a RegExp tests the value, a function is asked about it) and nock's exactness (every
+  field named, nothing besides).
+- **An object reply body is labelled `application/json`** (`replyOptions`). nock sets that header; undici's
+  MockAgent serialises the body but sets no content-type at all, so anything under test that branches on the
+  response's content-type behaved differently against the mock than against the real server — which is the one
+  thing a mocking shim must not do. An explicit content-type is left alone.
 - **`responseOptions` must always be an object**, never `undefined`, or undici throws `UND_ERR_INVALID_ARG`.
 - **`persist()`, `done()` and `isDone()` live on the `Scope`**, which is where nock's docs put them —
   `nock(host).persist().get('/')` and `scope.done()`. `isDone()` filters `pendingInterceptors()` by the scope's

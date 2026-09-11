@@ -14,7 +14,14 @@ const pools = new Map<string, Interceptable>();
 
 type HeaderMatcher = string | RegExp | ((fieldValue: string) => boolean);
 type PathMatcher = string | RegExp | ((path: string) => boolean);
-type BodyMatcher = string | RegExp | ((body: string) => boolean);
+
+/**
+ * An object or array matches the request body parsed as JSON, field by field, as it does in
+ * nock. undici compares a non-RegExp, non-function matcher with `===`, so an object never
+ * matched anything - and because an unmatched interceptor falls through to the real network,
+ * a test written that way quietly made a live outbound request.
+ */
+type BodyMatcher = string | RegExp | Record<string, any> | unknown[] | ((body: string) => boolean);
 
 /** `true` matches any query string, an object matches those exact params. */
 type QueryMatcher = boolean | Record<string, any> | URLSearchParams;
@@ -68,6 +75,104 @@ function parseRequestBody(body: unknown, headers: Record<string, string>): unkno
   }
 
   return body;
+}
+
+/**
+ * Deep-compare an expected body against what arrived, with nock's leaf matchers: a RegExp
+ * tests the value, a function is asked about it, anything else compares by value.
+ */
+function bodyValueMatches(expected: unknown, actual: unknown): boolean {
+  if (expected instanceof RegExp) {
+    return typeof actual === 'string' && expected.test(actual);
+  }
+
+  if (typeof expected === 'function') {
+    return Boolean((expected as (value: unknown) => unknown)(actual));
+  }
+
+  if (Array.isArray(expected)) {
+    return (
+      Array.isArray(actual) &&
+      expected.length === actual.length &&
+      expected.every((item, i) => bodyValueMatches(item, actual[i]))
+    );
+  }
+
+  if (expected !== null && typeof expected === 'object') {
+    if (actual === null || typeof actual !== 'object' || Array.isArray(actual)) {
+      return false;
+    }
+
+    const expectedKeys = Object.keys(expected);
+    const actualKeys = Object.keys(actual as object);
+
+    // Exact, as nock's object body matching is: every field named and nothing besides.
+    return (
+      expectedKeys.length === actualKeys.length &&
+      expectedKeys.every((key) =>
+        bodyValueMatches((expected as Record<string, unknown>)[key], (actual as Record<string, unknown>)[key]),
+      )
+    );
+  }
+
+  return expected === actual;
+}
+
+/**
+ * Turn an object/array body matcher into the function matcher undici can actually apply.
+ * Strings, RegExps and functions are already shapes undici understands, so they pass through.
+ */
+function toBodyMatcher(body?: BodyMatcher): string | RegExp | ((body: string) => boolean) | undefined {
+  if (body === null || body === undefined || typeof body !== 'object' || body instanceof RegExp) {
+    return body as string | RegExp | undefined;
+  }
+
+  return (requestBody: string) => {
+    let parsed: unknown;
+
+    try {
+      parsed = JSON.parse(requestBody);
+    } catch {
+      return false;
+    }
+
+    return bodyValueMatches(body, parsed);
+  };
+}
+
+/** Whether a reply body is one nock would label `application/json`. */
+function isJsonReplyBody(body: unknown): boolean {
+  return typeof body === 'object' && body !== null && !Buffer.isBuffer(body);
+}
+
+function hasContentType(headers: ReplyHeaders): boolean {
+  for (const key in headers) {
+    if (key.toLowerCase() === 'content-type') {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * The response headers undici should send.
+ *
+ * nock labels an object or array reply `application/json`; undici's MockAgent serialises the
+ * body but sets no content-type at all, so anything under test that branches on the response's
+ * content-type behaved differently against the mock than against the real server - which is
+ * the one thing a mocking shim must not do.
+ */
+function replyOptions(body: unknown, headers?: ReplyHeaders): {headers?: ReplyHeaders} {
+  if (!isJsonReplyBody(body)) {
+    return headers ? {headers} : {};
+  }
+
+  if (!headers) {
+    return {headers: {'content-type': 'application/json'}};
+  }
+
+  return {headers: hasContentType(headers) ? headers : {...headers, 'content-type': 'application/json'}};
 }
 
 function stripQuery(path: string): string {
@@ -298,7 +403,7 @@ class Interceptor {
     const options: MockInterceptor.Options = {
       method: this.#method,
       path: buildPathMatcher(this.#basePath, this.#path, ignoreQuery, undiciAppliesQuery ? undefined : query),
-      body: this.#body,
+      body: toBodyMatcher(this.#body),
       headers: Object.keys(this.#headers).length > 0 ? this.#headers : undefined,
     };
 
@@ -366,7 +471,7 @@ class Interceptor {
     }
 
     return this.#applyScopeOptions(
-      interceptor.reply(responseCodeOrFunction, (body ?? '') as any, headers ? {headers: headers as any} : {}),
+      interceptor.reply(responseCodeOrFunction, (body ?? '') as any, replyOptions(body, headers) as any),
     );
   }
 
@@ -381,7 +486,7 @@ class Interceptor {
           parseRequestBody(opts.body, context.req.headers),
         );
 
-        return {statusCode, data: data ?? '', responseOptions: replyHeaders ? {headers: replyHeaders as any} : {}};
+        return {statusCode, data: data ?? '', responseOptions: replyOptions(data, replyHeaders) as any};
       }),
     );
   }
