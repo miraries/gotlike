@@ -436,17 +436,32 @@ onto `GotlikeResponse` as a seventh constructor argument, because `JSON.stringif
 `{"a":1}` for a response that was on the wire as `{\n  "a"  :  1\n}` — which silently breaks any signature or
 digest checked over `rawBody`.
 
+**The one limit on that, and it is deliberate:** on the `text`/`json` paths `rawBody` is a UTF-8 encoding of the
+decoded text, so it is byte-exact only for UTF-8 — which JSON is by RFC 8259, and which `charset=utf-8` promises.
+A response in another charset comes back through undici's `body.text()` already decoded lossily (`0xe9` → U+FFFD),
+so `body` is mojibake and `rawBody` re-encodes the mojibake: measured, `63 61 66 e9` reads back as
+`63 61 66 ef bf bd`. `responseType: 'buffer'` is exact and is the answer for those responses. Making the text path
+exact would mean reading `bytes()` instead of `text()` on *every* response — undici's single-chunk `text()` decodes
+in place with no copy, while `bytes()` copies the body first — measured at +160ns for 250 bytes, +2.2µs for 100KB,
+paid by every caller to serve the few who read `rawBody` on a non-UTF-8 response. Don't make that trade without
+a reason to.
+
 ### Streams
 
 There are **two** stream paths, and which one runs depends on whether the request has a body:
 
-- **no body, and a method that can't carry one** → `callBodylessStream`, via `undici.request`. Returns the
-  response `Readable` unwrapped.
-- **anything else** → `callStream`, via `undici.pipeline`, returning a `Duplex` whose writable half is the
-  request body.
+- **a method that can't carry a body** → `callBodylessStream`, via `undici.request`. Returns the
+  response `Readable` unwrapped. A body supplied in the *options* still goes out; undici sends one on a GET.
+- **a `bodyMethods` method** → `callStream`, via `undici.pipeline`, returning a `Duplex` whose writable half is
+  the request body.
 
 The split is on `bodyMethods` (`POST`/`PUT`/`PATCH`/`DELETE`/`QUERY`), which `BodyMethod` is derived from so the list
-and the type can't drift. It used to test `method === 'GET' || 'HEAD'`, which put every other bodyless method —
+and the type can't drift - **on the method alone, never on whether a body is present**. It used to route anything
+carrying a body to the pipeline, which meant `stream(url, {body})` on a GET took the one path that cannot follow a
+redirect (below) and resolved with the bare 302, whatever `followRedirect` said. The pipeline path exists so the
+*caller* can write the body into the duplex; a body that arrived in the options needs none of that, and through
+`undici.request` it is an ordinary replayable body that survives the hop. The `stream()` overloads key on `method`
+too, so they had been promising a `Readable` for exactly the case that returned a `Duplex`. It used to test `method === 'GET' || 'HEAD'`, which put every other bodyless method —
 `OPTIONS`, and anything on a client with no `method` in its base options — on the pipeline path, where nothing
 ends the writable half and `undici.pipeline` never sends the request at all. That hung forever.
 
@@ -541,6 +556,16 @@ The deadline is what actually bounds the request, and it is not optional. undici
 either one — a request under a 1.5s timeout was measured still running at 4.9s. undici also arms them on its
 coarse timer wheel (`lib/util/timers.js`, `RESOLUTION_MS = 1000`), which used to round every sub-second timeout up
 to roughly a second. Both are covered by tests (`/trickle`, and a 50ms timeout asserted to fire promptly).
+
+**The deadline bounds an attempt, not the retry sequence.** One signal is handed to undici and spans every attempt
+it makes, so the deadline was a cumulative budget: measured, a `timeout: {request: 400}` with `retry: {limit: 4}`
+against an upstream answering in 150ms ran all five attempts in got 14 (1045ms) and gave up after three here
+(404ms) - a client configured to retry was denied most of its retries, and the README claimed got's semantics
+while not having them. `requestSignal` therefore hands back a `restart` alongside `release`, and `countAttempts`
+calls it on every re-dispatch, which is after undici's backoff wait and so doesn't charge the wait to the attempt.
+This is also what undici's own `headersTimeout`/`bodyTimeout` already did, so all three now agree. The restart
+reaches the interceptor on the `attempts` holder (`AttemptState.restartDeadline`), which only exists for a client
+that retries at all.
 
 undici's own timeout errors are still mapped, since they give the more specific message when they do fire first.
 The deadline reports itself as a `TimeoutError` DOMException, which lands on the same `TimeoutError`/`ETIMEDOUT`

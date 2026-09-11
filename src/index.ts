@@ -203,6 +203,8 @@ type RedirectState = DispatchState & {
 
 type AttemptState = DispatchState & {
   onRetry?: (error: Error | undefined, statusCode: number | undefined, retryCount: number) => void;
+  /** Starts the request deadline over for a new attempt. See `requestSignal`. */
+  restartDeadline?: () => void;
 };
 
 /**
@@ -331,6 +333,9 @@ const countAttempts = trackDispatches(
       // falls back to the url that was requested, which is where the answer came from.
       redirects.lastUrl = undefined;
     }
+
+    // A fresh attempt gets the whole of `timeout.request`, not what the last one left over.
+    (state as AttemptState).restartDeadline?.();
 
     (state as AttemptState).onRetry?.(state.lastError, state.lastStatusCode, state.count - 1);
   },
@@ -781,11 +786,11 @@ function concatHooks<T>(base?: T[], added?: T[]): T[] | undefined {
  * It also sidesteps undici's coarse timer wheel (`lib/util/timers.js`, `RESOLUTION_MS = 1000`),
  * which used to round every sub-second timeout up to roughly a second.
  */
-function requestSignal(options: FormedOptions): {signal?: AbortSignal; release: () => void} {
+function requestSignal(options: FormedOptions): {signal?: AbortSignal; release: () => void; restart: () => void} {
   const timeout = options.timeout?.request;
 
   if (timeout === undefined) {
-    return {signal: options.signal, release: noRelease};
+    return {signal: options.signal, release: noRelease, restart: noRelease};
   }
 
   // Built from an `AbortController` rather than `AbortSignal.timeout`, which cannot be
@@ -795,18 +800,33 @@ function requestSignal(options: FormedOptions): {signal?: AbortSignal; release: 
   // longer the timeout, the worse it gets. Releasing on settle keeps it to the requests
   // actually in flight.
   const controller = new AbortController();
-  const timer = setTimeout(() => {
-    // The same `TimeoutError` DOMException `AbortSignal.timeout` reports, message included, so
-    // `isTimeoutReason` and anything a caller matches on are unchanged.
-    controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
-  }, timeout);
+  const arm = (): NodeJS.Timeout =>
+    setTimeout(() => {
+      // The same `TimeoutError` DOMException `AbortSignal.timeout` reports, message included,
+      // so `isTimeoutReason` and anything a caller matches on are unchanged.
+      controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+      // As `AbortSignal.timeout` does: a pending deadline must not hold the process open.
+    }, timeout).unref();
 
-  // As `AbortSignal.timeout` does: a pending deadline must not hold the process open.
-  timer.unref();
+  let timer = arm();
 
   return {
     signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
     release: () => clearTimeout(timer),
+    /*
+     * `timeout.request` bounds an *attempt*, as got's does and as undici's own
+     * `headersTimeout`/`bodyTimeout` do - so a retry starts the clock again. One signal spans
+     * every attempt undici makes, so without this the deadline was a cumulative budget for the
+     * whole retry sequence: measured against got 14, a `timeout: {request: 400}` with
+     * `retry: {limit: 4}` against an upstream answering in 150ms ran all five attempts there
+     * (1045ms) and gave up after three here (404ms). A request configured to retry was being
+     * denied most of its retries, which is the opposite of what either option asks for. The
+     * backoff wait is not counted, because this fires when the new attempt is dispatched.
+     */
+    restart: () => {
+      clearTimeout(timer);
+      timer = arm();
+    },
   };
 }
 
@@ -2001,6 +2021,13 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     const deadline = requestSignal(options);
+    const attempts = this.attemptState();
+
+    if (attempts) {
+      // Only a client that retries has anything to restart, and `attemptState` only allocates
+      // for one - so the assignment costs nothing on a client without `retry`.
+      attempts.restartDeadline = deadline.restart;
+    }
 
     return {
       dispatcher: this.agent,
@@ -2016,7 +2043,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       redirects: this.follows(options) ? {count: 0} : undefined,
       // Handed to every dispatch, streams included: this is what drives `retryCount` and
       // fires `beforeRetry`.
-      attempts: this.attemptState(),
+      attempts,
     };
   }
 
@@ -2189,9 +2216,17 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       const body = options.body;
 
       if (options.isStream) {
-        const hasBody = options.body !== undefined && options.body !== null;
-        const stream =
-          !hasBody && !isBodyMethod(options.method) ? await this.callBodylessStream(options) : this.callStream(options);
+        /*
+         * The method alone decides, not whether a body happens to be present. The pipeline
+         * path exists so the *caller* can write the request body into the duplex's writable
+         * half; a body that came in through the options needs none of that, and paid for it
+         * dearly - `RedirectHandler` refuses to follow a redirect whose body it cannot
+         * replay, so `stream(url, {body})` on a GET resolved with the bare 302 and an empty
+         * body however `followRedirect` was set. Routed through `undici.request` the body is
+         * an ordinary replayable one and the chain is followed. The `stream()` overloads
+         * already typed a non-body method as a `Readable`, so this is also what they claim.
+         */
+        const stream = isBodyMethod(options.method) ? this.callStream(options) : await this.callBodylessStream(options);
 
         return stream as unknown as Response<T>;
       }
@@ -2441,7 +2476,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     let undiciResponse;
 
     try {
-      undiciResponse = await undici.request(options.url as string, dispatch);
+      // A body is legal on a bodyless *method* - undici sends one on a GET, and this is the
+      // path that keeps it replayable across a redirect.
+      undiciResponse = await undici.request(options.url as string, {...dispatch, body: options.body});
     } catch (error) {
       // Nothing left to bound - the request never got off the ground.
       dispatch.release();

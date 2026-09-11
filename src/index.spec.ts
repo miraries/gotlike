@@ -401,6 +401,44 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  // A redirect in front of `/echo`, so a test can tell a chain that was followed from one that
+  // stopped at the 302 - and whether the body came with it.
+
+  if (req.url === '/redirect-echo') {
+    res.statusCode = 302;
+    res.setHeader('Location', '/echo');
+
+    res.end();
+
+    return;
+  }
+
+  /*
+   * Spends real time on every attempt before failing, which is what separates a per-attempt
+   * deadline from a cumulative one: three attempts cost more than `timeout.request` allows for
+   * one, so a client that retries only gets through them if the clock restarts each time.
+   */
+  if (req.url === '/slow-flaky') {
+    const testId = req.headers['test-id']?.toString() ?? 'default';
+
+    serverState.retryCounts[testId] = serverState.retryCounts[testId] ? serverState.retryCounts[testId] + 1 : 1;
+
+    const attempt = serverState.retryCounts[testId];
+
+    setTimeout(() => {
+      if (attempt < 4) {
+        res.statusCode = 503;
+        res.end();
+
+        return;
+      }
+
+      res.end('slow ok');
+    }, 100);
+
+    return;
+  }
+
   if (req.url === '/retry') {
     const testId = req.headers['test-id']?.toString() ?? 'default';
 
@@ -2486,6 +2524,78 @@ test('beforeRedirect does not fire when followRedirect is off', async () => {
  * already on it, was treated as one more hop, and fired `beforeRedirect` with the status that
  * had caused the retry - telling the hook that a `503` had redirected to the original url.
  */
+/*
+ * The routing between the two stream paths keys on the method, not on whether a body happens
+ * to be present: `undici.pipeline` makes the duplex's writable half the request body, and
+ * `RedirectHandler` will not follow a redirect whose body it cannot replay - so a GET stream
+ * carrying a body from the options used to resolve with the bare 302 whatever `followRedirect`
+ * said. Through `undici.request` the body is an ordinary replayable one.
+ */
+test('a stream given a body in its options still follows redirects', async () => {
+  const extClient = client.extend({followRedirect: true});
+  const stream = await extClient.stream('http://localhost:3000/redirect-echo', {body: 'payload'});
+  const head = await stream.response;
+
+  assert.strictEqual(head.statusCode, 200);
+  assert.strictEqual(head.url, 'http://localhost:3000/echo');
+
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of stream) {
+    chunks.push(chunk as Buffer);
+  }
+
+  const echoed = JSON.parse(Buffer.concat(chunks).toString()) as {url: string; method: string; body: string};
+
+  assert.strictEqual(echoed.url, '/echo');
+  // The body survived the hop too, which is what `undici.request` buys over the pipeline.
+  assert.strictEqual(echoed.method, 'GET');
+  assert.strictEqual(echoed.body, 'payload');
+});
+
+/*
+ * `timeout.request` bounds an attempt, not the whole retry sequence - as got's does, and as
+ * undici's own per-phase timeouts do. The deadline signal spans every attempt undici makes, so
+ * it used to be a cumulative budget: four 100ms attempts under a 250ms timeout died on the
+ * third. Measured against got 14, which runs all of them.
+ */
+test('timeout.request bounds each attempt rather than the whole retry sequence', async () => {
+  const extClient = client.extend({
+    retry: {limit: 3, backoffLimit: 10, statusCodes: [503]},
+  });
+  const response = await extClient.get('http://localhost:3000/slow-flaky', {
+    timeout: {request: 250},
+    headers: {'test-id': randomUUID()},
+  });
+
+  assert.strictEqual(response.body, 'slow ok');
+  assert.strictEqual(response.retryCount, 3);
+});
+
+/*
+ * The other half of the same change: restarting the clock per attempt must not stop it
+ * bounding one. A single attempt that outruns the deadline still fails.
+ */
+test('timeout.request still fires within a single retried attempt', async () => {
+  const extClient = client.extend({
+    retry: {limit: 3, backoffLimit: 10, statusCodes: [503]},
+  });
+
+  await assert.rejects(
+    () =>
+      extClient.get('http://localhost:3000/slow-flaky', {
+        timeout: {request: 50},
+        headers: {'test-id': randomUUID()},
+      }),
+    (err: Error) => {
+      assert.ok(err instanceof TimeoutError);
+      assert.strictEqual((err as RequestError).code, 'ETIMEDOUT');
+
+      return true;
+    },
+  );
+});
+
 test('beforeRedirect does not fire for a retry', async () => {
   const calls: Array<{statusCode: number; path: string}> = [];
 
