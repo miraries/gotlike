@@ -479,6 +479,23 @@ Rejected: reimplementing redirect handling to get the saving *while* following r
 buy ~2µs in exchange for owning method-rewriting and cross-origin header-stripping semantics. The
 opt-in default already gets the whole saving with no correctness risk.
 
+### Response body typing
+
+`Response` can't be a tagged union over `responseType` — the value that settles the body type may
+come from the client rather than the call, so there is nothing on `Response<T>` to key it on. The
+**call site** pins it instead, through overloads on every verb, on `handle()` and on the callable
+form: `TextCall`/`BufferCall` resolve the body to `string`/`Buffer`, `WholeResponse`/`BodyOnly`
+choose between `Response<T>` and a bare `T`, and anything else falls through to the caller's `T`
+so `get<Thing>(url)` reads exactly as it does in got.
+
+`resolveBodyOnly` used to be typed as returning `Response<T>` while returning the body at runtime —
+a straight lie in the types. The `BodyOnly` overloads are what fix it, which is why the
+implementation signatures return `Promise<any>`.
+
+The overload set is asserted at the bottom of `index.spec.ts` (`typeAssertions`), which is never
+invoked — type stripping doesn't check types, so those assertions are enforced by
+`npm run typecheck`, not by `npm test`.
+
 ## Public API surface
 
 `index.ts` exports the class plus pre-built singletons for drop-in replacement: `default`, `gotlike`, `got`

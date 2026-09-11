@@ -2783,3 +2783,45 @@ test('beforeRetry fires and retryCount is reported on a stream', async () => {
   assert.strictEqual(head.retryCount, 2);
   assert.deepStrictEqual(seen, [1, 2]);
 });
+
+/*
+ * Type-level assertions.
+ *
+ * `npm test` runs through node's type stripping, which erases types without checking them -
+ * so these are enforced by `npm run typecheck`, which includes the spec files. The function
+ * is never invoked; referencing it is enough to have `tsc` check the body.
+ */
+type Exact<A, B> = (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+
+const expectType =
+  <Expected>() =>
+  <Actual>(_actual: Exact<Actual, Expected> extends true ? Actual : never): void => {};
+
+async function typeAssertions() {
+  type Thing = {id: number};
+
+  // got's idiom: the body type comes from the call.
+  expectType<Thing>()((await client.get<Thing>('u')).body);
+  expectType<Thing>()((await client<Thing>('u')).body);
+  expectType<Thing>()((await client.post<Thing>('u', {json: {a: 1}})).body);
+  expectType<Thing>()((await client.extend({prefixUrl: 'p'}).get<Thing>('u')).body);
+  expectType<Thing>()((await new Gotlike({prefixUrl: 'p'}).get<Thing>('u')).body);
+  expectType<Thing>()((await createClient({prefixUrl: 'p'}).get<Thing>('u')).body);
+
+  // `responseType` settles it when the caller doesn't.
+  expectType<string>()((await client.get('u')).body);
+  expectType<string>()((await client.get('u', {responseType: 'text'})).body);
+  expectType<Buffer>()((await client.get('u', {responseType: 'buffer'})).body);
+  expectType<Thing>()((await client.get<Thing>('u', {responseType: 'json'})).body);
+
+  // `resolveBodyOnly` resolves with the body itself - it used to claim a whole `Response`.
+  expectType<Thing>()(await client.get<Thing>('u', {resolveBodyOnly: true, responseType: 'json'}));
+  expectType<string>()(await client.get('u', {resolveBodyOnly: true}));
+  expectType<Buffer>()(await client.get('u', {resolveBodyOnly: true, responseType: 'buffer'}));
+
+  expectType<Buffer>()((await client.get('u')).rawBody);
+  expectType<number>()((await client.get('u')).retryCount);
+  expectType<number>()((await (await client.stream('u')).response).retryCount);
+}
+
+void typeAssertions;

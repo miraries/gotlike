@@ -853,8 +853,35 @@ export type GotlikeStream = Readable & {
 /** A `stream()` for a method that can carry a body: write the request body to it. */
 export type GotlikeUploadStream = GotlikeStream & Duplex;
 
+/*
+ * The option shapes the request overloads discriminate on. Together they let a call site say
+ * what it gets back without a cast: `responseType` pins the body type for `text` and
+ * `buffer`, `resolveBodyOnly` decides between a `Response<T>` and a bare `T`, and everything
+ * else falls through to the caller's `T` - so `get<Thing>(url)` still reads as it does in got.
+ */
+
+/** No `responseType`, or an explicit `text`: the body is a string. */
+export type TextCall = RequestOptions & {responseType?: 'text'};
+
+/** `responseType: 'buffer'`: the body is a Node `Buffer`. */
+export type BufferCall = RequestOptions & {responseType: 'buffer'};
+
+/** Resolves with the whole `Response`. */
+export type WholeResponse = {resolveBodyOnly?: false};
+
+/** Resolves with the body alone. */
+export type BodyOnly = {resolveBodyOnly: true};
+
 export type Response<T = any> = {
-  body: T; // todo: make response type tagged union based on responseType
+  /**
+   * The parsed body.
+   *
+   * `Response` can't be a tagged union over `responseType`, because the type that settles it
+   * may come from the client rather than the call - so the *call site* pins it instead: the
+   * verb overloads resolve `text` to `string` and `buffer` to `Buffer`, and leave `json` (and
+   * an unspecified type) to the caller's `T`, the way got does.
+   */
+  body: T;
   headers: IncomingHttpHeaders;
   readonly url: string | URL;
   statusCode: number;
@@ -1445,7 +1472,11 @@ export class Gotlike {
     return formed;
   }
 
-  handle<T>(options: RequestOptions = {}, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<Response<T>> {
+  handle(options: TextCall & BodyOnly, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<string>;
+  handle(options: BufferCall & BodyOnly, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<Buffer>;
+  handle<T>(options: RequestOptions & BodyOnly, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<T>;
+  handle<T>(options?: RequestOptions, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<Response<T>>;
+  handle<T>(options: RequestOptions = {}, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<any> {
     let formed: FormedOptions;
 
     // A synchronous throw out of a promise-returning method escapes `.catch()`, so a bad
@@ -2058,23 +2089,53 @@ export class Gotlike {
     return this.handle({...options, isStream: true}, url) as unknown as Promise<GotlikeStream>;
   }
 
-  get<T>(url: string | URL, options: RequestOptions = {}) {
+  get(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  get(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
+  get(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  get(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
+  get<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
+  get<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  get<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'GET');
   }
 
-  post<T>(url: string | URL, options: RequestOptions = {}) {
+  post(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  post(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
+  post(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  post(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
+  post<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
+  post<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  post<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'POST');
   }
 
-  delete<T>(url: string | URL, options: RequestOptions = {}) {
+  delete(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  delete(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
+  delete(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  delete(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
+  delete<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
+  delete<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  delete<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'DELETE');
   }
 
-  put<T>(url: string | URL, options: RequestOptions = {}) {
+  put(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  put(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
+  put(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  put(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
+  put<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
+  put<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  put<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'PUT');
   }
 
-  patch<T>(url: string | URL, options: RequestOptions = {}) {
+  patch(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  patch(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
+  patch(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  patch(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
+  patch<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
+  patch<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  patch<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'PATCH');
   }
 }
@@ -2084,7 +2145,12 @@ export class Gotlike {
  * can, while keeping every method and field of the underlying `Gotlike`.
  */
 export type CallableClient = Omit<Gotlike, 'extend'> & {
-  <T = unknown>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  (url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  (url: string | URL, options: TextCall & BodyOnly): Promise<string>;
+  (url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  (url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
+  <T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
+  <T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
   /**
    * `Gotlike` is `Omit`ted of `extend` above on purpose: an intersection merges call
    * signatures into an overload set, and `Gotlike['extend']` would win and type an extended

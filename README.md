@@ -347,6 +347,32 @@ response.timings.phases.total
 response.request.options
 ```
 
+### Typing the body
+
+The body type comes from the call site, as it does in got - pass it as a type argument:
+
+```ts
+type User = { id: number; name: string }
+
+const { body } = await gotlike.get<User>('/users/1', { responseType: 'json' })
+//      ^? User
+```
+
+`responseType` settles it when you don't, and `resolveBodyOnly` unwraps the response:
+
+```ts
+await gotlike.get('/x')                                    // Response<string>
+await gotlike.get('/x', { responseType: 'buffer' })        // Response<Buffer>
+await gotlike.get<User>('/x', { resolveBodyOnly: true })   // User
+await gotlike.get('/x', { resolveBodyOnly: true })         // string
+```
+
+The same overloads are on `post`/`put`/`patch`/`delete`, on the callable form
+(`gotlike<User>('/x')`) and on `handle`, and they survive `extend()`.
+
+`Response` itself is not a tagged union over `responseType`: the value that settles the body type
+may come from the client rather than the call, so there is nothing on `Response<T>` to key it on.
+
 ## Benchmark
 
 ```
