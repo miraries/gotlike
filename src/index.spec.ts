@@ -3833,6 +3833,44 @@ test('an `@` in the path is not mistaken for credentials', async () => {
 });
 
 /*
+ * `parseUserinfo: false` opts out of the scan entirely, for a client whose urls never carry
+ * credentials - the request then goes out exactly as undici would send it unassisted:
+ * anonymous, the same as before this feature existed.
+ */
+test('parseUserinfo false skips parsing credentials out of the url', async () => {
+  const noParse = client.extend({parseUserinfo: false});
+
+  const response = await noParse.get<Echo>('http://alice:s3cret@localhost:3000/echo', {responseType: 'json'});
+
+  assert.strictEqual(response.body.headers['authorization'], undefined);
+});
+
+test('explicit username/password still work with parseUserinfo false', async () => {
+  const noParse = client.extend({parseUserinfo: false});
+
+  const response = await noParse.get<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+    username: 'bob',
+    password: 'other',
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from('bob:other').toString('base64'));
+});
+
+test('parseUserinfo itself is client-only', async () => {
+  // Read from the instance, so a per-request value would have done nothing at all.
+  await assert.rejects(
+    () => client.get('http://localhost:3000/json', {parseUserinfo: false}),
+    (err: Error) => {
+      assert.ok(err instanceof ValidationError);
+      assert.match(err.message, /only be set when creating or extending/);
+
+      return true;
+    },
+  );
+});
+
+/*
  * The `afterResponse` loop used to sit outside both of `call()`'s trys, so a hook that threw
  * escaped as its own raw error - no `RequestError`, no `beforeError` hooks, invisible to any
  * caller matching on `instanceof RequestError`. got wraps this same loop.

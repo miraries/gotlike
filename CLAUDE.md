@@ -140,6 +140,12 @@ node's `urlToHttpOptions` turns those into the `Authorization` header; undici do
 as got's does. Explicit `username`/`password` options win. It scans for the authority by index rather than
 parsing, so a url with an `@` in its *path* (`/users/@me`) costs two `indexOf`s and allocates nothing.
 
+Even that bounded scan showed up under profiling (`benchmark/profile.ts`) as the second-largest cost in
+gotlike's own code, after `call()` itself — ~300-400ns per request, run unconditionally even though almost no
+real url carries credentials. `parseUserinfo: false` (client-only, same reasoning as `validate`) skips the call
+to `splitUserinfo` entirely for a client that never sees one. Explicit `username`/`password` options are
+unaffected, since they don't go through it.
+
 Every failure is normalized into a `RequestError` carrying `options` and the undici response, with `code` one of
 `ETIMEDOUT` (headers/body timeout), `ERR_BODY_PARSE_FAILURE` (JSON parse — the raw text is attached to
 `response.body` so callers can inspect it), `ERR_HTTP_ERROR`, or `ERR_REQUEST_ERROR`.
@@ -751,6 +757,29 @@ Between-process variance is still ~15%, so **gotlike and raw `undici.request` sh
 gotlike is a thin wrapper and cannot genuinely be faster. If a change makes gotlike look like it beats raw
 undici, that is a measurement artefact, not a result. Env knobs: `BENCH_DURATION`, `BENCH_ROUNDS`,
 `BENCH_WARMUP`, `BENCH_CONCURRENCY`, `BENCH_SERVER`.
+
+### Profiling
+
+`npm run profile` (from `benchmark/`) answers a different question than `bench` does: not "how does gotlike
+compare to got/undici/fetch", but "what does gotlike's *own* code spend time on". `profile.ts` drives the two
+shapes that matter most - a GET whose response is a ~10-property JSON object, and a POST that sends and
+receives one - against `server.ts`'s raw-socket loopback server, and captures a V8 CPU profile per scenario via
+`node:inspector`'s `Session`. Loopback rather than a null dispatcher: the sampling profiler only attributes
+time to frames actually on the stack, so a real (if local) socket wait shows up as idle rather than inflating
+some function's self time, and the samples that remain are genuinely CPU-bound.
+
+`analyze-profile.ts` turns a `.cpuprofile` into a self-time report, bucketed by owner - `gotlike`, `undici`,
+`node internal`, and V8's own `(garbage collector)`/`(idle)`/`(program)` frames - which is the actual point:
+telling gotlike's own overhead apart from undici's and Node's. Self time is summed by function across every
+node in the call tree that matches, since the same function appears as several different tree nodes when it's
+reached through different call paths.
+
+Measured this way (concurrency 20, 4s/scenario): gotlike's own code is ~7-9% of wall time, with `call()`
+itself accounting for ~77-80% of that (it's where the actual work - body read, JSON codec, response
+construction - happens, not fat to trim) and `splitUserinfo` a distant second at ~9-13% (~300-400ns/request,
+see `parseUserinfo` above). Node's socket write/parse internals (~42-44%) and undici's own request machinery
+(~18%) dwarf both, and are outside gotlike's own code. Line numbers in the report are compiled `dist/index.js`
+lines, not `src/index.ts` ones - no source-map consumption - so match by function name.
 
 ## Lint, format, typecheck
 

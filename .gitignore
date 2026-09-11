@@ -10,3 +10,6 @@ node_modules
 
 # stray tsc output - declarations belong in dist/
 src/*.d.ts
+
+# profile.ts output - regenerate with `npm run profile` in benchmark/
+benchmark/*.cpuprofile

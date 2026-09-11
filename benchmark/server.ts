@@ -14,6 +14,19 @@ import type {AddressInfo} from 'node:net';
  * isn't distorting the comparison.
  */
 
+export const profile10Payload = {
+  id: 1,
+  name: 'benchmark-item',
+  status: 'active',
+  createdAt: '2024-01-01T00:00:00.000Z',
+  updatedAt: '2024-01-02T00:00:00.000Z',
+  count: 42,
+  price: 19.99,
+  active: true,
+  category: 'widgets',
+  tags: ['a', 'b', 'c'],
+};
+
 const bodies: Record<string, {body: Buffer; contentType: string}> = {
   '/small': {body: Buffer.from('hello'), contentType: 'text/plain'},
   '/json': {
@@ -29,6 +42,12 @@ const bodies: Record<string, {body: Buffer; contentType: string}> = {
   },
   '/large': {body: Buffer.from('x'.repeat(100 * 1024)), contentType: 'text/plain'},
   '/echo': {body: Buffer.from('{"ok":true}'), contentType: 'application/json'},
+  // A ~10-property flat-ish object: the shape `profile.ts` uses for both the GET response and
+  // the POST request/response body, since that's the size the aggregator's calls actually are.
+  '/profile10': {
+    body: Buffer.from(JSON.stringify(profile10Payload)),
+    contentType: 'application/json',
+  },
 };
 
 /** Pre-built, so the hot path is a single socket write. */

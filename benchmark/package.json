@@ -9,6 +9,8 @@
   "main": "index.js",
   "scripts": {
     "bench": "npm --prefix .. run build && node index.ts",
+    "profile": "npm --prefix .. run build && node profile.ts",
+    "profile:analyze": "node analyze-profile.ts",
     "typecheck": "npm --prefix .. run build && ../node_modules/.bin/tsc -p tsconfig.json"
   },
   "dependencies": {
