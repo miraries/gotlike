@@ -17,6 +17,7 @@ import client, {
   HTTPError,
   ParseError,
   RequestError,
+  type Response as GotlikeResponse,
   TimeoutError,
   ValidationError,
 } from './index.ts';
@@ -47,12 +48,32 @@ const serverState: {retryCounts: Record<string, number>} = {
 };
 
 const server = http.createServer((req: http.IncomingMessage, res: http.ServerResponse) => {
-  // req.on('data', (...data) => {
-  //   console.log('reqdata', data.toString());
-  // });
   if (req.url === '/json') {
     res.write('{"test": "value"}\n');
     res.end();
+
+    return;
+  }
+
+  if (req.url === '/trickle') {
+    // A byte every 250ms for 3s: each gap is short enough that undici's per-chunk
+    // `bodyTimeout` never fires, so only a total-request deadline can cut this off.
+    res.writeHead(200, {'content-type': 'text/plain'});
+
+    let written = 0;
+    const ticker = setInterval(() => {
+      if (written++ >= 12) {
+        clearInterval(ticker);
+        res.end();
+
+        return;
+      }
+
+      res.write('x');
+    }, 250);
+
+    ticker.unref();
+    res.on('close', () => clearInterval(ticker));
 
     return;
   }
@@ -248,6 +269,20 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  if (req.url === '/retry-after') {
+    // Always fails, and always asks for a 2s wait. A client that honours `Retry-After`
+    // cannot get through its retries quickly; one that ignores it races through them.
+    const testId = req.headers['test-id']?.toString() ?? 'default';
+
+    serverState.retryCounts[testId] = (serverState.retryCounts[testId] ?? 0) + 1;
+
+    res.statusCode = 429;
+    res.setHeader('retry-after', '2');
+    res.end();
+
+    return;
+  }
+
   if (req.url === '/retry') {
     const testId = req.headers['test-id']?.toString() ?? 'default';
 
@@ -323,11 +358,12 @@ test('throws error on timeout', async () => {
 });
 
 /**
- * undici arms headers/body timeouts on its coarse timer wheel (lib/util/timers.js,
- * RESOLUTION_MS = 1000), so anything under a second is effectively a one second
- * timeout. Documented as a test so the floor isn't rediscovered the hard way.
+ * undici arms its own headers/body timeouts on a coarse timer wheel (lib/util/timers.js,
+ * RESOLUTION_MS = 1000), which used to round every sub-second timeout up to roughly a
+ * second. `timeout.request` is enforced by a deadline signal on top of those, so it fires
+ * when it says it will.
  */
-test('sub-second timeouts are floored to roughly one second', async () => {
+test("a sub-second timeout fires on time rather than at undici's one second floor", async () => {
   const start = process.hrtime.bigint();
 
   await assert.rejects(() => client.get('http://localhost:3000/timeout', {timeout: {request: 50}}), {
@@ -336,7 +372,38 @@ test('sub-second timeouts are floored to roughly one second', async () => {
 
   const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
 
-  assert.ok(elapsedMs > 900, `expected the 50ms timeout to be floored, fired after ${elapsedMs}ms`);
+  assert.ok(elapsedMs < 800, `expected the 50ms timeout to fire promptly, fired after ${elapsedMs}ms`);
+});
+
+/**
+ * undici's `bodyTimeout` restarts on every chunk it receives, so a response that trickles
+ * bytes slowly enough never trips it - `timeout.request` has to bound the whole request,
+ * the way got's does.
+ */
+test('timeout.request bounds the whole request, not just the gap between chunks', async () => {
+  const start = process.hrtime.bigint();
+
+  const error = await failure(client.get('http://localhost:3000/trickle', {timeout: {request: 700}}));
+
+  const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+
+  // The route writes a byte every 250ms for 3s; each gap alone is well inside the timeout.
+  assert.ok(elapsedMs < 1500, `expected the trickling body to be cut off, ran for ${elapsedMs}ms`);
+});
+
+test('a caller signal still aborts when a timeout is also set', async () => {
+  const controller = new AbortController();
+
+  setTimeout(() => controller.abort(), 50);
+
+  const error = await failure(
+    client.get('http://localhost:3000/timeout', {timeout: {request: 10_000}, signal: controller.signal}),
+  );
+
+  assert.strictEqual(error.code, 'ERR_ABORTED');
+  assert.strictEqual(error.name, 'AbortError');
 });
 
 test('does not time out a response that arrives within the timeout', async () => {
@@ -1074,7 +1141,9 @@ test('timeout error preserves the underlying undici error as cause', async () =>
 
   assert.strictEqual(err.code, 'ETIMEDOUT');
   assert.strictEqual(err.cause instanceof Error, true);
-  assert.strictEqual((err.cause as Error & {code: string}).code, 'UND_ERR_HEADERS_TIMEOUT');
+  // The deadline signal is what bounds `timeout.request`, and it reports itself as a
+  // `TimeoutError` DOMException.
+  assert.strictEqual((err.cause as Error).name, 'TimeoutError');
   // Nothing was received, so there is no response to attach.
   assert.strictEqual(err.response, undefined);
 });
@@ -2441,4 +2510,276 @@ test('nock mocks request once', async () => {
   });
 
   assert.strictEqual(response2.body.test, 'value');
+});
+
+/*
+ * Regressions for the defaults, error-normalisation and stream fixes below. Each of these
+ * failed silently before: the whole point of the group is that nothing about them was
+ * visible to a caller until something downstream went wrong.
+ */
+
+test('a directly constructed client throws on error statuses, like the singleton', async () => {
+  // `defaultOptions` used to be applied only to the exported singleton, so `new Gotlike(...)`
+  // got `throwHttpErrors: undefined` and quietly resolved every 4xx/5xx as a success.
+  const bare = new Gotlike({prefixUrl: 'http://localhost:3000'});
+
+  const error = await failure<HTTPError>(bare.get('status?code=500'));
+
+  assert.ok(error instanceof HTTPError);
+  assert.strictEqual(error.code, 'ERR_HTTP_ERROR');
+});
+
+test('a directly constructed client defaults to text, not buffer', async () => {
+  const bare = new Gotlike({prefixUrl: 'http://localhost:3000'});
+  const callable = createClient({prefixUrl: 'http://localhost:3000'});
+
+  assert.strictEqual(typeof (await bare.get('json')).body, 'string');
+  assert.strictEqual(typeof (await callable.get('json')).body, 'string');
+});
+
+test('a directly constructed client does not follow redirects by default', async () => {
+  const bare = new Gotlike({prefixUrl: 'http://localhost:3000', throwHttpErrors: false});
+
+  assert.strictEqual((await bare.get('redirect')).statusCode, 302);
+});
+
+test('a client-level json body is not inherited by the requests it makes', async () => {
+  // A body belongs to one request. This client used to send `{"leaked":true}` on every call.
+  const withBody = client.extend({json: {leaked: true}, responseType: 'json'});
+
+  const response = await withBody.get<Echo>('http://localhost:3000/echo');
+
+  assert.strictEqual(response.body.body, '');
+  assert.strictEqual(response.body.headers['content-type'], undefined);
+
+  // A per-call body still works on that same client.
+  const posted = await withBody.post<Echo>('http://localhost:3000/echo', {json: {sent: true}});
+
+  assert.strictEqual(posted.body.body, '{"sent":true}');
+});
+
+test('a client-level body and form are not inherited either', async () => {
+  const withBody = client.extend({body: 'client-body', responseType: 'json'});
+  const withForm = client.extend({form: {a: '1'}, responseType: 'json'});
+
+  assert.strictEqual((await withBody.get<Echo>('http://localhost:3000/echo')).body.body, '');
+  assert.strictEqual((await withForm.get<Echo>('http://localhost:3000/echo')).body.body, '');
+});
+
+test('an error thrown by a beforeRequest hook is a RequestError and runs beforeError', async () => {
+  const seen: string[] = [];
+
+  const extClient = client.extend({
+    hooks: {
+      beforeRequest: [
+        () => {
+          throw new Error('hook exploded');
+        },
+      ],
+      beforeError: [
+        (error) => {
+          seen.push(error.message);
+
+          return error;
+        },
+      ],
+    },
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/json'));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
+  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+  assert.strictEqual(error.message, 'hook exploded');
+  assert.strictEqual((error.cause as Error).message, 'hook exploded');
+  assert.deepStrictEqual(seen, ['hook exploded']);
+});
+
+test('retry honours Retry-After by default', async () => {
+  const testId = randomUUID();
+  const retrying = client.extend({retry: {limit: 1, statusCodes: [429]}, throwHttpErrors: false});
+
+  const start = process.hrtime.bigint();
+
+  const response = await retrying.get('http://localhost:3000/retry-after', {headers: {'test-id': testId}});
+
+  const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+
+  assert.strictEqual(response.statusCode, 429);
+  assert.strictEqual(response.retryCount, 1);
+  assert.strictEqual(serverState.retryCounts[testId], 2);
+
+  // One retry, with the server asking for 2s. Ignoring the header raced through in ~500ms.
+  assert.ok(elapsedMs > 1500, `expected Retry-After to be honoured, retried after ${elapsedMs}ms`);
+});
+
+test("retry defaults to got's limit of 2, not undici's 5", async () => {
+  const testId = randomUUID();
+  // No `limit`: undici would default to 5 retries, tripling what a failing upstream sees.
+  const retrying = client.extend({retry: {statusCodes: [429]}, throwHttpErrors: false});
+
+  const response = await retrying.get('http://localhost:3000/retry-after', {headers: {'test-id': testId}});
+
+  assert.strictEqual(response.retryCount, 2);
+  assert.strictEqual(serverState.retryCounts[testId], 3);
+});
+
+test('a per-request followRedirect: true fails validation rather than the request', async () => {
+  // With `validate` off this used to reach undici as an unsupported `maxRedirections`, which
+  // failed the request with an opaque UND_ERR_INVALID_ARG instead of being ignored.
+  const lax = new Gotlike({responseType: 'json', validate: false, prefixUrl: 'http://localhost:3000'});
+
+  const response = await lax.get<Echo>('echo', {followRedirect: true});
+
+  assert.strictEqual(response.statusCode, 200);
+
+  await assert.rejects(() => client.get('http://localhost:3000/echo', {followRedirect: true}), ValidationError);
+});
+
+test('rawBody is the bytes that arrived, not a re-serialisation of the parsed json', async () => {
+  const response = await client.get<{test: string}>('http://localhost:3000/json', {responseType: 'json'});
+
+  // The route writes `{"test": "value"}\n` - spacing and trailing newline included.
+  assert.strictEqual(response.rawBody.toString(), '{"test": "value"}\n');
+  assert.deepStrictEqual(response.body, {test: 'value'});
+});
+
+test('searchParams and form repeat a key for an array value', async () => {
+  const response = await client.get<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+    searchParams: {a: [1, 2], b: 'z', dropped: null},
+  });
+
+  assert.strictEqual(response.body.url, '/echo?a=1&a=2&b=z');
+
+  const posted = await client.post<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+    form: {a: ['x', 'y']},
+  });
+
+  assert.strictEqual(posted.body.body, 'a=x&a=y');
+});
+
+test('an empty url resolves to the prefix itself, with no trailing slash added', async () => {
+  const prefixed = client.extend({prefixUrl: 'http://localhost:3000/echo', responseType: 'json'});
+
+  assert.strictEqual((await prefixed.get<Echo>('')).body.url, '/echo');
+});
+
+test("an afterResponse retry does not write back onto the first attempt's options", async () => {
+  let first: GotlikeResponse<Echo> | undefined;
+
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (first) {
+            return response;
+          }
+
+          first = response as GotlikeResponse<Echo>;
+
+          // No `headers` of its own: the merged options used to alias the first attempt's
+          // header object, so `call()`'s content-type for this body landed on it too.
+          return retryWithMergedOptions({json: {second: true}, method: 'POST'});
+        },
+      ],
+    },
+  });
+
+  await extClient.get<Echo>('http://localhost:3000/echo');
+
+  assert.strictEqual(first?.request.options.headers['content-type'], undefined);
+  assert.strictEqual(first?.request.options.body, undefined);
+});
+
+test('an afterResponse hook that always retries fails instead of recursing forever', async () => {
+  let calls = 0;
+
+  const extClient = client.extend({
+    hooks: {
+      afterResponse: [
+        (_response, retryWithMergedOptions) => {
+          calls++;
+
+          return retryWithMergedOptions({});
+        },
+      ],
+    },
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/json'));
+
+  assert.strictEqual(error.code, 'ERR_TOO_MANY_RETRIES');
+  assert.ok(calls < 50, `expected a bounded number of retries, got ${calls}`);
+});
+
+test('beforeError runs for a stream, and the error carries the response', async () => {
+  const seen: string[] = [];
+
+  const extClient = client.extend({
+    hooks: {
+      beforeError: [
+        (error) => {
+          seen.push(error.code);
+
+          return error;
+        },
+      ],
+    },
+  });
+
+  const duplex = await extClient.stream('http://localhost:3000/status?code=503');
+  const error = await failure<HTTPError>(text(duplex));
+
+  assert.ok(error instanceof HTTPError);
+  assert.deepStrictEqual(seen, ['ERR_HTTP_ERROR']);
+  assert.strictEqual(error.response?.statusCode, 503);
+  assert.strictEqual(error.response?.ok, false);
+});
+
+test('beforeError runs for an upload stream too', async () => {
+  const seen: string[] = [];
+
+  const extClient = client.extend({
+    hooks: {
+      beforeError: [
+        (error) => {
+          seen.push(error.code);
+
+          return error;
+        },
+      ],
+    },
+  });
+
+  const duplex = await extClient.stream('http://localhost:3000/status?code=500', {method: 'POST'});
+
+  duplex.end('body');
+
+  const error = await failure<HTTPError>(text(duplex));
+
+  assert.ok(error instanceof HTTPError, `expected an HTTPError, got ${error}`);
+  assert.deepStrictEqual(seen, ['ERR_HTTP_ERROR']);
+  assert.strictEqual(error.response?.statusCode, 500);
+});
+
+test('beforeRetry fires and retryCount is reported on a stream', async () => {
+  const testId = randomUUID();
+  const seen: number[] = [];
+
+  const retrying = client.extend({
+    retry: {limit: 3, statusCodes: [429]},
+    hooks: {beforeRetry: [(_error, _statusCode, retryCount) => seen.push(retryCount)]},
+  });
+
+  const duplex = await retrying.stream('http://localhost:3000/retry', {headers: {'test-id': testId}});
+  const head = await duplex.response;
+
+  await text(duplex);
+
+  assert.strictEqual(head.statusCode, 200);
+  assert.strictEqual(head.retryCount, 2);
+  assert.deepStrictEqual(seen, [1, 2]);
 });

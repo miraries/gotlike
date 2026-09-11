@@ -73,8 +73,17 @@ Two invariants worth preserving here:
 allocating per request, and a stray write fails loudly instead of leaking. When a context *is* set, the request
 gets its own shallow copy of it.
 
-`formOptions` also fills in `method: 'GET'` when nothing set one. `stream()` and the callable form pass no method,
-and only the exported singletons carry one in their base options — and `call()` routes the two stream paths on it.
+**`defaultOptions` is applied by the constructor, not by the exported singleton.** It used to be passed only to
+`createClient(defaultOptions)`, which meant a hand-built `new Gotlike(...)` or `createClient(...)` silently had
+`throwHttpErrors: undefined` (every 4xx/5xx resolving as a success) and no `responseType` (falling through to
+`buffer` instead of `text`) — while `FormedOptions` declares both as required. Every construction path now starts
+from the same defaults. `formOptions` still fills in `method: 'GET'` as a backstop, since `call()` routes the two
+stream paths on it.
+
+**`json`/`body`/`form` are per-request only, and `formOptions` strips them off the instance defaults.** A body
+belongs to one request; a client built with `json` was otherwise sending it on every call, GETs included. The
+`baseHasBody` flag is computed once in the constructor so the hot path pays one boolean test rather than three
+property reads.
 
 `call()` does the actual undici request, in this order: resolve the URL (`resolveUrl` joins `prefixUrl` without
 doubling slashes and writes the result back to `options.url`), serialize `json` into `options.body`, run
@@ -119,7 +128,10 @@ they must be composed onto a dispatcher up front. The `agent` getter does this:
   `Gotlike.followsRedirects` records the decision, and `formOptions` rejects a per-request
   `followRedirect: true` rather than ignoring it — composing the interceptor is a create/extend-time
   decision, so a per-request opt-in could never work. Per-request `false` is fine and just sets
-  `maxRedirections: 0`;
+  `maxRedirections: 0`. **`dispatchOptions` gates `maxRedirections` on `this.followsRedirects`, not on
+  `options.followRedirect` alone** — undici rejects `maxRedirections` outright when the interceptor isn't in
+  the chain, so with `validate: false` a per-request `true` used to slip past the ValidationError and fail
+  every request with an opaque `UND_ERR_INVALID_ARG`;
 - when nothing needs composing, `agent` returns the base dispatcher untouched;
 - the composition is memoised against the base dispatcher's identity (`#composedFrom`), so the chain is built
   once per dispatcher rather than once per request.
@@ -148,6 +160,12 @@ Retry support is whatever undici's `RetryHandler` provides; got's `calculateDela
 and `maxRetryAfter` is degraded to a boolean `retryAfter`. `retryOptions.throwOnError` is forced to `false` so
 that exhausted retries resolve to the last response (got's behaviour) instead of throwing `RequestRetryError`.
 
+Two defaults are deliberately *not* undici's, because undici's diverge from got in ways nobody would go looking
+for: `limit` defaults to **2** (undici's is 5, which triples the load a failing upstream sees), and `retryAfter`
+defaults to **true**. Deriving `retryAfter` from `!!maxRetryAfter` turned honouring `Retry-After` *off* for every
+caller who didn't set that option — so the client ignored an upstream's explicit backoff and hammered it on
+undici's own schedule. The retried status codes and methods are still undici's; that is documented, not fixed.
+
 ### Hooks
 
 Arrays, got's signatures, **read from instance options only** — a `hooks` object passed to a single call is
@@ -160,7 +178,22 @@ the request was sent with and calls `call()` **directly, not `handle()`** — ha
 request, and re-entering them would re-log and re-wrap a request the caller made once. It also clears
 `prefixUrl`, since `options.url` was already resolved against it on the first attempt.
 
-`beforeError` hooks may return a replacement error; anything that isn't an `Error` is ignored.
+It **always reallocates `headers`**, even when the hook passed none. Aliasing the first attempt's header object
+meant `call()`'s own writes on the retry — a `content-type` for a body the retry added — landed on the options
+the *first* response reports having been sent with.
+
+It is also **bounded** (`maxAfterResponseRetries`, 20), tracked through a symbol key on the options so option
+spreads carry it while `for...in` validation and `Object.keys` never see it. A hook that always retries on a
+status it never stops seeing — an auth refresh that silently fails — used to recurse until the process died;
+it now fails with `ERR_TOO_MANY_RETRIES`.
+
+`beforeError` hooks may return a replacement error; anything that isn't an `Error` is ignored. They run for
+**every** failure path, streams included — see Streams — and for anything a `beforeRequest` hook throws.
+
+**The pre-request work in `call()` has its own `try`.** The url resolution, body serialisation and the
+`beforeRequest` hook loop all sit inside it, so a throwing hook (or a circular `json`) becomes a `RequestError`
+with the hook's own message and runs the `beforeError` hooks. It used to reject with the raw error, which meant
+a caller matching on `instanceof RequestError` missed it entirely.
 
 ### Bodyless responses and parse failures
 
@@ -182,8 +215,10 @@ These exist because the same code was written out two or three times, and each c
 forget a field:
 
 - **`dispatchOptions()`** — the options every dispatch shares. `call()`, `callBodylessStream()` and
-  `callStream()` each built this literal by hand. It also owns the `redirects` holder, so no caller
-  recomputes it.
+  `callStream()` each built this literal by hand. It also owns the `redirects` and `attempts` holders, so no
+  caller recomputes them — and, because it owns `attempts`, the stream paths get retry bookkeeping for free.
+  They used to get none, which left `beforeRetry` silently unfired and `retryCount` pinned at 0 on a stream
+  undici had in fact retried.
 - **`trackDispatches(select, onRedispatch)`** + **`OutcomeHandler`** — one interceptor factory and one
   `DecoratorHandler` behind both `countAttempts` (retries) and `makeRedirectTracker` (redirects). They had
   separate, near-identical handler classes recording the same three fields.
@@ -214,6 +249,9 @@ error so the next dispatch can report why it was retried. All public API.
 `beforeRetry` fires from that interceptor and **cannot delay or cancel a retry** — undici decides to retry
 inside a synchronous dispatch, so there is nothing to await on. It is for logging and metrics; this is a
 documented divergence from got, not an oversight.
+
+`attemptState()` builds the holder and `dispatchOptions()` hands it to every dispatch, so `retryCount` and
+`beforeRetry` work identically for `call()` and for both stream paths (`StreamHead.retryCount`).
 
 `beforeRedirect` uses the same shape: `makeRedirectTracker` is composed **inside** undici's redirect
 interceptor, so it is re-entered per hop, and the hop's options are still mutable there — which is what lets
@@ -249,6 +287,11 @@ throwing, which would hand callers compressed bytes silently.
 
 `response.rawBody` is a lazy getter, not an eager field: text and JSON go through undici's optimised
 `body.text()`, and materialising a Buffer per request just in case would cost more than it saves.
+
+**It is the bytes that arrived, not a re-serialisation.** For `responseType: 'json'` the original text is carried
+onto `GotlikeResponse` as a seventh constructor argument, because `JSON.stringify(parsedBody)` gave back
+`{"a":1}` for a response that was on the wire as `{\n  "a"  :  1\n}` — which silently breaks any signature or
+digest checked over `rawBody`.
 
 ### Streams
 
@@ -291,16 +334,30 @@ Two things that were wrong before and are easy to reintroduce:
   ended immediately; anything else is left open for the caller. The old code only ever ended for GET, so a
   POST hung.
 
-`throwHttpErrors` is applied by throwing from inside the pipeline handler, which surfaces on the duplex's
-`error` event. The `response` promise gets a `.catch(() => undefined)` attached at creation — nothing is
-obliged to await it, and an unhandled rejection would take the process down.
+`throwHttpErrors` on a stream is raised **by the readable at read time**, on both stream paths, rather than by
+throwing from inside the pipeline handler. Throwing there was synchronous, which left no room to await the
+`beforeError` hooks or to attach the response — so a streamed failure skipped the hooks entirely and arrived with
+`error.response` undefined, which the documented contract says only happens when no response ever came. Both
+paths now build the error through `toRequestError`. The `response` promise gets a `.catch(() => undefined)`
+attached at creation — nothing is obliged to await it, and an unhandled rejection would take the process down.
+
+`undici.pipeline` can also reject its arguments synchronously; that is caught and reported on the stream
+(`failedUploadStream`) rather than by rejecting `stream()`, so both paths fail the same way.
 
 ### Timeouts
 
-`timeout.request` maps to undici's `headersTimeout` + `bodyTimeout`. undici arms both on its coarse timer wheel
-(`lib/util/timers.js`, `RESOLUTION_MS = 1000`), so **any timeout under ~1s effectively fires at ~1s**. A test
-pins this down so it isn't rediscovered as a flake. Don't write tests whose server delay is under a second and
-expect a sub-second timeout to beat it.
+`timeout.request` sets undici's `headersTimeout` + `bodyTimeout` **and** an `AbortSignal.timeout` deadline
+(`requestSignal`), combined with any caller `signal` via `AbortSignal.any`.
+
+The deadline is what actually bounds the request, and it is not optional. undici's two timeouts are per-phase and
+`bodyTimeout` **restarts on every chunk received**, so a response that trickles a byte at a time never trips
+either one — a request under a 1.5s timeout was measured still running at 4.9s. undici also arms them on its
+coarse timer wheel (`lib/util/timers.js`, `RESOLUTION_MS = 1000`), which used to round every sub-second timeout up
+to roughly a second. Both are covered by tests (`/trickle`, and a 50ms timeout asserted to fire promptly).
+
+undici's own timeout errors are still mapped, since they give the more specific message when they do fire first.
+The deadline reports itself as a `TimeoutError` DOMException, which lands on the same `TimeoutError`/`ETIMEDOUT`
+as everything else.
 
 ### extend()
 
@@ -425,6 +482,7 @@ opt-in default already gets the whole saving with no correctness risk.
 ## Public API surface
 
 `index.ts` exports the class plus pre-built singletons for drop-in replacement: `default`, `gotlike`, `got`
-(all `new Gotlike(defaultOptions)`), and types `Got`, `ExtendOptions`, `RequestOptions`, `Response`,
+(all one `createClient()` — the defaults come from the constructor now, so passing `defaultOptions` here would be
+redundant), and types `Got`, `ExtendOptions`, `RequestOptions`, `Response`,
 `HandlerFunction`, `RequestError`. Keep all of these working when changing the entry point — the README documents
 requiring/importing any of them.

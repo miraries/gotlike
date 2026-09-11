@@ -67,7 +67,7 @@ Supports:
 - [x] Hooks *(arrays, instance-level only)*
 - [x] `afterResponse` retries via `retryWithMergedOptions`
 - [x] `context`
-- [x] Retries *(partial - maps onto undici's `retry` interceptor)*
+- [x] Retries *(partial - maps onto undici's `retry` interceptor; honours `Retry-After`)*
 - [x] `searchParams`, `form`
 - [x] Decompression - gzip, deflate, br, zstd, compress
 - [x] Basic auth - `username` / `password`
@@ -94,7 +94,7 @@ Supports:
 | --- | --- | --- |
 | `hooks`, `handlers`, `retry`, `agent`, `http2`, `pipelining`, `dnsCache`, `dnsLookup`, `decompress` | per request or per client | **create/extend only** - passing them per request is a `ValidationError` |
 | option merging | per-option merge table, every request | **one shallow spread**; `headers` and `context` merge one level deep |
-| `response.rawBody` | always materialised | **computed on first access** |
+| `response.rawBody` | always materialised | **computed on first access** - the bytes as received, so a `json` response still hands back the original text |
 | `options.url` | normalised to a `URL` | **left a string**, rewritten to the full `prefixUrl`-resolved URL before handlers and hooks see it. Use `String(options.url)`, not `options.url.href` |
 | `options.context` | fresh `{}` per request | a **shared frozen** `{}` when unset - reads are safe, writes throw rather than leak. Pass a `context` to get a writable one |
 | `validate` | n/a | client-only, like the options above - it is read from the instance, so a per-request value would do nothing |
@@ -105,7 +105,8 @@ Supports:
 
 | | behaviour |
 | --- | --- |
-| `timeout.request` | undici arms timeouts on a coarse timer wheel with 1s resolution, so **anything under ~1s behaves as ~1s** |
+| `timeout.request` | a cap on the **whole** request, as got's is. undici's own `headersTimeout`/`bodyTimeout` are per-phase and `bodyTimeout` restarts on every chunk, so a slowly trickling response would never trip them - a deadline signal enforces the total on top. That also sidesteps undici's coarse 1s timer wheel, so sub-second timeouts fire on time |
+| `retry` | maps onto undici's `retry` interceptor. `limit` defaults to got's 2, and `Retry-After` is honoured, but `calculateDelay`/`noise` are not implemented and `maxRetryAfter` degrades to "honour the header or don't". The retried **status codes and methods are undici's defaults**, not got's - set `statusCodes`/`methods` explicitly if that matters |
 | `beforeRedirect`, `beforeRetry` | **cannot delay or cancel** - undici decides both inside a synchronous dispatch interceptor, so a returned promise is not awaited |
 | streamed request bodies | **not replayed across a 307/308**, which must preserve method and body. 301/302/303 are fine (they rewrite to GET and drop the body); non-streamed bodies replay normally |
 
@@ -217,6 +218,9 @@ const client = gotlike.extend({
 });
 ```
 
+`beforeError` runs for streamed requests too, and a stream's `HTTPError` carries the same
+`error.response` a non-streamed one does.
+
 `beforeRedirect` and `beforeRetry` **cannot delay or cancel** the redirect or retry - undici decides
 both inside a synchronous dispatch interceptor, so a promise returned from them is not awaited. They
 are for logging, metrics, and (for `beforeRedirect`) adjusting `request.headers` on the next hop.
@@ -274,7 +278,11 @@ await pipeline(createReadStream('file'), upload);
 ```
 
 With `throwHttpErrors` on, an error status surfaces when you read the stream - listen on `error`,
-or await `stream.response` and check `ok` with it turned off.
+or await `stream.response` and check `ok` with it turned off. The error is a full `HTTPError`, with
+`error.response` populated and the `beforeError` hooks already applied.
+
+`stream.response` also carries `retryCount`, alongside `statusCode`, `ok`, `headers`, `url` and
+`timings`.
 
 A request with no body of its own resolves to a plain `Readable`: there is nothing to write to a
 GET, and wrapping it in a duplex costs ~10% of stream throughput for a writable half nobody can
@@ -330,7 +338,7 @@ empty `Buffer` - rather than a parse failure on an empty string.
 
 ```ts
 response.body        // parsed per responseType; a Buffer for 'buffer'
-response.rawBody     // Buffer; computed on first access, not eagerly
+response.rawBody     // Buffer of the bytes received; computed on first access, not eagerly
 response.ok          // statusCode in the 2xx range
 response.statusCode
 response.headers

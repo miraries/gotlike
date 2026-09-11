@@ -39,6 +39,46 @@ function asStream(readable: Readable, head: StreamHead | undefined, error?: Erro
   return stream;
 }
 
+/** Deliberate no-op, used where a rejection is already reported somewhere else. */
+function noop(): void {}
+
+/**
+ * A `stream()` duplex for a request that failed before it could be dispatched.
+ *
+ * The writable half accepts and discards writes so a caller that pipes into it doesn't fail
+ * with a second, less useful error; the readable half raises the real one at read time, the
+ * way `asStream` does.
+ */
+function failedUploadStream(error: Promise<Error>): GotlikeUploadStream {
+  error.catch(noop);
+
+  let raised = false;
+
+  const stream = new Duplex({
+    read() {
+      if (raised) {
+        return;
+      }
+
+      raised = true;
+      error.then((failure) => this.destroy(failure), noop);
+    },
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+    final(callback) {
+      callback();
+    },
+  }) as GotlikeUploadStream;
+
+  stream.response = error.then<StreamHead>((failure) => {
+    throw failure;
+  });
+  stream.response.catch(noop);
+
+  return stream;
+}
+
 /**
  * At a redirect hop undici hands over headers in its flat `[name, value, name, value]` raw
  * form rather than as an object, so a hook writing `headers.authorization` would be setting
@@ -244,10 +284,33 @@ const acceptEncoding = [
 
 const absoluteUrl = /^[a-z][a-z\d+\-.]*:\/\//i;
 
+/** A single `searchParams` / `form` value. Arrays of these repeat the key. */
+export type QueryValue = string | number | boolean | null | undefined;
+
+/** got's default. undici's is 5, which is a lot more load on an upstream that is already failing. */
+const defaultRetryLimit = 2;
+
+/**
+ * How many times an `afterResponse` hook may call `retryWithMergedOptions` for one request.
+ * Generous enough that no real refresh-and-retry flow reaches it, and finite so that a hook
+ * which always sees the status it retries on fails with this error instead of recursing until
+ * the process dies.
+ */
+const maxAfterResponseRetries = 20;
+
+/** Carries the `retryWithMergedOptions` depth on the options. A symbol, so option spreads
+ * copy it while `for...in` validation and `Object.keys` never see it. */
+const retryDepth = Symbol('gotlike.retryDepth');
+
+type RetryDepth = {[retryDepth]?: number};
+
 /**
  * Serialise `searchParams` / `form` values. Entries that are `null` or `undefined` are
  * dropped rather than sent as the string "null" - got does the same, and a provider
  * receiving `?foo=undefined` is never what was meant.
+ *
+ * An array value repeats the key (`?a=1&a=2`). Falling through to `String(value)` joined it
+ * with a comma into a single `?a=1%2C2` instead - a wrong query string, produced silently.
  */
 function stringifyQuery(input: NonNullable<RequestOptions['searchParams']>): string {
   if (typeof input === 'string') {
@@ -263,9 +326,21 @@ function stringifyQuery(input: NonNullable<RequestOptions['searchParams']>): str
   for (const key in input) {
     const value = input[key];
 
-    if (value !== null && value !== undefined) {
-      params.append(key, String(value));
+    if (value === null || value === undefined) {
+      continue;
     }
+
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item !== null && item !== undefined) {
+          params.append(key, String(item));
+        }
+      }
+
+      continue;
+    }
+
+    params.append(key, String(value));
   }
 
   return params.toString();
@@ -382,6 +457,32 @@ function concatHooks<T>(base?: T[], added?: T[]): T[] | undefined {
   }
 
   return added ? [...base, ...added] : base;
+}
+
+/**
+ * The signal a dispatch actually runs under.
+ *
+ * got's `timeout.request` caps the *whole* request. undici's `headersTimeout`/`bodyTimeout`
+ * are per-phase, and `bodyTimeout` restarts on every chunk received - so a response that
+ * trickles a byte at a time never trips either one, and a request under a 1.5s timeout was
+ * measured still running at 4.9s. Both are still set, since they produce the more specific
+ * error when they do fire, but the deadline below is what actually bounds the request.
+ *
+ * It also sidesteps undici's coarse timer wheel (`lib/util/timers.js`, `RESOLUTION_MS = 1000`),
+ * which used to round every sub-second timeout up to roughly a second.
+ */
+function requestSignal(options: FormedOptions): AbortSignal | undefined {
+  const timeout = options.timeout?.request;
+
+  if (timeout === undefined) {
+    return options.signal;
+  }
+
+  // Reports itself as a `TimeoutError` DOMException, which `call()` already maps to
+  // `TimeoutError`/`ETIMEDOUT` - the same place undici's own timeout errors land.
+  const deadline = AbortSignal.timeout(timeout);
+
+  return options.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
 }
 
 /** Milliseconds since `startTime`, or 0 when the request never got far enough to have one. */
@@ -502,10 +603,16 @@ export type RequestOptions<T = unknown> = {
   /**
    * JSON body. If the `Content-Type` header is not set, it will be set to `application/json`.
    *
-   * __Note__: This option is not enumerable and will not be merged with the instance defaults.
+   * __Note__: read from the per-call options only. A body belongs to one request, so a `json`
+   * set on a client is dropped rather than inherited - got behaves the same way.
    */
   json?: unknown;
 
+  /**
+   * Raw request body. Overridden by `json` and `form`.
+   *
+   * __Note__: per-call only, like `json`.
+   */
   body?: string | Buffer | Uint8Array | null;
 
   /** The parsing method. `buffer` resolves to a Node `Buffer`. */
@@ -514,15 +621,21 @@ export type RequestOptions<T = unknown> = {
   /**
    * Query string to add to the request URL. Overrides any query already present on `url`.
    *
-   * Object values are stringified; `null` and `undefined` entries are dropped.
+   * Object values are stringified; `null` and `undefined` entries are dropped, and an array
+   * value repeats the key (`{a: [1, 2]}` becomes `?a=1&a=2`).
    */
-  searchParams?: string | URLSearchParams | Record<string, string | number | boolean | null | undefined>;
+  searchParams?: string | URLSearchParams | Record<string, QueryValue | readonly QueryValue[]>;
 
   /**
    * `application/x-www-form-urlencoded` body. Sets the `Content-Type` header unless one is
    * already set. Takes precedence over `body`, and is itself overridden by `json`.
+   *
+   * Serialised like `searchParams`, so an array value repeats the key.
+   *
+   * __Note__: read from the per-call options only. Like `json` and `body`, a form set on a
+   * client is not inherited by the requests it makes.
    */
-  form?: Record<string, string | number | boolean | null | undefined> | URLSearchParams;
+  form?: Record<string, QueryValue | readonly QueryValue[]> | URLSearchParams;
 
   /**
    * Validate options. Client options are always validated on create/extend - it happens
@@ -711,6 +824,8 @@ export type StreamHead = {
   ok: boolean;
   headers: IncomingHttpHeaders;
   url: string | URL;
+  /** How many times the request was retried. Always 0 unless `retry` is configured. */
+  retryCount: number;
   timings: {
     phases: {
       /** Time to the response head. The body is still streaming at this point. */
@@ -751,7 +866,8 @@ export type Response<T = any> = {
    * Computed on first access rather than eagerly: text and JSON responses are read with
    * undici's optimised `body.text()`, and materialising a Buffer for every request just in
    * case would cost more than it's worth. For a `buffer` responseType this is the body
-   * itself; otherwise it's the decoded text re-encoded as UTF-8.
+   * itself; otherwise it's the body as received, re-encoded as UTF-8 - for `json` that is
+   * the original text, not a re-serialisation of the parsed value.
    */
   readonly rawBody: Buffer;
   /** How many times the request was retried. Always 0 unless `retry` is configured. */
@@ -782,6 +898,7 @@ class GotlikeResponse<T> implements Response<T> {
   request: {options: FormedOptions};
 
   #rawBody?: Buffer;
+  #rawText?: string;
 
   constructor(
     body: T,
@@ -790,6 +907,13 @@ class GotlikeResponse<T> implements Response<T> {
     retryCount: number,
     total: number,
     options: FormedOptions,
+    /**
+     * The body exactly as it was received, when `body` is no longer it. Only the `json`
+     * path needs this: re-serialising the parsed object gave back `{"a":1}` for a response
+     * that was on the wire as `{\n  "a"  :  1\n}`, which quietly broke any signature
+     * checked over `rawBody`.
+     */
+    rawText?: string,
   ) {
     this.body = body;
     this.headers = headers;
@@ -798,6 +922,7 @@ class GotlikeResponse<T> implements Response<T> {
     this.retryCount = retryCount;
     this.timings = {phases: {total}};
     this.request = {options};
+    this.#rawText = rawText;
   }
 
   get url(): string | URL {
@@ -805,9 +930,16 @@ class GotlikeResponse<T> implements Response<T> {
   }
 
   get rawBody(): Buffer {
-    return (this.#rawBody ??= Buffer.isBuffer(this.body)
-      ? this.body
-      : Buffer.from(typeof this.body === 'string' ? this.body : (JSON.stringify(this.body) ?? '')));
+    if (this.#rawBody === undefined) {
+      this.#rawBody =
+        this.#rawText === undefined
+          ? Buffer.isBuffer(this.body)
+            ? this.body
+            : Buffer.from(typeof this.body === 'string' ? this.body : (JSON.stringify(this.body) ?? ''))
+          : Buffer.from(this.#rawText);
+    }
+
+    return this.#rawBody;
   }
 }
 
@@ -1009,7 +1141,8 @@ export function validateOptions(options: RequestOptions, atCreation: boolean): v
 }
 
 export class Gotlike {
-  baseOptions?: RequestOptions;
+  /** The client defaults, with `defaultOptions` already folded in - never undefined. */
+  baseOptions: RequestOptions;
 
   /** Explicit dispatcher for this client, if one was built or passed in. */
   ownAgent?: Dispatcher;
@@ -1037,6 +1170,9 @@ export class Gotlike {
   /** Whether the composed chain decompresses. Instance-level, so `call()` can't disagree. */
   decompress: boolean;
 
+  /** Whether the client defaults carry a `json`/`body`/`form`, which must not be inherited. */
+  baseHasBody: boolean;
+
   decompressOptions?: DecompressOptions;
 
   /**
@@ -1058,14 +1194,29 @@ export class Gotlike {
       validateOptions(options, true);
     }
 
-    this.baseOptions = options;
-    this.followsRedirects = options?.followRedirect === true;
-    this.validate = options?.validate !== false;
-    this.decompress = options?.decompress !== false;
+    /*
+     * The defaults are folded in *here*, not onto the exported singleton, so that every way of
+     * building a client shares them. They used to be `createClient(defaultOptions)`'s alone,
+     * which left `new Gotlike(...)` and `createClient(...)` with `throwHttpErrors` undefined -
+     * silently resolving 4xx/5xx as successes - and no `responseType`, falling through to
+     * `buffer` instead of `text`. `FormedOptions` declares both as required, so the rest of the
+     * code was right to trust them; this is what makes that true.
+     */
+    const merged: RequestOptions = options ? {...defaultOptions, ...options} : {...defaultOptions};
+
+    this.baseOptions = merged;
+    this.followsRedirects = merged.followRedirect === true;
+    this.validate = merged.validate !== false;
+    this.decompress = merged.decompress !== false;
+
+    // got never takes a body from the client defaults, and `json`'s own docs here say the same.
+    // Checked once, so `formOptions` can skip three property reads per request in the usual
+    // case where no client carries one.
+    this.baseHasBody = merged.json !== undefined || merged.body !== undefined || merged.form !== undefined;
 
     // Lower-cased once here so the per-request merge can fold a per-call name in with a single
     // `toLowerCase()` and be sure nothing collides with a differently-cased default.
-    this.defaultHeaders = lowercaseHeaders(options?.headers);
+    this.defaultHeaders = lowercaseHeaders(merged.headers);
 
     // undici's decompress interceptor acts on the response's content-encoding but never asks
     // for one, so support has to be advertised here.
@@ -1078,30 +1229,30 @@ export class Gotlike {
         // undici skips error responses by default. got decompresses them, and so must we:
         // a gzipped error body is exactly what error handling needs to read.
         skipErrorResponses: false,
-        ...(typeof options?.decompress === 'object' ? options.decompress : undefined),
+        ...(typeof merged.decompress === 'object' ? merged.decompress : undefined),
       };
     }
 
     // Left undefined when empty, so `call()` only has to check for a truthy field.
-    this.beforeRequestHooks = usedHooks(options?.hooks?.beforeRequest);
-    this.afterResponseHooks = usedHooks(options?.hooks?.afterResponse);
-    this.beforeErrorHooks = usedHooks(options?.hooks?.beforeError);
-    this.beforeRetryHooks = usedHooks(options?.hooks?.beforeRetry);
-    this.beforeRedirectHooks = usedHooks(options?.hooks?.beforeRedirect);
+    this.beforeRequestHooks = usedHooks(merged.hooks?.beforeRequest);
+    this.afterResponseHooks = usedHooks(merged.hooks?.afterResponse);
+    this.beforeErrorHooks = usedHooks(merged.hooks?.beforeError);
+    this.beforeRetryHooks = usedHooks(merged.hooks?.beforeRetry);
+    this.beforeRedirectHooks = usedHooks(merged.hooks?.beforeRedirect);
 
-    if (options?.agent) {
-      this.ownAgent = options.agent;
-    } else if (options && agentOptions.some((key) => options[key] !== undefined)) {
+    if (merged.agent) {
+      this.ownAgent = merged.agent;
+    } else if (agentOptions.some((key) => merged[key] !== undefined)) {
       this.ownAgent = new undici.Agent({
-        allowH2: options.http2,
-        pipelining: options.pipelining,
-        connections: options.connections,
-        keepAliveTimeout: options.keepAliveTimeout,
-        keepAliveMaxTimeout: options.keepAliveMaxTimeout,
-        connectTimeout: options.connectTimeout,
-        connect: options.dnsLookup
+        allowH2: merged.http2,
+        pipelining: merged.pipelining,
+        connections: merged.connections,
+        keepAliveTimeout: merged.keepAliveTimeout,
+        keepAliveMaxTimeout: merged.keepAliveMaxTimeout,
+        connectTimeout: merged.connectTimeout,
+        connect: merged.dnsLookup
           ? {
-              lookup: options.dnsLookup,
+              lookup: merged.dnsLookup,
             }
           : undefined,
       });
@@ -1109,19 +1260,51 @@ export class Gotlike {
 
     // `retry: {limit: 0}` is how callers disable retries; composing a RetryHandler that
     // will never retry just costs a handler allocation per request, so skip it entirely.
-    if (options?.retry && options.retry.limit !== 0) {
+    if (merged.retry && merged.retry.limit !== 0) {
       this.retryOptions = {
-        methods: options.retry.methods,
-        statusCodes: options.retry.statusCodes,
-        errorCodes: options.retry.errorCodes,
-        maxRetries: options.retry.limit,
-        maxTimeout: options.retry.backoffLimit,
-        retryAfter: !!options.retry.maxRetryAfter,
+        methods: merged.retry.methods,
+        statusCodes: merged.retry.statusCodes,
+        errorCodes: merged.retry.errorCodes,
+        // undici would default this to 5. got's default is 2, and silently tripling the
+        // load a failing upstream sees is not a difference anyone would go looking for.
+        maxRetries: merged.retry.limit ?? defaultRetryLimit,
+        maxTimeout: merged.retry.backoffLimit,
+        // undici defaults this to `true`, and got honours `Retry-After` by default too.
+        // Deriving it from `maxRetryAfter` alone turned it *off* for every caller who
+        // didn't set that option, which is almost all of them - so the client ignored an
+        // upstream's explicit backoff and hammered it on undici's own schedule instead.
+        retryAfter: merged.retry.maxRetryAfter === undefined ? true : !!merged.retry.maxRetryAfter,
         // got resolves an exhausted retry to the last response; undici's handler
         // throws a RequestRetryError instead unless we opt out.
         throwOnError: false,
       };
     }
+  }
+
+  /**
+   * Retry bookkeeping for a single dispatch, or `undefined` on a client that never retries.
+   *
+   * Built here rather than inline in `call()` because `dispatchOptions()` hands it to every
+   * dispatch - the stream paths used to get none, which left `beforeRetry` silently unfired
+   * and `retryCount` pinned at 0 on a stream that undici had in fact retried.
+   */
+  attemptState(): AttemptState | undefined {
+    if (!this.retryOptions) {
+      return undefined;
+    }
+
+    const hooks = this.beforeRetryHooks;
+
+    return {
+      count: 0,
+      onRetry:
+        hooks &&
+        ((error, statusCode, retryCount) => {
+          for (const hook of hooks) {
+            hook(error, statusCode, retryCount);
+          }
+        }),
+    };
   }
 
   /**
@@ -1142,7 +1325,7 @@ export class Gotlike {
       const chain: Dispatcher.DispatcherComposeInterceptor[] = [];
 
       // Resolve first, so everything downstream talks to a cached address.
-      if (options?.dnsCache) {
+      if (options.dnsCache) {
         chain.push(interceptors.dns(options.dnsCache === true ? undefined : options.dnsCache));
       }
 
@@ -1158,11 +1341,11 @@ export class Gotlike {
         chain.push(interceptors.redirect());
       }
 
-      if (options?.dedupe) {
+      if (options.dedupe) {
         chain.push(interceptors.deduplicate(options.dedupe === true ? undefined : options.dedupe));
       }
 
-      if (options?.cache) {
+      if (options.cache) {
         chain.push(interceptors.cache(options.cache === true ? undefined : options.cache));
       }
 
@@ -1205,7 +1388,25 @@ export class Gotlike {
     }
 
     const base = this.baseOptions;
-    const formed = (base ? {...base, ...options} : {...options}) as FormedOptions;
+    const formed = {...base, ...options} as FormedOptions;
+
+    // A body belongs to one request, never to a client. got doesn't merge `json`/`body`/`form`
+    // from the defaults and neither does this - a client built with `json` was otherwise
+    // sending that body on every request it made, GETs included. Guarded by a flag computed in
+    // the constructor, so the usual case costs one boolean test rather than three reads.
+    if (this.baseHasBody) {
+      if (options.json === undefined) {
+        formed.json = undefined;
+      }
+
+      if (options.body === undefined) {
+        formed.body = undefined;
+      }
+
+      if (options.form === undefined) {
+        formed.form = undefined;
+      }
+    }
 
     // Always a fresh object: handlers and `beforeRequest` hooks routinely write to
     // `options.headers`, and the instance defaults must not pick those up. Per-call names are
@@ -1213,7 +1414,7 @@ export class Gotlike {
     // `authorization` rather than joining it.
     formed.headers = mergeHeaders(this.defaultHeaders, options.headers);
 
-    if (base?.context && options.context) {
+    if (base.context && options.context) {
       formed.context = {...base.context, ...options.context};
     } else if (formed.context === undefined) {
       // Shared and frozen: `options.context.foo` should read as undefined rather than
@@ -1286,11 +1487,6 @@ export class Gotlike {
   }
 
   /**
-   * Join `prefixUrl` and `url` the way got does: the prefix keeps at most one trailing
-   * slash and the path never contributes a leading one, so neither side can produce the
-   * `//` that plain concatenation used to.
-   */
-  /**
    * The options every dispatch shares. `call()`, `callBodylessStream()` and `callStream()`
    * built this same literal three times over, which is three places to forget a field.
    */
@@ -1301,12 +1497,25 @@ export class Gotlike {
       method: options.method,
       bodyTimeout: options.timeout?.request,
       headersTimeout: options.timeout?.request,
-      signal: options.signal,
-      maxRedirections: options.followRedirect ? 10 : 0,
+      signal: requestSignal(options),
+      // `this.followsRedirects` decides whether the interceptor is in the chain at all, and
+      // undici rejects `maxRedirections` outright when it isn't. Reading only
+      // `options.followRedirect` meant that a per-request `followRedirect: true` slipped
+      // through whenever `validate` was off and failed every request with an opaque
+      // `UND_ERR_INVALID_ARG` instead of being the ValidationError it is with validation on.
+      maxRedirections: this.followsRedirects && options.followRedirect ? 10 : 0,
       redirects: this.beforeRedirectHooks ? {count: 0} : undefined,
+      // Handed to every dispatch, streams included: this is what drives `retryCount` and
+      // fires `beforeRetry`.
+      attempts: this.attemptState(),
     };
   }
 
+  /**
+   * Join `prefixUrl` and `url`: the prefix keeps at most one trailing slash and the path never
+   * contributes a leading one, so neither side can produce the `//` that plain concatenation
+   * used to. An empty `url` is the prefix itself, rather than the prefix plus a bare slash.
+   */
   resolveUrl(options: FormedOptions): string {
     const url = options.url === undefined ? '' : String(options.url);
 
@@ -1316,8 +1525,10 @@ export class Gotlike {
     const joined =
       !options.prefixUrl || absoluteUrl.test(url)
         ? url
-        : (options.prefixUrl.endsWith('/') ? options.prefixUrl : options.prefixUrl + '/') +
-          (url.startsWith('/') ? url.slice(1) : url);
+        : url === ''
+          ? options.prefixUrl
+          : (options.prefixUrl.endsWith('/') ? options.prefixUrl : options.prefixUrl + '/') +
+            (url.startsWith('/') ? url.slice(1) : url);
 
     if (options.searchParams === undefined) {
       return joined;
@@ -1362,45 +1573,59 @@ export class Gotlike {
   async call<T = unknown>(options: FormedOptions): Promise<Response<T>> {
     let undiciResponse;
     let responseBody;
+    let rawText;
     let startTime;
     let attempts: AttemptState | undefined;
     let parseFailed = false;
+    let url = '';
 
-    // The resolved URL is what hooks and handlers should see and what request signing
-    // needs, so write it back before anything gets a look at the options.
-    const url = (options.url = this.resolveUrl(options));
+    /*
+     * Everything that runs before the request gets its own try: a throwing `beforeRequest`
+     * hook (or a circular `json`) used to reject with the raw error, skipping both the
+     * `RequestError` wrapper and the `beforeError` hooks, so a caller matching on
+     * `instanceof RequestError` silently missed it.
+     */
+    try {
+      // The resolved URL is what hooks and handlers should see and what request signing
+      // needs, so write it back before anything gets a look at the options.
+      url = options.url = this.resolveUrl(options);
 
-    // Serialise up front so `beforeRequest` hooks can read and re-sign `options.body`
-    // regardless of whether the caller passed `json` or `body`.
-    if (options.json !== undefined) {
-      options.body = JSON.stringify(options.json);
+      // Serialise up front so `beforeRequest` hooks can read and re-sign `options.body`
+      // regardless of whether the caller passed `json` or `body`.
+      if (options.json !== undefined) {
+        options.body = JSON.stringify(options.json);
 
-      // Case-insensitive: undici would otherwise send both a caller's `Content-Type` and
-      // the one we add, and the header the server picks is anyone's guess.
-      if (!hasHeader(options.headers, 'content-type')) {
-        options.headers['content-type'] = 'application/json';
+        // Case-insensitive: undici would otherwise send both a caller's `Content-Type` and
+        // the one we add, and the header the server picks is anyone's guess.
+        if (!hasHeader(options.headers, 'content-type')) {
+          options.headers['content-type'] = 'application/json';
+        }
+      } else if (options.form !== undefined) {
+        options.body = stringifyQuery(options.form);
+
+        if (!hasHeader(options.headers, 'content-type')) {
+          options.headers['content-type'] = 'application/x-www-form-urlencoded';
+        }
       }
-    } else if (options.form !== undefined) {
-      options.body = stringifyQuery(options.form);
 
-      if (!hasHeader(options.headers, 'content-type')) {
-        options.headers['content-type'] = 'application/x-www-form-urlencoded';
+      if (
+        (options.username !== undefined || options.password !== undefined) &&
+        !hasHeader(options.headers, 'authorization')
+      ) {
+        const credentials = `${options.username ?? ''}:${options.password ?? ''}`;
+
+        options.headers['authorization'] = 'Basic ' + Buffer.from(credentials).toString('base64');
       }
-    }
 
-    if (
-      (options.username !== undefined || options.password !== undefined) &&
-      !hasHeader(options.headers, 'authorization')
-    ) {
-      const credentials = `${options.username ?? ''}:${options.password ?? ''}`;
-
-      options.headers['authorization'] = 'Basic ' + Buffer.from(credentials).toString('base64');
-    }
-
-    if (this.beforeRequestHooks) {
-      for (const hook of this.beforeRequestHooks) {
-        await hook(options);
+      if (this.beforeRequestHooks) {
+        for (const hook of this.beforeRequestHooks) {
+          await hook(options);
+        }
       }
+    } catch (error) {
+      // The hook's own message, not a generic one - it is the only thing that says what
+      // actually went wrong.
+      throw await this.toRequestError((error as Error).message, 'ERR_REQUEST_ERROR', error as Error, options);
     }
 
     // make request
@@ -1417,23 +1642,13 @@ export class Gotlike {
 
       startTime = process.hrtime();
 
+      const dispatch = this.dispatchOptions(options);
+
       // Only allocated for clients that actually retry; everyone else reports 0.
-      attempts = this.retryOptions
-        ? {
-            count: 0,
-            onRetry:
-              this.beforeRetryHooks &&
-              ((error, statusCode, retryCount) => {
-                for (const hook of this.beforeRetryHooks!) {
-                  hook(error, statusCode, retryCount);
-                }
-              }),
-          }
-        : undefined;
+      attempts = dispatch.attempts;
 
       const requestOptions: UndiciRequestOptions = {
-        ...this.dispatchOptions(options),
-        attempts,
+        ...dispatch,
         body,
       };
 
@@ -1449,8 +1664,10 @@ export class Gotlike {
       } else if (options.responseType === 'json') {
         const text = await undiciResponse.body.text();
 
-        // Keep the raw text reachable: it is what `error.response.body` should show.
+        // Keep the raw text reachable: it is what `error.response.body` should show on a
+        // parse failure, and what `response.rawBody` has to hand back on a successful one.
         responseBody = text;
+        rawText = text;
 
         try {
           responseBody = JSON.parse(text);
@@ -1489,6 +1706,7 @@ export class Gotlike {
           retriesFrom(attempts),
           elapsedMs(startTime),
           options,
+          rawText,
         );
 
       if (err instanceof HeadersTimeoutError || err instanceof BodyTimeoutError) {
@@ -1541,6 +1759,7 @@ export class Gotlike {
       retriesFrom(attempts),
       elapsedMs(startTime),
       options,
+      rawText,
     );
 
     // Runs before `throwHttpErrors` on purpose: got-style token refresh hooks need to see
@@ -1576,22 +1795,27 @@ export class Gotlike {
    */
   async callBodylessStream(options: FormedOptions): Promise<GotlikeStream> {
     const startTime = process.hrtime();
+    const dispatch = this.dispatchOptions(options);
 
     let undiciResponse;
 
     try {
-      undiciResponse = await undici.request(options.url as string, this.dispatchOptions(options));
+      undiciResponse = await undici.request(options.url as string, dispatch);
     } catch (error) {
       // Reported through the duplex rather than by rejecting `stream()`, so that both
-      // stream paths fail the same way whatever the caller is listening on.
-      return asStream(Readable.from([]), undefined, error as Error);
+      // stream paths fail the same way whatever the caller is listening on. Normalised the
+      // same way `call()` normalises it, `beforeError` hooks included.
+      return asStream(Readable.from([]), undefined, await this.toStreamError(error as Error, options));
     }
+
+    const retryCount = retriesFrom(dispatch.attempts);
 
     const streamHead: StreamHead = {
       statusCode: undiciResponse.statusCode,
       ok: isOk(undiciResponse.statusCode),
       headers: undiciResponse.headers,
       url: options.url as string | URL,
+      retryCount,
       timings: {
         phases: {
           total: elapsedMs(startTime),
@@ -1599,20 +1823,53 @@ export class Gotlike {
       },
     };
 
-    const failed = options.throwHttpErrors && isHttpError(undiciResponse.statusCode);
-
-    if (failed) {
-      // The body is being replaced by the error, so let undici reclaim the socket.
-      undiciResponse.body.dump().catch(() => undefined);
+    if (!options.throwHttpErrors || !isHttpError(undiciResponse.statusCode)) {
+      return asStream(undiciResponse.body, streamHead);
     }
 
-    return asStream(
-      undiciResponse.body,
-      streamHead,
-      failed
-        ? new HTTPError(`Response code ${streamHead.statusCode}`, 'ERR_HTTP_ERROR', undefined, options)
-        : undefined,
+    // The body is being replaced by the error, so let undici reclaim the socket.
+    undiciResponse.body.dump().catch(() => undefined);
+
+    // Built through `toRequestError` like every other failure: it carries the response the
+    // way the docs promise, and it runs the `beforeError` hooks, which a bare
+    // `new HTTPError(...)` skipped entirely for streams.
+    const error = await this.toRequestError(
+      `Response code ${streamHead.statusCode}`,
+      'ERR_HTTP_ERROR',
+      undefined,
+      options,
+      new GotlikeResponse<undefined>(
+        undefined,
+        streamHead.headers,
+        streamHead.statusCode,
+        retryCount,
+        streamHead.timings.phases.total,
+        options,
+      ),
+      HTTPError,
     );
+
+    return asStream(undiciResponse.body, streamHead, error);
+  }
+
+  /**
+   * Normalise a pre-response stream failure the way `call()`'s catch does, so that a stream
+   * and a plain request report the same thing for the same underlying error.
+   */
+  toStreamError(error: Error, options: FormedOptions): Promise<Error> {
+    if (error instanceof HeadersTimeoutError || error instanceof BodyTimeoutError) {
+      return this.toRequestError(error.message, 'ETIMEDOUT', error, options, undefined, TimeoutError);
+    }
+
+    if (error?.name === 'AbortError') {
+      return this.toRequestError(error.message, 'ERR_ABORTED', error, options, undefined, AbortError);
+    }
+
+    if (error?.name === 'TimeoutError') {
+      return this.toRequestError(error.message, 'ETIMEDOUT', error, options, undefined, TimeoutError);
+    }
+
+    return this.toRequestError('Request error', 'ERR_REQUEST_ERROR', error, options);
   }
 
   /**
@@ -1637,15 +1894,18 @@ export class Gotlike {
     // down; the same failure is always reported on the stream's `error` event too.
     head.catch(() => undefined);
 
-    const duplex = undici.pipeline(
-      options.url as string,
-      this.dispatchOptions(options),
-      ({statusCode, headers, body}) => {
+    const dispatch = this.dispatchOptions(options);
+
+    let duplex: GotlikeUploadStream;
+
+    try {
+      duplex = undici.pipeline(options.url as string, dispatch, ({statusCode, headers, body}) => {
         const streamHead: StreamHead = {
           statusCode,
           ok: isOk(statusCode),
           headers,
           url: options.url as string | URL,
+          retryCount: retriesFrom(dispatch.attempts),
           timings: {
             phases: {
               total: elapsedMs(startTime),
@@ -1656,14 +1916,59 @@ export class Gotlike {
         resolveHead(streamHead);
         duplex.emit('response', streamHead);
 
-        if (options.throwHttpErrors && isHttpError(statusCode)) {
-          // Destroying from inside the handler surfaces on the duplex's `error` event.
-          throw new HTTPError(`Response code ${statusCode}`, 'ERR_HTTP_ERROR', undefined, options);
+        if (!options.throwHttpErrors || !isHttpError(statusCode)) {
+          return body;
         }
 
-        return body;
-      },
-    ) as unknown as GotlikeUploadStream;
+        // The body is being replaced by the error, so let undici reclaim the socket.
+        body.resume();
+
+        /*
+         * Raised by the readable at read time, exactly as `asStream` does on the other
+         * stream path, rather than thrown from here. Throwing was synchronous, which left no
+         * room to await the `beforeError` hooks or to attach the response - so a streamed
+         * failure skipped the hooks entirely and arrived with `error.response` undefined,
+         * which the documented contract says only happens when no response ever came.
+         */
+        const failure = this.toRequestError(
+          `Response code ${statusCode}`,
+          'ERR_HTTP_ERROR',
+          undefined,
+          options,
+          new GotlikeResponse<undefined>(
+            undefined,
+            headers,
+            statusCode,
+            streamHead.retryCount,
+            streamHead.timings.phases.total,
+            options,
+          ),
+          HTTPError,
+        );
+
+        // Nothing is obliged to read the stream, and an unhandled rejection would take the
+        // process down.
+        failure.catch(() => undefined);
+
+        let raised = false;
+
+        return new Readable({
+          read() {
+            if (raised) {
+              return;
+            }
+
+            raised = true;
+            failure.then((error) => this.destroy(error), noop);
+          },
+        });
+      }) as unknown as GotlikeUploadStream;
+    } catch (error) {
+      // `undici.pipeline` can reject its arguments synchronously. Reported on the stream like
+      // every other stream failure, rather than by rejecting `stream()` - which is what the
+      // bodyless path already did for the same class of error.
+      return failedUploadStream(this.toStreamError(error as Error, options));
+    }
 
     duplex.on('error', (error: Error) => rejectHead(error));
 
@@ -1689,14 +1994,30 @@ export class Gotlike {
    * The retry goes straight to `call()`: handlers already ran for this request, and running
    * them again would re-log and re-wrap a request the caller only made once.
    */
-  retryWithMergedOptions<T>(options: FormedOptions, newOptions: RequestOptions): Promise<Response<T>> {
-    const merged = {...options, ...newOptions} as FormedOptions;
+  async retryWithMergedOptions<T>(options: FormedOptions, newOptions: RequestOptions): Promise<Response<T>> {
+    const depth = ((options as RetryDepth)[retryDepth] ?? 0) + 1;
 
-    if (newOptions.headers) {
-      // The first attempt's headers may carry whatever case a hook or handler wrote, so
-      // normalise both sides here - a refreshed `authorization` has to replace the stale one.
-      merged.headers = mergeHeaders(lowercaseHeaders(options.headers), newOptions.headers);
+    if (depth > maxAfterResponseRetries) {
+      // A hook that keeps retrying on a status it never stops seeing - an auth refresh that
+      // silently fails, say - used to recurse until the process ran out of stack or memory.
+      throw await this.toRequestError(
+        `afterResponse retried the request more than ${maxAfterResponseRetries} times`,
+        'ERR_TOO_MANY_RETRIES',
+        undefined,
+        options,
+      );
     }
+
+    const merged = {
+      ...options,
+      ...newOptions,
+      // Always a fresh object, even when the hook passed no headers of its own. Aliasing the
+      // first attempt's headers meant `call()`'s own writes - a `content-type` for a body the
+      // retry added - landed on the options the *first* response reports having been sent
+      // with. The first attempt's names may carry whatever case a hook or handler wrote, so
+      // normalise both sides: a refreshed `authorization` has to replace the stale one.
+      headers: mergeHeaders(lowercaseHeaders(options.headers), newOptions.headers),
+    } as FormedOptions;
 
     if (newOptions.context) {
       merged.context = {...options.context, ...newOptions.context};
@@ -1704,6 +2025,7 @@ export class Gotlike {
 
     // `url` was already resolved against `prefixUrl` for the first attempt.
     merged.prefixUrl = undefined;
+    (merged as RetryDepth)[retryDepth] = depth;
 
     return this.call<T>(merged);
   }
@@ -1831,8 +2153,11 @@ export function createClient(options?: RequestOptions): CallableClient {
  * One instance behind all three names, as got does. Three separate clients would each carry
  * their own headers and interceptor chain, and `got !== gotlike` would be a surprise for
  * anyone configuring or comparing them.
+ *
+ * No options: `defaultOptions` is applied by the constructor now, so this client and a
+ * hand-built `new Gotlike(...)` start from exactly the same place.
  */
-const defaultClient = createClient(defaultOptions);
+const defaultClient = createClient();
 
 export default defaultClient;
 
