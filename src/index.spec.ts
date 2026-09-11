@@ -2595,6 +2595,13 @@ test('an error thrown by a beforeRequest hook is a RequestError and runs beforeE
   assert.deepStrictEqual(seen, ['hook exploded']);
 });
 
+/**
+ * The one retry test that genuinely spends real time: the wall clock *is* the assertion, and
+ * nothing can be faked away. `mock.timers` can't help - node's fake timers never reach
+ * `AbortSignal.timeout`, and ticking undici's backoff here would also fast-forward its
+ * keep-alive timers and tear down the socket mid-test. Deliberately no `backoffLimit`, since
+ * undici takes `min(retryAfter, maxTimeout)` and clamping it would defeat the point.
+ */
 test('retry honours Retry-After by default', async () => {
   const testId = randomUUID();
   const retrying = client.extend({retry: {limit: 1, statusCodes: [429]}, throwHttpErrors: false});
@@ -2616,7 +2623,9 @@ test('retry honours Retry-After by default', async () => {
 test("retry defaults to got's limit of 2, not undici's 5", async () => {
   const testId = randomUUID();
   // No `limit`: undici would default to 5 retries, tripling what a failing upstream sees.
-  const retrying = client.extend({retry: {statusCodes: [429]}, throwHttpErrors: false});
+  // `backoffLimit` clamps the wait (undici takes `min(retryAfter, maxTimeout)`), so this
+  // asserts the retry *count* without paying for the route's `retry-after: 2`.
+  const retrying = client.extend({retry: {statusCodes: [429], backoffLimit: 10}, throwHttpErrors: false});
 
   const response = await retrying.get('http://localhost:3000/retry-after', {headers: {'test-id': testId}});
 
@@ -2770,7 +2779,7 @@ test('beforeRetry fires and retryCount is reported on a stream', async () => {
   const seen: number[] = [];
 
   const retrying = client.extend({
-    retry: {limit: 3, statusCodes: [429]},
+    retry: {limit: 3, statusCodes: [429], backoffLimit: 10},
     hooks: {beforeRetry: [(_error, _statusCode, retryCount) => seen.push(retryCount)]},
   });
 

@@ -404,6 +404,18 @@ amigo's `.query(true)`, spribe's capture-via-`reply(function)`) as named tests.
 hits per `test-id` header — pass a unique `test-id` (e.g. `randomUUID()`) for retry tests so counters don't leak
 between them. Uses `node:test` + `node:assert`, flat `test(...)` calls, no framework.
 
+**Retry tests set `backoffLimit: 10`** unless the wait itself is what's under test. undici's
+backoff is `min(minTimeout * factor ** n, maxTimeout)` — and `min(retryAfter, maxTimeout)` when the
+server sent a `Retry-After` — so `backoffLimit` (which maps to `maxTimeout`) collapses both. Two
+tests that forgot it cost 5.5s of a 9.5s suite. The exception is *retry honours Retry-After by
+default*, where the wall clock is the assertion.
+
+Don't reach for `node:test`'s `mock.timers` here. It does fast-forward undici's retry backoff
+(measured 1500ms → 35ms), but it needs a tick-pump interleaved with real socket I/O, it would also
+fast-forward undici's keep-alive timers and tear down the connection mid-test, and it **cannot
+reach `AbortSignal.timeout`** — which is what `timeout.request` is built on — because that is a
+native timer rather than `globalThis.setTimeout`. Verified, not assumed.
+
 `assert.rejects` returns a promise: **always `await` it**. An un-awaited `assert.rejects` makes the test pass
 unconditionally, which is how the timeout test sat green while asserting nothing.
 
