@@ -72,6 +72,12 @@ Two invariants worth preserving here:
   *replaces* an instance `authorization`. Merging by exact key kept both, undici sent both, and the server
   picked one — usually the stale one. Only the override side is walked on the hot path; the defaults are
   already normalised.
+- **A `url` is given as an argument or as an option, never both.** The argument used to overwrite the option
+  in silence; got refuses the combination outright (`The \`url\` option is mutually exclusive with the
+  \`input\` argument`, measured against got 14). The check sits inside the `url !== undefined` branch and
+  behind `validate`, so the hot path pays one property read for it. The callable `client({url, ...})` form
+  therefore passes its url in the options only - handing it over positionally as well was always redundant,
+  since `formOptions` spreads it in either way, and would now be rejected.
 - **Everything that would need deep merging is resolved at create/extend time** (`hooks`, `handlers`, `retry`,
   `agent`). That's what makes a shallow spread sufficient. `formOptions` costs ~46ns; a request costs ~60µs.
 
@@ -359,6 +365,17 @@ documented divergence from got, not an oversight.
 
 `attemptState()` builds the holder and `dispatchOptions()` hands it to every dispatch, so `retryCount` and
 `beforeRetry` work identically for `call()` and for both stream paths (`StreamHead.retryCount`).
+
+**`countAttempts` also starts the redirect chain over.** A retry is a fresh chain - undici's
+`RedirectHandler` counts hops per attempt - but the redirect tracker's state holder travels with the dispatch
+options and so survived the retry interceptor's re-dispatch. The retried attempt entered the tracker with the
+previous attempt's hop count already on it, was treated as one more hop, and fired `beforeRedirect` telling
+the hook that a `503` had redirected to the url the request started from - which is exactly the hook where
+people re-add a stripped `authorization` header. `lastUrl` only came out right by accident, because that
+bogus hop happened to overwrite it with the attempt's own url; it is cleared instead, so `response.url` falls
+back to the url that was requested, which is where a retry that followed no redirects was in fact answered.
+This works from `countAttempts` because it is composed *outside* the redirect interceptor and so runs before
+the new attempt's first hop, and because the holder is the same object every hop sees.
 
 `beforeRedirect` uses the same shape: `makeRedirectTracker` is composed **inside** undici's redirect
 interceptor, so it is re-entered per hop, and the hop's options are still mutable there — which is what lets

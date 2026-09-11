@@ -341,6 +341,66 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  /*
+   * A redirect chain in front of a status that gets retried, which is the shape that made a
+   * retry look like one more redirect hop. `test-id` survives the same-origin redirect, so
+   * the counter downstream is still per test.
+   */
+  if (req.url === '/redirect-flaky') {
+    res.statusCode = 302;
+    res.setHeader('location', '/flaky-target');
+    res.end();
+
+    return;
+  }
+
+  if (req.url === '/flaky-target') {
+    const testId = req.headers['test-id']?.toString() ?? 'default';
+
+    serverState.retryCounts[testId] = serverState.retryCounts[testId] ? serverState.retryCounts[testId] + 1 : 1;
+
+    if (serverState.retryCounts[testId] < 2) {
+      res.statusCode = 503;
+      res.end();
+
+      return;
+    }
+
+    res.end('flaky ok');
+
+    return;
+  }
+
+  /*
+   * Redirects on its first hit and answers on its second, so the retried attempt reaches the
+   * url that was requested rather than the first attempt's detour - which is what pins
+   * `response.url` to the right one of the two.
+   */
+  if (req.url === '/flip') {
+    const testId = req.headers['test-id']?.toString() ?? 'default';
+
+    serverState.retryCounts[testId] = serverState.retryCounts[testId] ? serverState.retryCounts[testId] + 1 : 1;
+
+    if (serverState.retryCounts[testId] < 2) {
+      res.statusCode = 302;
+      res.setHeader('location', '/flip-detour');
+      res.end();
+
+      return;
+    }
+
+    res.end('answered by flip');
+
+    return;
+  }
+
+  if (req.url === '/flip-detour') {
+    res.statusCode = 503;
+    res.end();
+
+    return;
+  }
+
   if (req.url === '/retry') {
     const testId = req.headers['test-id']?.toString() ?? 'default';
 
@@ -2248,6 +2308,28 @@ test('validation runs on create and extend, throwing synchronously', () => {
   assert.doesNotThrow(() => client.extend({retry: {limit: 2}, hooks: {beforeRequest: []}}));
 });
 
+/*
+ * got refuses this outright rather than picking a winner (`The `url` option is mutually
+ * exclusive with the `input` argument`, measured against got 14); the argument used to
+ * overwrite the option with nothing said. The options-only callable form is the legal way to
+ * pass a url as an option and has to keep working.
+ */
+test('a url given both as an argument and as an option is rejected', async () => {
+  await assert.rejects(
+    () => client.get('http://localhost:3000/json', {url: 'http://localhost:3000/text'}),
+    (err: Error) => {
+      assert.ok(err instanceof ValidationError);
+      assert.match(err.message, /both as an argument and as an option/);
+
+      return true;
+    },
+  );
+
+  const response = await client({url: 'http://localhost:3000/json'});
+
+  assert.strictEqual(response.statusCode, 200);
+});
+
 test('validate itself is client-only', async () => {
   // Read from the instance, so a per-request value would have done nothing at all.
   await assert.rejects(
@@ -2395,6 +2477,66 @@ test('beforeRedirect does not fire when followRedirect is off', async () => {
 
   assert.strictEqual(response.statusCode, 302);
   assert.strictEqual(calls, 0);
+});
+
+/*
+ * A retry is a fresh redirect chain, not a continuation of the previous one. The tracker's
+ * state holder travels with the dispatch options, so it survived the retry interceptor's
+ * re-dispatch: the retried attempt entered the tracker with the previous attempt's hop count
+ * already on it, was treated as one more hop, and fired `beforeRedirect` with the status that
+ * had caused the retry - telling the hook that a `503` had redirected to the original url.
+ */
+test('beforeRedirect does not fire for a retry', async () => {
+  const calls: Array<{statusCode: number; path: string}> = [];
+
+  const extClient = client.extend({
+    followRedirect: true,
+    retry: {limit: 3, backoffLimit: 10, statusCodes: [503]},
+    hooks: {
+      beforeRedirect: [
+        (request, response) => {
+          calls.push({statusCode: response.statusCode, path: String(request.path)});
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get('http://localhost:3000/redirect-flaky', {
+    headers: {'test-id': randomUUID()},
+  });
+
+  assert.strictEqual(response.body, 'flaky ok');
+  assert.strictEqual(response.retryCount, 1);
+
+  // One real hop per attempt, and nothing else: no `503 -> /redirect-flaky` entry.
+  assert.deepStrictEqual(calls, [
+    {statusCode: 302, path: '/flaky-target'},
+    {statusCode: 302, path: '/flaky-target'},
+  ]);
+});
+
+/*
+ * The other half of the same holder, and a guard on the fix rather than on the old bug: this
+ * passed before, but only by accident. `lastUrl` is what `response.url` reports, and a hop
+ * recorded on the first attempt must not be left standing for a retried attempt that went
+ * somewhere else - here the retry is answered by the url that was requested, while the first
+ * attempt had been redirected away from it. The bogus retry-as-hop used to overwrite `lastUrl`
+ * with the right answer on its way past; clearing the holder has to reach the same place
+ * deliberately, via the fallback to the requested url.
+ */
+test("response.url after a retry names the url that answered, not the previous attempt's hop", async () => {
+  const extClient = client.extend({
+    followRedirect: true,
+    retry: {limit: 3, backoffLimit: 10, statusCodes: [503]},
+  });
+
+  const response = await extClient.get('http://localhost:3000/flip', {
+    headers: {'test-id': randomUUID()},
+  });
+
+  assert.strictEqual(response.body, 'answered by flip');
+  assert.strictEqual(response.retryCount, 1);
+  assert.strictEqual(response.url, 'http://localhost:3000/flip');
 });
 
 test('beforeRedirect concatenates through extend and works on streams', async () => {

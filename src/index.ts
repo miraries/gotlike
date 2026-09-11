@@ -304,10 +304,34 @@ function trackDispatches(
     };
 }
 
-/** Drives `response.retryCount`, and `beforeRetry` when the client has such hooks. */
+/**
+ * Drives `response.retryCount`, and `beforeRetry` when the client has such hooks.
+ *
+ * It also starts the redirect chain over, because a retry is a fresh chain: undici's
+ * `RedirectHandler` counts hops per attempt and so must the tracker. This is composed
+ * *outside* the redirect interceptor, so it runs before the re-dispatched attempt's first
+ * hop, and the holder is the same object every hop sees - which is what makes resetting it
+ * from here work at all. Left alone, the re-dispatch looked to the tracker like one more hop
+ * of the previous attempt's chain: `beforeRedirect` fired with the status that caused the
+ * retry (`503 -> /the-original-url`, which is not a redirect and no hook should be told
+ * about), and `lastUrl` only came out right by accident, because that bogus hop happened to
+ * overwrite it with the url the attempt was starting from.
+ */
 const countAttempts = trackDispatches(
   (opts) => opts.attempts,
-  (state) => {
+  (state, opts) => {
+    const redirects = (opts as InterceptorOptions).redirects;
+
+    if (redirects) {
+      redirects.count = 0;
+      redirects.lastStatusCode = undefined;
+      redirects.lastHeaders = undefined;
+      redirects.lastError = undefined;
+      // Cleared rather than kept: with no hop recorded for this attempt, `response.url`
+      // falls back to the url that was requested, which is where the answer came from.
+      redirects.lastUrl = undefined;
+    }
+
     (state as AttemptState).onRetry?.(state.lastError, state.lastStatusCode, state.count - 1);
   },
 );
@@ -1864,6 +1888,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     if (url !== undefined) {
+      // got refuses the combination outright (`The \`url\` option is mutually exclusive with
+      // the \`input\` argument`, measured against got 14) rather than picking a winner, and
+      // two urls in one call is always a mistake worth hearing about - the argument used to
+      // quietly overwrite the option. Inside the `url !== undefined` branch and behind
+      // `validate`, so the hot path pays one property read for it.
+      if (this.validate && options.url !== undefined) {
+        invalid('`url` cannot be given both as an argument and as an option');
+      }
+
       formed.url = url;
     }
 
@@ -2903,7 +2936,10 @@ function asCallable<O extends ClientOptions>(instance: Gotlike<O>): CallableClie
     // `URL` is an object too, so it has to be excluded explicitly, and `null` reaches the
     // url path where it fails as a bad url rather than as a confusing property read.
     if (urlOrOptions !== null && typeof urlOrOptions === 'object' && !(urlOrOptions instanceof URL)) {
-      return instance.handle<T>(urlOrOptions, urlOrOptions.url);
+      // The url stays in the options rather than being passed alongside them: `formOptions`
+      // spreads it in either way, so handing it over a second time was redundant - and now
+      // that giving both is rejected, it would reject this perfectly legal form.
+      return instance.handle<T>(urlOrOptions);
     }
 
     return instance.handle<T>(options, urlOrOptions);
