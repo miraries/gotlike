@@ -62,11 +62,17 @@ async function measure(
 ): Promise<{latencies: Float64Array; elapsedMs: number; errors: number}> {
   const latencies: number[] = [];
   let errors = 0;
-  let stop = false;
+
+  const startedAt = process.hrtime.bigint();
+  const deadline = startedAt + BigInt(DURATION_MS) * 1_000_000n;
 
   const worker = async () => {
-    while (!stop) {
+    for (;;) {
       const started = process.hrtime.bigint();
+
+      if (started >= deadline) {
+        return;
+      }
 
       try {
         await run(url);
@@ -77,14 +83,7 @@ async function measure(
     }
   };
 
-  const startedAt = process.hrtime.bigint();
-  const timer = setTimeout(() => {
-    stop = true;
-  }, DURATION_MS);
-
   await Promise.all(Array.from({length: concurrency}, worker));
-
-  clearTimeout(timer);
 
   return {
     latencies: Float64Array.from(latencies).sort(),

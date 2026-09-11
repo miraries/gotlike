@@ -377,7 +377,7 @@ test('extend client twice', async () => {
 
   const response = await extClient.get('http://localhost:3000/headers');
 
-  assert(typeof response.body === 'string');
+  assert.ok(typeof response.body === 'string');
   assert.match(response.body, /"foo":"bar"/);
 });
 
@@ -1732,8 +1732,7 @@ test('handlers still see a full response under resolveBodyOnly', async () => {
       async (options, next) => {
         const response = await next(options);
 
-        seen.push(response.timings.phases.total);
-        seen.push(response.statusCode);
+        seen.push(response.timings.phases.total, response.statusCode);
 
         return response;
       },
@@ -2284,11 +2283,11 @@ test('status codes that cannot carry a body are not parsed', async () => {
     assert.strictEqual(json.statusCode, code);
     assert.strictEqual(json.body, undefined, `${code} json body`);
 
-    const text = await client.get(`http://localhost:3000/status-empty?code=${code}`, {
+    const plain = await client.get(`http://localhost:3000/status-empty?code=${code}`, {
       throwHttpErrors: false,
     });
 
-    assert.strictEqual(text.body, '', `${code} text body`);
+    assert.strictEqual(plain.body, '', `${code} text body`);
 
     const buffer = await client.get<Buffer>(`http://localhost:3000/status-empty?code=${code}`, {
       responseType: 'buffer',

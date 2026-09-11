@@ -1,14 +1,43 @@
 # Gotlike
 
 A [got](https://github.com/sindresorhus/got)-shaped HTTP client for node.js, built on
-[undici](https://github.com/nodejs/undici). Includes a nock-like mocking layer, since nock doesn't
+[undici](https://github.com/nodejs/undici). Includes a [nock](https://github.com/nock/nock)-like mocking layer, since nock doesn't
 intercept undici.
 
-ESM, node >= 22.12. CommonJS projects can still `require('gotlike')` - node supports `require()`
-of ESM from 22.12, and named exports destructure as usual:
+ESM, node >= 22.12. CommonJS projects can still `require('gotlike')`
 
-```js
-const { got, Gotlike, RequestError } = require('gotlike');
+## Usage
+
+```ts
+import { Gotlike } from 'gotlike'
+
+// these work as well
+// const {gotlike} = require('gotlike')
+// const {got} = require('gotlike')
+// import got from 'gotlike'
+// import {Got} from 'gotlike'
+// import {gotlike} from 'gotlike'
+
+const gotlike = new Gotlike({ // or gotlike.extend({ ... })
+  prefixUrl: 'https://example.com/api/v1',
+  headers: {
+    'authorization': 'Bearer test',
+  },
+  responseType: 'json',
+})
+
+const response = await gotlike.get('/test')
+
+console.log(response.body)
+```
+
+The client is also callable, like got's export:
+
+```ts
+const response = await gotlike('/test', { responseType: 'json' })
+
+// `new Gotlike(...)` gives the plain, non-callable class;
+// `createClient(...)` gives the callable form.
 ```
 
 ## Motivation
@@ -54,7 +83,6 @@ Supports:
 - [x] Response caching and request deduplication
 - [x] HTTP2 *(over TLS; cleartext h2c needs an `agent`)*
 - [x] Pipelining
-- [ ] HTTP3 - blocked upstream: node has no QUIC, undici has no h3. See below
 - [x] Options validation
 - [x] Callable client - `gotlike(url, options)`
 
@@ -80,7 +108,6 @@ Supports:
 | `timeout.request` | undici arms timeouts on a coarse timer wheel with 1s resolution, so **anything under ~1s behaves as ~1s** |
 | `beforeRedirect`, `beforeRetry` | **cannot delay or cancel** - undici decides both inside a synchronous dispatch interceptor, so a returned promise is not awaited |
 | streamed request bodies | **not replayed across a 307/308**, which must preserve method and body. 301/302/303 are fine (they rewrite to GET and drop the body); non-streamed bodies replay normally |
-| HTTP/3 | not available - see [On HTTP/3](#on-http3) |
 
 ### Smaller surface
 
@@ -151,32 +178,6 @@ gotlike.extend({ agent: new EnvHttpProxyAgent() });
 `agent` takes any undici `Dispatcher`, including one you write yourself. gotlike never looks
 inside it, and its own interceptor chain composes on top - so a new transport needs no changes
 here.
-
-### On HTTP/3
-
-Not implementable today, and not for want of trying:
-
-- **node has no QUIC.** `node:quic` is not a builtin, even behind `--experimental-quic`.
-- **undici has no HTTP/3**, and its connection layer is TCP/TLS-oriented; QUIC is UDP with its own
-  TLS 1.3 integration, stream multiplexing and loss recovery.
-- **the npm ecosystem has no usable h3 client.** `@matrixai/quic` is maintained but is QUIC
-  *transport* only - HTTP/3 also needs h3 framing and QPACK header compression on top. Everything
-  else (`node-quic`, `quiche`, `http3`) was last touched in 2022.
-
-Implementing it here would mean owning a QUIC binding plus an h3/QPACK stack, which is a project in
-itself rather than a feature of an http client wrapper.
-
-The upside of the `agent` seam is that this stays a one-line change whenever an h3 dispatcher does
-exist, from undici or anyone else:
-
-```ts
-gotlike.extend({ agent: new SomeHttp3Dispatcher() });
-```
-
-Worth checking whether it would buy anything first: HTTP/3's wins are largely connection setup and
-lossy networks. Server-to-server calls to a fixed set of upstreams over warm keep-alive connections
-- which is what this client is for - see much less from it, and UDP in userspace can cost more than
-it saves.
 
 ## Hooks
 
@@ -370,40 +371,6 @@ Benchmarking clients in one process is noisier than it looks: whichever runs fir
 sockets and leaves a cold JIT for the rest, which alone produced a ~25% swing. The runner rotates
 client order across several rounds and reports each client's median round. Tunable with
 `BENCH_DURATION`, `BENCH_ROUNDS`, `BENCH_WARMUP`, `BENCH_CONCURRENCY` and `BENCH_SERVER=http`.
-
-## Usage
-
-```ts
-import { Gotlike } from 'gotlike'
-
-// these work as well
-// const {gotlike} = require('gotlike')
-// const {got} = require('gotlike')
-// import got from 'gotlike'
-// import {Got} from 'gotlike'
-// import {gotlike} from 'gotlike'
-
-const gotlike = new Gotlike({ // or gotlike.extend({ ... })
-  prefixUrl: 'https://example.com/api/v1',
-  headers: {
-    'authorization': 'Basic test:test',
-  },
-  responseType: 'json',
-})
-
-const response = await gotlike.get('/test')
-
-console.log(response.body)
-```
-
-The client is also callable, like got's export:
-
-```ts
-const response = await gotlike('/test', { responseType: 'json' })
-
-// `new Gotlike(...)` gives the plain, non-callable class;
-// `createClient(...)` gives the callable form.
-```
 
 ## Options validation
 
