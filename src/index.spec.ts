@@ -1563,6 +1563,54 @@ test('form does not override an explicit content-type, and json wins over form',
   assert.strictEqual(both.body.headers['content-type'], 'application/json');
 });
 
+test('query method sends the QUERY verb and optional request payload', async () => {
+  const withJson = await client.query<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+    json: {search: 'term'},
+  });
+
+  assert.strictEqual(withJson.body.method, 'QUERY');
+  assert.strictEqual(withJson.body.body, '{"search":"term"}');
+
+  const withoutBody = await client.query<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+  });
+
+  assert.strictEqual(withoutBody.body.method, 'QUERY');
+  assert.strictEqual(withoutBody.body.body, '');
+});
+
+test('query method supports resolveBodyOnly', async () => {
+  const body = await client.query<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+    json: {q: 'only-body'},
+    resolveBodyOnly: true,
+  });
+
+  assert.strictEqual(body.method, 'QUERY');
+  assert.strictEqual(body.body, '{"q":"only-body"}');
+});
+
+test('validation accepts method: "QUERY"', async () => {
+  const response = await client<Echo>('http://localhost:3000/echo', {
+    method: 'QUERY',
+    responseType: 'json',
+    json: {customMethod: true},
+  });
+
+  assert.strictEqual(response.body.method, 'QUERY');
+  assert.strictEqual(response.body.body, '{"customMethod":true}');
+});
+
+test('stream accepts a request body written to duplex with method QUERY', async () => {
+  const duplex = await client.stream('http://localhost:3000/echo', {method: 'QUERY'});
+  duplex.end('query-payload');
+
+  const echo = JSON.parse(await text(duplex)) as Echo;
+  assert.strictEqual(echo.method, 'QUERY');
+  assert.strictEqual(echo.body, 'query-payload');
+});
+
 test('dnsCache resolves through a cached lookup', async () => {
   let lookups = 0;
 
@@ -3168,6 +3216,7 @@ async function typeAssertions() {
   expectType<Thing>()((await client.get<Thing>('u')).body);
   expectType<Thing>()((await client<Thing>('u')).body);
   expectType<Thing>()((await client.post<Thing>('u', {json: {a: 1}})).body);
+  expectType<Thing>()((await client.query<Thing>('u', {json: {a: 1}})).body);
   expectType<Thing>()((await client.extend({prefixUrl: 'p'}).get<Thing>('u')).body);
   expectType<Thing>()((await new Gotlike({prefixUrl: 'p'}).get<Thing>('u')).body);
   expectType<Thing>()((await createClient({prefixUrl: 'p'}).get<Thing>('u')).body);

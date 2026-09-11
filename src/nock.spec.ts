@@ -457,3 +457,28 @@ test('done throws while the scope has interceptors left', async () => {
 
   scope.done();
 });
+
+test('nock supports the QUERY method with body matching', async () => {
+  nock('http://mock.test')
+    .query('/search', '{"query":"test"}')
+    .reply(200, {results: [1, 2]});
+
+  const response = await json.query<{results: number[]}>('http://mock.test/search', {
+    json: {query: 'test'},
+  });
+
+  assert.deepStrictEqual(response.body, {results: [1, 2]});
+});
+
+test('nock scope.query allows chaining interceptor.query for URL query params', async () => {
+  nock('http://mock.test')
+    .query('/items')
+    .query({filter: 'active'})
+    .reply(200, {items: ['a']});
+
+  const response = await json.query<{items: string[]}>('http://mock.test/items', {
+    searchParams: {filter: 'active'},
+  });
+
+  assert.deepStrictEqual(response.body, {items: ['a']});
+});

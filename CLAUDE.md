@@ -48,7 +48,7 @@ Three source files, all in `src/`:
 
 ### Request pipeline
 
-`get`/`post`/`put`/`patch`/`delete`/`stream` are thin wrappers that set `url`/`method` and call `handle()`.
+`get`/`post`/`put`/`patch`/`delete`/`query`/`stream` are thin wrappers that set `url`/`method` and call `handle()`.
 
 `handle()` calls `formOptions()` — one spread of `{...baseOptions, ...options}` into a **fresh** object, with
 `headers` and `context` merged one level deep — then either runs the handler chain or goes straight to `call()`.
@@ -339,7 +339,7 @@ There are **two** stream paths, and which one runs depends on whether the reques
 - **anything else** → `callStream`, via `undici.pipeline`, returning a `Duplex` whose writable half is the
   request body.
 
-The split is on `bodyMethods` (`POST`/`PUT`/`PATCH`/`DELETE`), which `BodyMethod` is derived from so the list
+The split is on `bodyMethods` (`POST`/`PUT`/`PATCH`/`DELETE`/`QUERY`), which `BodyMethod` is derived from so the list
 and the type can't drift. It used to test `method === 'GET' || 'HEAD'`, which put every other bodyless method —
 `OPTIONS`, and anything on a client with no `method` in its base options — on the pipeline path, where nothing
 ends the writable half and `undici.pipeline` never sends the request at all. That hung forever.

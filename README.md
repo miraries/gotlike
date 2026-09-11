@@ -407,7 +407,7 @@ await api.get('/x', { responseType: 'text' })  // Response<string> - the call st
 
 A client-level `resolveBodyOnly: true` carries through the same way.
 
-The same overloads are on `post`/`put`/`patch`/`delete`, on the callable form
+The same overloads are on `post`/`put`/`patch`/`delete`/`query`, on the callable form
 (`gotlike<User>('/x')`) and on `handle`.
 
 `Response` itself is not a tagged union over `responseType` - there is nothing on `Response<T>` to

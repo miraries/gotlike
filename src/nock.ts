@@ -458,6 +458,10 @@ class Scope {
     return this.#verb('OPTIONS', path, body, options);
   }
 
+  query(path: PathMatcher, body?: BodyMatcher, options?: Options) {
+    return this.#verb('QUERY', path, body, options);
+  }
+
   /**
    * True once every interceptor registered on this scope has been consumed.
    *

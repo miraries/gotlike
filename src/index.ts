@@ -1101,7 +1101,7 @@ const defaultOptions = {
 } satisfies RequestOptions;
 
 const responseTypes = ['text', 'json', 'buffer'];
-const httpMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'TRACE', 'CONNECT'];
+const httpMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS', 'TRACE', 'CONNECT', 'QUERY'];
 
 /**
  * The methods `stream()` hands a writable half to. `BodyMethod` is derived from this list, so
@@ -1111,7 +1111,7 @@ const httpMethods = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS',
  * the request until the writable side ends, and for a method the caller can't write to there
  * would be nothing to end it.
  */
-const bodyMethods = ['POST', 'PUT', 'PATCH', 'DELETE'] as const;
+const bodyMethods = ['POST', 'PUT', 'PATCH', 'DELETE', 'QUERY'] as const;
 
 function isBodyMethod(method?: string): boolean {
   return bodyMethods.includes(method as BodyMethod);
@@ -2367,6 +2367,18 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   patch<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
   patch<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'PATCH');
+  }
+
+  query(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  query(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  query(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  query(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
+  query(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  query(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
+  query<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
+  query<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  query<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
+    return this.handle<T>(options, url, 'QUERY');
   }
 }
 
