@@ -860,17 +860,44 @@ export type GotlikeUploadStream = GotlikeStream & Duplex;
  * else falls through to the caller's `T` - so `get<Thing>(url)` still reads as it does in got.
  */
 
-/** No `responseType`, or an explicit `text`: the body is a string. */
-export type TextCall = RequestOptions & {responseType?: 'text'};
+/** An explicit `responseType: 'text'`: the body is a string. */
+export type TextCall = RequestOptions & {responseType: 'text'};
 
 /** `responseType: 'buffer'`: the body is a Node `Buffer`. */
 export type BufferCall = RequestOptions & {responseType: 'buffer'};
+
+/** A call that names no `responseType`, so the client's own setting decides the body type. */
+export type InheritCall = RequestOptions & {responseType?: undefined};
 
 /** Resolves with the whole `Response`. */
 export type WholeResponse = {resolveBodyOnly?: false};
 
 /** Resolves with the body alone. */
 export type BodyOnly = {resolveBodyOnly: true};
+
+/**
+ * The body type a client's own `responseType` implies, for a call that doesn't name one.
+ * `json` lands on `unknown` rather than `any`, so it still has to be narrowed somewhere.
+ */
+export type ClientBody<O> = O extends {responseType: 'json'}
+  ? unknown
+  : O extends {responseType: 'buffer'}
+    ? Buffer
+    : string;
+
+/** A whole `Response`, or the bare body when the *client* was built with `resolveBodyOnly`. */
+export type ClientResult<O, Body> = O extends {resolveBodyOnly: true} ? Body : Response<Body>;
+
+/**
+ * The client options that change what a call resolves to when the call itself stays quiet.
+ * Threaded through `extend()` so an extended client keeps reporting the right body type -
+ * without it, `extend({responseType: 'json'}).get(url)` claimed `Response<string>` while
+ * handing back a parsed object.
+ */
+export type ClientOptions = RequestOptions;
+
+/** `extend()`'s merge, at the type level: the extension wins, key by key. */
+export type MergeClientOptions<Base, Extension> = Omit<Base, keyof Extension> & Extension;
 
 export type Response<T = any> = {
   /**
@@ -1167,7 +1194,7 @@ export function validateOptions(options: RequestOptions, atCreation: boolean): v
   }
 }
 
-export class Gotlike {
+export class Gotlike<O extends ClientOptions = ClientOptions> {
   /** The client defaults, with `defaultOptions` already folded in - never undefined. */
   baseOptions: RequestOptions;
 
@@ -1216,7 +1243,7 @@ export class Gotlike {
   #composedFrom?: Dispatcher;
   #composed?: Dispatcher;
 
-  constructor(options?: RequestOptions) {
+  constructor(options?: O) {
     if (options) {
       validateOptions(options, true);
     }
@@ -2061,10 +2088,10 @@ export class Gotlike {
     return this.call<T>(merged);
   }
 
-  extend(options: RequestOptions) {
+  extend<E extends RequestOptions>(options: E): Gotlike<MergeClientOptions<O, E>> {
     const base = this.baseOptions;
 
-    return new Gotlike({
+    return new Gotlike<MergeClientOptions<O, E>>({
       ...base,
       ...options,
       // Case-insensitively, like the per-request merge: extending with `Authorization` must
@@ -2074,7 +2101,7 @@ export class Gotlike {
       // Handlers and hooks accumulate, so an extended client keeps the parent's.
       handlers: concatHooks(base?.handlers, options.handlers),
       hooks: mergeHooks(base?.hooks, options.hooks),
-    });
+    } as MergeClientOptions<O, E>);
   }
 
   /**
@@ -2089,52 +2116,62 @@ export class Gotlike {
     return this.handle({...options, isStream: true}, url) as unknown as Promise<GotlikeStream>;
   }
 
-  get(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  get(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  get(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  get(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
   get(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  get(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  get(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
   get(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   get<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  get<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  get<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
   get<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'GET');
   }
 
-  post(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  post(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  post(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  post(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
   post(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  post(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  post(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
   post(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   post<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  post<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  post<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
   post<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'POST');
   }
 
-  delete(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  delete(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  delete(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  delete(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
   delete(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  delete(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  delete(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
   delete(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   delete<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  delete<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  delete<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
   delete<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'DELETE');
   }
 
-  put(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  put(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  put(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  put(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
   put(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  put(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  put(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
   put(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   put<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  put<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  put<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
   put<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'PUT');
   }
 
-  patch(url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+  patch(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  patch(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  patch(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
   patch(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  patch(url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  patch(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
   patch(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   patch<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  patch<T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  patch<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
   patch<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'PATCH');
   }
@@ -2144,19 +2181,21 @@ export class Gotlike {
  * A client that can also be called directly - `client(url, options)` - the way got's export
  * can, while keeping every method and field of the underlying `Gotlike`.
  */
-export type CallableClient = Omit<Gotlike, 'extend'> & {
-  (url: string | URL, options?: TextCall & WholeResponse): Promise<Response<string>>;
+export type CallableClient<O extends ClientOptions = ClientOptions> = Omit<Gotlike<O>, 'extend'> & {
+  (url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  (url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  (url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
   (url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  (url: string | URL, options: BufferCall & WholeResponse): Promise<Response<Buffer>>;
+  (url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
   (url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   <T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  <T>(url: string | URL, options?: RequestOptions): Promise<Response<T>>;
+  <T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
   /**
    * `Gotlike` is `Omit`ted of `extend` above on purpose: an intersection merges call
    * signatures into an overload set, and `Gotlike['extend']` would win and type an extended
    * client as a plain, non-callable `Gotlike`.
    */
-  extend(options: RequestOptions): CallableClient;
+  extend<E extends RequestOptions>(options: E): CallableClient<MergeClientOptions<O, E>>;
 };
 
 /**
@@ -2168,10 +2207,10 @@ export type CallableClient = Omit<Gotlike, 'extend'> & {
  *
  * All of this happens once per client; the per-request path is untouched.
  */
-function asCallable(instance: Gotlike): CallableClient {
+function asCallable<O extends ClientOptions>(instance: Gotlike<O>): CallableClient<O> {
   const callable = function callableClient<T>(url: string | URL, options: RequestOptions = {}) {
     return instance.handle<T>(options, url);
-  } as unknown as CallableClient;
+  } as unknown as CallableClient<O>;
 
   for (const key of Object.getOwnPropertyNames(Gotlike.prototype)) {
     if (key === 'constructor') {
@@ -2204,15 +2243,15 @@ function asCallable(instance: Gotlike): CallableClient {
     });
   }
 
-  // An extended client stays callable.
-  callable.extend = (options: RequestOptions) => asCallable(instance.extend(options));
+  // An extended client stays callable, and carries the merged options in its type.
+  callable.extend = <E extends RequestOptions>(options: E) => asCallable(instance.extend<E>(options));
 
   return callable;
 }
 
 /** Create a callable client. `new Gotlike(options)` gives the plain, non-callable form. */
-export function createClient(options?: RequestOptions): CallableClient {
-  return asCallable(new Gotlike(options));
+export function createClient<O extends ClientOptions = ClientOptions>(options?: O): CallableClient<O> {
+  return asCallable(new Gotlike<O>(options));
 }
 
 /**

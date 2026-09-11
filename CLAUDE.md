@@ -481,12 +481,23 @@ opt-in default already gets the whole saving with no correctness risk.
 
 ### Response body typing
 
-`Response` can't be a tagged union over `responseType` — the value that settles the body type may
-come from the client rather than the call, so there is nothing on `Response<T>` to key it on. The
-**call site** pins it instead, through overloads on every verb, on `handle()` and on the callable
-form: `TextCall`/`BufferCall` resolve the body to `string`/`Buffer`, `WholeResponse`/`BodyOnly`
-choose between `Response<T>` and a bare `T`, and anything else falls through to the caller's `T`
-so `get<Thing>(url)` reads exactly as it does in got.
+`Response` can't be a tagged union over `responseType` — there is nothing on `Response<T>` to key it
+on. Two things settle the body type instead, and both are needed:
+
+- **The call**, through overloads on every verb, on `handle()` and on the callable form.
+  `TextCall`/`BufferCall` resolve the body to `string`/`Buffer`, `BodyOnly`/`WholeResponse` choose
+  between a bare `T` and a `Response<T>`, and an explicit `<T>` always wins — so `get<Thing>(url)`
+  reads exactly as it does in got.
+- **The client**, through `Gotlike<O extends ClientOptions>`, threaded by `extend()` via
+  `MergeClientOptions<O, E>` and read by `ClientBody<O>` / `ClientResult<O, Body>`. got does the
+  same thing (`DefaultResponseBodyType<U>` in its `types.d.ts`), and without it
+  `extend({responseType: 'json'}).get(url)` claims `Response<string>` while handing back a parsed
+  object. A client-level `resolveBodyOnly: true` is carried the same way.
+
+`InheritCall` is the overload arm for a call that names no `responseType` — that is what defers to
+the client. It has to be `{responseType?: undefined}` rather than an optional `'text'`: got's
+equivalent arm accepts an absent-or-text `responseType`, which is why `jsonClient.get(url, {})`
+loses the client's setting in got but not here.
 
 `resolveBodyOnly` used to be typed as returning `Response<T>` while returning the body at runtime —
 a straight lie in the types. The `BodyOnly` overloads are what fix it, which is why the
@@ -494,7 +505,9 @@ implementation signatures return `Promise<any>`.
 
 The overload set is asserted at the bottom of `index.spec.ts` (`typeAssertions`), which is never
 invoked — type stripping doesn't check types, so those assertions are enforced by
-`npm run typecheck`, not by `npm test`.
+`npm run typecheck`, not by `npm test`. Keeping a generic `<T>(url, options?)` arm in the set is
+what keeps an extended client assignable to a plain `Got`-typed field; drop it and
+`const c: Got = gotlike.extend({responseType: 'json'})` stops compiling.
 
 ## Public API surface
 

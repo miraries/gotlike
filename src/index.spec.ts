@@ -2808,6 +2808,26 @@ async function typeAssertions() {
   expectType<Thing>()((await new Gotlike({prefixUrl: 'p'}).get<Thing>('u')).body);
   expectType<Thing>()((await createClient({prefixUrl: 'p'}).get<Thing>('u')).body);
 
+  // An extended client's own `responseType` settles the body type for calls that stay quiet,
+  // the way got's does - this used to claim `Response<string>` while handing back an object.
+  const jsonClient = client.extend({responseType: 'json'});
+  const bufferClient = client.extend({responseType: 'buffer'});
+  const bodyOnlyClient = client.extend({responseType: 'json', resolveBodyOnly: true});
+
+  expectType<unknown>()((await jsonClient.get('u')).body);
+  expectType<unknown>()((await jsonClient.get('u', {})).body);
+  expectType<unknown>()((await jsonClient.get('u', {prefixUrl: 'p'})).body);
+  expectType<Buffer>()((await bufferClient.get('u')).body);
+  expectType<Thing>()((await jsonClient.get<Thing>('u')).body);
+  expectType<unknown>()(await jsonClient.get('u', {resolveBodyOnly: true}));
+  expectType<Thing>()(await bodyOnlyClient.get<Thing>('u'));
+  expectType<unknown>()(await bodyOnlyClient.get('u'));
+  // An explicit per-call `responseType` still wins over the client's.
+  expectType<string>()((await jsonClient.get('u', {responseType: 'text'})).body);
+  // ...and it survives another extend.
+  expectType<unknown>()((await jsonClient.extend({prefixUrl: 'p'}).get('u')).body);
+  expectType<string>()((await jsonClient.extend({responseType: 'text'}).get('u')).body);
+
   // `responseType` settles it when the caller doesn't.
   expectType<string>()((await client.get('u')).body);
   expectType<string>()((await client.get('u', {responseType: 'text'})).body);

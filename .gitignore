@@ -7,3 +7,6 @@ yarn.lock
 dist
 node_modules
 .claude/worktrees/
+
+# stray tsc output - declarations belong in dist/
+src/*.d.ts

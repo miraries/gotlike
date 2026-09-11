@@ -367,11 +367,24 @@ await gotlike.get<User>('/x', { resolveBodyOnly: true })   // User
 await gotlike.get('/x', { resolveBodyOnly: true })         // string
 ```
 
-The same overloads are on `post`/`put`/`patch`/`delete`, on the callable form
-(`gotlike<User>('/x')`) and on `handle`, and they survive `extend()`.
+A client's own `responseType` carries through `extend()`, so calls that say nothing still get
+the right body type:
 
-`Response` itself is not a tagged union over `responseType`: the value that settles the body type
-may come from the client rather than the call, so there is nothing on `Response<T>` to key it on.
+```ts
+const api = gotlike.extend({ prefixUrl, responseType: 'json' })
+
+await api.get('/x')              // Response<unknown> - narrow it, or pass the type
+await api.get<User>('/x')        // Response<User>
+await api.get('/x', { responseType: 'text' })  // Response<string> - the call still wins
+```
+
+A client-level `resolveBodyOnly: true` carries through the same way.
+
+The same overloads are on `post`/`put`/`patch`/`delete`, on the callable form
+(`gotlike<User>('/x')`) and on `handle`.
+
+`Response` itself is not a tagged union over `responseType` - there is nothing on `Response<T>` to
+key it on. The client type carries it instead, which is also what got does.
 
 ## Benchmark
 
