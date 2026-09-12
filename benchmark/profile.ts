@@ -1,7 +1,6 @@
 import {Session} from 'node:inspector/promises';
 import {writeFile} from 'node:fs/promises';
 import path from 'node:path';
-import {fileURLToPath} from 'node:url';
 import {Agent, setGlobalDispatcher} from 'undici';
 import {Gotlike} from '../dist/index.js';
 import {startServer, profile10Payload} from './server.ts';
@@ -32,7 +31,7 @@ const WARMUP_MS = Number(process.env.PROFILE_WARMUP ?? 500);
 const CONCURRENCY = Number(process.env.PROFILE_CONCURRENCY ?? 20);
 const SAMPLING_INTERVAL_US = Number(process.env.PROFILE_INTERVAL ?? 50);
 
-const outDir = path.dirname(fileURLToPath(import.meta.url));
+const outDir = import.meta.dirname;
 
 type Scenario = {
   name: string;

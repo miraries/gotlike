@@ -602,11 +602,11 @@ function countDeadlines(delay: number): {armed: () => number; pending: () => num
     return handle;
   }) as typeof globalThis.setTimeout;
 
-  globalThis.clearTimeout = ((handle: Parameters<typeof globalThis.clearTimeout>[0]) => {
+  globalThis.clearTimeout = (handle: Parameters<typeof globalThis.clearTimeout>[0]) => {
     live.delete(handle);
 
     return realClearTimeout(handle);
-  }) as typeof globalThis.clearTimeout;
+  };
 
   return {
     // Asserted alongside `pending`, so reverting to an uncancellable `AbortSignal.timeout` -
@@ -788,9 +788,9 @@ test('extend does not let a child share the parent’s handlers, hooks or contex
   assert.deepStrictEqual(child.baseOptions.hooks?.beforeRequest, [parentHook]);
   assert.deepStrictEqual(child.baseOptions.context, {tenant: 'parent'});
 
-  child.baseOptions.handlers!.push((options, next) => next(options));
-  child.baseOptions.hooks!.beforeRequest!.push(() => undefined);
-  child.baseOptions.context!.tenant = 'child';
+  child.baseOptions.handlers.push((options, next) => next(options));
+  child.baseOptions.hooks.beforeRequest.push(() => undefined);
+  child.baseOptions.context.tenant = 'child';
 
   assert.strictEqual(parent.baseOptions.handlers!.length, 1);
   assert.strictEqual(parent.baseOptions.hooks!.beforeRequest!.length, 1);
@@ -1815,10 +1815,10 @@ test('responseType buffer resolves to a real Buffer', async () => {
 });
 
 test('resolveBodyOnly with a buffer returns the Buffer itself', async () => {
-  const body = (await client.get<Buffer>('http://localhost:3000/png', {
+  const body = await client.get<Buffer>('http://localhost:3000/png', {
     responseType: 'buffer',
     resolveBodyOnly: true,
-  })) as unknown as Buffer;
+  });
 
   assert.ok(Buffer.isBuffer(body));
 });
@@ -2360,7 +2360,7 @@ test('handlers still see a full response under resolveBodyOnly', async () => {
 
   const body = (await extClient.get('http://localhost:3000/json', {
     resolveBodyOnly: true,
-  })) as unknown as {test: string};
+  })) as {test: string};
 
   assert.strictEqual(seen.length, 2);
   assert.strictEqual(typeof seen[0], 'number');
@@ -2386,7 +2386,7 @@ test('afterResponse hooks see a full response under resolveBodyOnly', async () =
 
   const body = (await extClient.get('http://localhost:3000/json', {
     resolveBodyOnly: true,
-  })) as unknown as {test: string};
+  })) as {test: string};
 
   assert.strictEqual(statusCode, 200);
   assert.deepStrictEqual(body, {test: 'value'});
@@ -2415,10 +2415,10 @@ test('a called client defaults to GET and honours instance options', async () =>
 });
 
 test('the ThumbnailService shape works: callable + buffer + resolveBodyOnly', async () => {
-  const body = (await client<Buffer>('http://localhost:3000/png', {
+  const body = await client<Buffer>('http://localhost:3000/png', {
     responseType: 'buffer',
     resolveBodyOnly: true,
-  })) as unknown as Buffer;
+  });
 
   assert.ok(Buffer.isBuffer(body));
   assert.strictEqual(body.subarray(1, 4).toString(), 'PNG');
@@ -2467,7 +2467,11 @@ test('a callable client forwards fields that were left unset at construction', a
   const agent = new Agent();
 
   for (const key of ['ownAgent', 'retryOptions', 'decompressOptions'] as const) {
-    assert.ok(Object.getOwnPropertyDescriptor(callable, key)?.get, `${key} should forward to the instance`);
+    assert.strictEqual(
+      typeof Object.getOwnPropertyDescriptor(callable, key)?.get,
+      'function',
+      `${key} should forward to the instance`,
+    );
   }
 
   callable.ownAgent = agent;
@@ -4485,6 +4489,8 @@ test('a beforeRequest hook throwing a non-Error still fails as a RequestError', 
     hooks: {
       beforeRequest: [
         () => {
+          // The non-Error throw is what the test is about.
+          // oxlint-disable-next-line no-throw-literal, typescript/only-throw-error
           throw 'plain string failure';
         },
       ],
@@ -4514,7 +4520,8 @@ test('a beforeRequest hook throwing null still fails as a RequestError', async (
     hooks: {
       beforeRequest: [
         () => {
-          // eslint-disable-next-line no-throw-literal
+          // The non-Error throw is what the test is about.
+          // oxlint-disable-next-line no-throw-literal, typescript/only-throw-error
           throw null;
         },
       ],
@@ -4605,6 +4612,8 @@ test('a failed upload stream still reports on its response promise', async () =>
 // `for...in` walks the prototype chain, so anything adding an enumerable property to
 // `Object.prototype` failed every request with `Unknown option`.
 test('validation ignores inherited enumerable properties', async () => {
+  // Writing to `Object.prototype` is the whole point here - it is what the offending library did.
+  // oxlint-disable-next-line no-extend-native
   Object.defineProperty(Object.prototype, 'injectedBySomeLibrary', {
     value: 'x',
     enumerable: true,

@@ -178,7 +178,7 @@ function bodyValueMatches(expected: unknown, actual: unknown): boolean {
     }
 
     const expectedKeys = Object.keys(expected);
-    const actualKeys = Object.keys(actual as object);
+    const actualKeys = Object.keys(actual);
 
     // Exact, as nock's object body matching is: every field named and nothing besides -
     // and the field has to be *there*. Reading it and comparing was not the same thing:
@@ -188,7 +188,7 @@ function bodyValueMatches(expected: unknown, actual: unknown): boolean {
       expectedKeys.length === actualKeys.length &&
       expectedKeys.every(
         (key) =>
-          Object.hasOwn(actual as object, key) &&
+          Object.hasOwn(actual, key) &&
           bodyValueMatches((expected as Record<string, unknown>)[key], (actual as Record<string, unknown>)[key]),
       )
     );
@@ -203,7 +203,7 @@ function bodyValueMatches(expected: unknown, actual: unknown): boolean {
  */
 function toBodyMatcher(body?: BodyMatcher): string | RegExp | ((body: string) => boolean) | undefined {
   if (body === null || body === undefined || typeof body !== 'object' || body instanceof RegExp) {
-    return body as string | RegExp | undefined;
+    return body;
   }
 
   // A Buffer/Uint8Array is an object too, and would otherwise fall into the JSON matcher below -
@@ -683,11 +683,7 @@ class Interceptor {
     return this.#applyScopeOptions(
       // `=== undefined`, not `??`: `reply(200, null)` means a body of `null`, and coercing it
       // to `''` turned a mocked null response into a parse failure.
-      interceptor.reply(
-        responseCodeOrFunction,
-        (body === undefined ? '' : body) as any,
-        replyOptions(body, headers) as any,
-      ),
+      interceptor.reply(responseCodeOrFunction, (body === undefined ? '' : body) as any, replyOptions(body, headers)),
     );
   }
 
@@ -705,7 +701,7 @@ class Interceptor {
         return {
           statusCode,
           data: (data === undefined ? '' : data) as any,
-          responseOptions: replyOptions(data, replyHeaders) as any,
+          responseOptions: replyOptions(data, replyHeaders),
         };
       }),
     );

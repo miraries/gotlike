@@ -34,7 +34,35 @@
     "no-underscore-dangle": "off",
     "unicorn/escape-case": "off",
     "unicorn/no-hex-escape": "off",
-    "max-depth": "off"
+    "max-depth": "off",
+    "typescript/no-floating-promises": [
+      "error",
+      {
+        "allowForKnownSafeCalls": [
+          {
+            "from": "package",
+            "package": "node:test",
+            "name": ["test", "describe", "it", "suite", "before", "after", "beforeEach", "afterEach"]
+          }
+        ]
+      }
+    ],
+    "typescript/prefer-readonly-parameter-types": "off",
+    "typescript/no-unsafe-type-assertion": "off",
+    "typescript/no-unsafe-assignment": "off",
+    "typescript/no-unsafe-member-access": "off",
+    "typescript/no-unsafe-call": "off",
+    "typescript/no-unsafe-argument": "off",
+    "typescript/no-unsafe-return": "off",
+    "typescript/strict-boolean-expressions": "off",
+    "typescript/no-unnecessary-type-conversion": "off",
+    "typescript/no-confusing-void-expression": "off",
+    "typescript/strict-void-return": "off",
+    "typescript/prefer-nullish-coalescing": "off",
+    "typescript/prefer-promise-reject-errors": "off",
+    "typescript/no-unnecessary-type-arguments": "off",
+    "typescript/no-unnecessary-type-parameters": "off",
+    "typescript/require-await": "off"
   },
   "ignorePatterns": [
     "**/dist/**",

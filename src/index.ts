@@ -729,7 +729,7 @@ function mergeSearchParams(base: SearchParams, override: SearchParams): URLSearc
  * `a=%5Bobject+Object%5D` - a wrong query string, sent without complaint. got rejects the same
  * input; one `typeof` per value is nothing against the request it is about to make.
  */
-function queryValue(key: string, value: unknown): string {
+function queryValue(key: string, value: QueryValue | readonly QueryValue[]): string {
   if (typeof value === 'object') {
     invalid(`\`${key}\` must be a string, number, boolean or an array of those, got an object`);
   }
@@ -1472,7 +1472,7 @@ function makeStreamClient(instance: Gotlike<any>): StreamClient {
     instance.handle({...options, isStream: true}, url)) as unknown as StreamClient;
 
   for (const verb of streamVerbs) {
-    const method = verb.toUpperCase() as Dispatcher.HttpMethod;
+    const method = verb.toUpperCase();
 
     // Through an index signature: `stream[verb]` with `verb` a union of the eight names asks
     // TypeScript to satisfy all eight return types with one function. The declared
