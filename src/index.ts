@@ -2859,6 +2859,18 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-type')) {
         delete merged.headers['content-type'];
       }
+
+      // `content-length` describes the replaced body just as `content-type` does, and an
+      // explicit one set for the first attempt survived the merge. undici validates a
+      // caller-supplied `content-length` against the body it is about to send
+      // (`strictContentLength`, on by default) and fails the dispatch outright, so a retry
+      // with a body of a different length died as an opaque `ERR_REQUEST_ERROR` whose real
+      // cause was a header left over from the previous attempt. Dropping it lets undici
+      // derive the length from the new body, which is what it does for every request that
+      // does not name one.
+      if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-length')) {
+        delete merged.headers['content-length'];
+      }
     }
 
     // Always a fresh object, for the same reason `headers` is: without it the retry shares

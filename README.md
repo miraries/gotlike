@@ -230,7 +230,9 @@ used exactly as written, so a signed query survives; a relative one is resolved 
 
 To change the body from a hook, **write `options.body`** - `json` and `form` have already been serialised into it
 by the time hooks run, as they have in got, so assigning `options.json` there has no effect. `content-length` is
-re-derived from whatever `options.body` ends up as.
+re-derived from whatever `options.body` ends up as - unless you set one explicitly, in which case it is yours to
+keep in step: undici checks an explicit `content-length` against the body it is about to send and fails the
+request on a mismatch.
 
 `beforeError` runs for streamed requests too - for *every* stream failure, not just an error status
 - and a stream's `HTTPError` carries the same `error.response` a non-streamed one does.

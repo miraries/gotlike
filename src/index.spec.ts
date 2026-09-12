@@ -3486,6 +3486,66 @@ test('an afterResponse retry keeps a content-type the hook set itself', async ()
   assert.strictEqual(response.body.headers['content-type'], 'application/xml');
 });
 
+/*
+ * An explicit `content-length` describes the replaced body just as `content-type` does. undici
+ * validates a caller-supplied one against the body it is about to send and fails the dispatch
+ * with `UND_ERR_REQ_CONTENT_LENGTH_MISMATCH`, so the stale header turned a retry with a
+ * differently sized body into an opaque `ERR_REQUEST_ERROR`.
+ */
+test('an afterResponse retry drops a stale content-length with the body it described', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.request.options.context.retried) {
+            return response;
+          }
+
+          return retryWithMergedOptions({context: {retried: true}, body: 'a much longer body'});
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://localhost:3000/echo', {
+    body: 'short',
+    headers: {'content-length': '5'},
+  });
+
+  assert.strictEqual(response.body.body, 'a much longer body');
+  assert.strictEqual(response.body.headers['content-length'], String('a much longer body'.length));
+});
+
+test('an afterResponse retry keeps a content-length the hook set itself', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.request.options.context.retried) {
+            return response;
+          }
+
+          return retryWithMergedOptions({
+            context: {retried: true},
+            body: 'a much longer body',
+            headers: {'Content-Length': '18'},
+          });
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://localhost:3000/echo', {
+    body: 'short',
+    headers: {'content-length': '5'},
+  });
+
+  assert.strictEqual(response.body.body, 'a much longer body');
+  assert.strictEqual(response.body.headers['content-length'], '18');
+});
+
 test('an afterResponse retry that names no body keeps the first attempt’s', async () => {
   const extClient = client.extend({
     responseType: 'json',

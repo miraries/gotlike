@@ -282,6 +282,15 @@ applies to the client defaults via `baseHasBody` — and the stale `content-type
 it, unless the hook set a `content-type` itself. A hook that names *no* body keeps the first attempt's body and
 content-type, which is what a token refresh wants.
 
+**An explicit `content-length` goes with it, for the same reason and under the same conditions.** It describes the
+body being replaced just as `content-type` does, but fails louder: undici validates a caller-supplied
+`content-length` against the body it is about to send (`strictContentLength`, on by default) and errors the
+dispatch rather than recomputing it, so a first attempt that set one and a retry that swapped in a body of a
+different length died as an opaque `ERR_REQUEST_ERROR` (`UND_ERR_REQ_CONTENT_LENGTH_MISMATCH` on `cause`) whose
+real cause was a header left over from the previous attempt. Dropped unless the hook set a `content-length`
+itself. Note that undici's check applies to a `beforeRequest` hook rewriting `options.body` too — nothing here
+re-derives a length the caller wrote by hand, and the README says so.
+
 It is also **bounded** (`maxAfterResponseRetries`, 20), tracked through a symbol key on the options so option
 spreads carry it while `for...in` validation and `Object.keys` never see it. A hook that always retries on a
 status it never stops seeing — an auth refresh that silently fails — used to recurse until the process died.
