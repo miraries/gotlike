@@ -545,6 +545,14 @@ test('a Buffer body matcher does not match different bytes', async () => {
   assertUnmatched(missed, 'different bytes should not match a Buffer body matcher');
 });
 
+test('a Buffer body matcher does not match a bodyless request', async () => {
+  nock('http://mock.test').post('/upload-nobody', Buffer.from('binary-data')).reply(200, 'matched');
+
+  const missed = await failure(client.post('http://mock.test/upload-nobody'));
+
+  assertUnmatched(missed, 'a request with no body should not match a Buffer body matcher');
+});
+
 test('registering a query-carrying path alongside .query() does not throw', () => {
   assert.doesNotThrow(() => {
     nock('http://mock.test').get('/search?type=user').query({q: 'test'}).reply(200, 'matched');
@@ -565,6 +573,17 @@ test('a query-carrying path combined with .query() rejects a request missing eit
   const missed = await failure(client.get('http://mock.test/search-partial', {searchParams: {type: 'user'}}));
 
   assertUnmatched(missed, "the path's own query param is required alongside .query()'s");
+});
+
+test('a repeated key in a query-carrying path still matches under a chained .query(fn)', async () => {
+  nock('http://mock.test')
+    .get('/search-tags?tag=a&tag=b')
+    .query(() => true)
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/search-tags', {searchParams: {tag: ['a', 'b']}});
+
+  assert.strictEqual(response.body, 'matched');
 });
 
 test('cleanAll removes pending interceptors across origins', async () => {

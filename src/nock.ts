@@ -158,12 +158,20 @@ function toBodyMatcher(body?: BodyMatcher): string | RegExp | ((body: string) =>
 
   // A Buffer/Uint8Array is an object too, and would otherwise fall into the JSON matcher below -
   // where `JSON.parse` on binary data always throws, so a buffer body matcher never matched
-  // anything. undici hands the request body back as a string, so the comparison goes byte-for-
-  // byte via a Buffer built from it, not from JSON.
+  // anything. undici hands a body-carrying request's body back as a Buffer already (not the
+  // string the type below promises) and a bodyless one as `undefined`, so this goes byte-for-
+  // byte via a Buffer built from whatever arrived, not from JSON - guarded the same way the JSON
+  // matcher below is, since `Buffer.from(undefined)` throws rather than returning a mismatch.
   if (ArrayBuffer.isView(body)) {
     const expected = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
 
-    return (requestBody: string) => Buffer.from(requestBody).equals(expected);
+    return (requestBody: string) => {
+      try {
+        return Buffer.from(requestBody).equals(expected);
+      } catch {
+        return false;
+      }
+    };
   }
 
   return (requestBody: string) => {
@@ -381,6 +389,22 @@ function splitPathQuery(path: PathMatcher): {path: PathMatcher; query?: Record<s
 }
 
 /**
+ * Compare one of the path's own literal query values against what a request actually carried.
+ * Both sides come from `searchParamsToObject`, so a repeated key is an array on each - a fresh
+ * one built per request, which `===` can never see as equal to the literal's own array even when
+ * every element matches.
+ */
+function ownQueryValueMatches(actual: string | string[] | undefined, expected: string | string[]): boolean {
+  if (Array.isArray(expected)) {
+    return (
+      Array.isArray(actual) && actual.length === expected.length && expected.every((value, i) => actual[i] === value)
+    );
+  }
+
+  return actual === expected;
+}
+
+/**
  * Fold a path's own literal query into a separately chained `.query()` expectation, so both have
  * to be satisfied - `nock(origin).get('/search?type=user').query({q: 'test'})` requires both
  * `type=user` and `q=test`. Passing the two straight to undici throws (`serializePathWithQuery`
@@ -401,7 +425,7 @@ function mergeQueryExpectations(
 
   if (typeof extra === 'function') {
     return (actual: Record<string, string | string[]>) =>
-      Object.entries(own).every(([key, value]) => actual[key] === value) && Boolean(extra(actual));
+      Object.entries(own).every(([key, value]) => ownQueryValueMatches(actual[key], value)) && Boolean(extra(actual));
   }
 
   return {...own, ...extra};
