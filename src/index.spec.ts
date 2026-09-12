@@ -458,9 +458,7 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
   res.end();
 });
 
-test.before(() => {
-  server.listen(3000);
-});
+test.before(() => new Promise<void>((resolve) => server.listen(3000, resolve)));
 
 test.after(() => {
   server.close();
@@ -999,6 +997,36 @@ test('afterResponse retry keeps prefixUrl from being applied twice', async () =>
 
   assert.strictEqual(response.statusCode, 200);
   assert.strictEqual(response.body['authorization'], 'Bearer refreshed');
+});
+
+test('afterResponse retry with new username/password replaces the stale Basic auth header', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        async (response, retryWithMergedOptions) => {
+          if (response.request.options.context.refreshed) {
+            return response;
+          }
+
+          return retryWithMergedOptions({
+            username: 'newuser',
+            password: 'newpass',
+            context: {...response.request.options.context, refreshed: true},
+          });
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Record<string, string>>('http://localhost:3000/unauthorized', {
+    username: 'olduser',
+    password: 'oldpass',
+  });
+
+  const expected = 'Basic ' + Buffer.from('newuser:newpass').toString('base64');
+
+  assert.strictEqual(response.body['authorization'], expected);
 });
 
 test('beforeError can replace the thrown error', async () => {

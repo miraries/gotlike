@@ -529,6 +529,44 @@ test('an undefined expected field is not satisfied by an absent one', async () =
   assertUnmatched(missed, 'a body naming none of the expected fields should not match');
 });
 
+test('a Buffer body matcher matches a request sending the same bytes', async () => {
+  nock('http://mock.test').post('/upload', Buffer.from('binary-data')).reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/upload', {body: Buffer.from('binary-data')});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a Buffer body matcher does not match different bytes', async () => {
+  nock('http://mock.test').post('/upload-diff', Buffer.from('binary-data')).reply(200, 'matched');
+
+  const missed = await failure(client.post('http://mock.test/upload-diff', {body: Buffer.from('other-bytes')}));
+
+  assertUnmatched(missed, 'different bytes should not match a Buffer body matcher');
+});
+
+test('registering a query-carrying path alongside .query() does not throw', () => {
+  assert.doesNotThrow(() => {
+    nock('http://mock.test').get('/search?type=user').query({q: 'test'}).reply(200, 'matched');
+  });
+});
+
+test('a query-carrying path combined with .query() requires both to be satisfied', async () => {
+  nock('http://mock.test').get('/search?type=user').query({q: 'test'}).reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/search', {searchParams: {type: 'user', q: 'test'}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a query-carrying path combined with .query() rejects a request missing either part', async () => {
+  nock('http://mock.test').get('/search-partial?type=user').query({q: 'test'}).reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/search-partial', {searchParams: {type: 'user'}}));
+
+  assertUnmatched(missed, "the path's own query param is required alongside .query()'s");
+});
+
 test('cleanAll removes pending interceptors across origins', async () => {
   nock('http://mock.test').get('/pending').reply(200, 'never used');
   nock('http://other.test').get('/pending').reply(200, 'never used');

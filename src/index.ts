@@ -2809,6 +2809,20 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     } as FormedOptions;
 
     /*
+     * `call()` only derives a Basic-auth header when none is present yet, so new
+     * `username`/`password` on a retry were silently ignored whenever the first attempt had
+     * already set one from its own credentials - the stale header survived the merge above and
+     * `hasHeader` then read it as "already set". Cleared unless the hook set its own
+     * `authorization` explicitly, which wins as it does everywhere else.
+     */
+    if (
+      (newOptions.username !== undefined || newOptions.password !== undefined) &&
+      (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'authorization'))
+    ) {
+      delete merged.headers['authorization'];
+    }
+
+    /*
      * A hook that supplies a body replaces the first attempt's, rather than merging with it.
      * `call()` resolves `json` -> `form` -> `body` in that order, so without this the first
      * attempt's `json` outranked a `body` or `form` the hook had just set and was sent again

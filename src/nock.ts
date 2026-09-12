@@ -30,7 +30,7 @@ type PathMatcher = string | RegExp | ((path: string) => boolean);
  * matched anything - and because an unmatched interceptor falls through to the real network,
  * a test written that way quietly made a live outbound request.
  */
-type BodyMatcher = string | RegExp | Record<string, any> | unknown[] | ((body: string) => boolean);
+type BodyMatcher = string | RegExp | Record<string, any> | unknown[] | ArrayBufferView | ((body: string) => boolean);
 
 /** `true` matches any query string, an object matches those exact params. */
 type QueryMatcher = boolean | Record<string, any> | URLSearchParams | QueryPredicate;
@@ -154,6 +154,16 @@ function bodyValueMatches(expected: unknown, actual: unknown): boolean {
 function toBodyMatcher(body?: BodyMatcher): string | RegExp | ((body: string) => boolean) | undefined {
   if (body === null || body === undefined || typeof body !== 'object' || body instanceof RegExp) {
     return body as string | RegExp | undefined;
+  }
+
+  // A Buffer/Uint8Array is an object too, and would otherwise fall into the JSON matcher below -
+  // where `JSON.parse` on binary data always throws, so a buffer body matcher never matched
+  // anything. undici hands the request body back as a string, so the comparison goes byte-for-
+  // byte via a Buffer built from it, not from JSON.
+  if (ArrayBuffer.isView(body)) {
+    const expected = Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+
+    return (requestBody: string) => Buffer.from(requestBody).equals(expected);
   }
 
   return (requestBody: string) => {
@@ -352,6 +362,52 @@ function queryToObject(query: QueryExpectation | URLSearchParams): QueryExpectat
 }
 
 /**
+ * Split a literal `?` out of a nock path matcher, the way `nock(origin).get('/search?type=user')`
+ * carries it. Only a string path can carry one - a regex or predicate path has no query of its
+ * own to speak of.
+ */
+function splitPathQuery(path: PathMatcher): {path: PathMatcher; query?: Record<string, string | string[]>} {
+  if (typeof path !== 'string') {
+    return {path};
+  }
+
+  const index = path.indexOf('?');
+
+  if (index === -1) {
+    return {path};
+  }
+
+  return {path: path.slice(0, index), query: searchParamsToObject(new URLSearchParams(path.slice(index + 1)))};
+}
+
+/**
+ * Fold a path's own literal query into a separately chained `.query()` expectation, so both have
+ * to be satisfied - `nock(origin).get('/search?type=user').query({q: 'test'})` requires both
+ * `type=user` and `q=test`. Passing the two straight to undici throws (`serializePathWithQuery`
+ * refuses a path that already has a `?`), and folding the literal one into the path string while
+ * ignoring it in the query check let a request missing it match regardless.
+ */
+function mergeQueryExpectations(
+  own: Record<string, string | string[]> | undefined,
+  extra?: QueryExpectation,
+): QueryExpectation | undefined {
+  if (!own) {
+    return extra;
+  }
+
+  if (extra === undefined) {
+    return own;
+  }
+
+  if (typeof extra === 'function') {
+    return (actual: Record<string, string | string[]>) =>
+      Object.entries(own).every(([key, value]) => actual[key] === value) && Boolean(extra(actual));
+  }
+
+  return {...own, ...extra};
+}
+
+/**
  * A `URLSearchParams` as the plain object nock deals in.
  *
  * Not `Object.fromEntries`, which keeps only the last of a repeated key - so
@@ -458,10 +514,18 @@ class Interceptor {
   #intercept(): MockInterceptor {
     // Only `.query(true)` needs a query-ignoring matcher.
     const ignoreQuery = this.#query === true;
-    const query =
+    const explicitQuery =
       this.#query !== undefined && this.#query !== true && this.#query !== false
         ? queryToObject(this.#query)
         : undefined;
+
+    // A literal `?` on the path itself - `nock(origin).get('/search?type=user')` - can't be
+    // handed to undici alongside a `query`: `serializePathWithQuery` throws outright when the
+    // path it's folding a query into already has one. Splitting it off here and folding it into
+    // the query expectation instead means both requirements are enforced and undici only ever
+    // sees a bare path.
+    const {path, query: ownQuery} = splitPathQuery(this.#path);
+    const query = ignoreQuery ? undefined : mergeQueryExpectations(ownQuery, explicitQuery);
 
     // For an object query undici folds the params into the interceptor's path string and
     // compares that, which a function matcher would defeat - so those keep an ordinary string
@@ -471,11 +535,11 @@ class Interceptor {
     // It also can only do it for values it can serialise. A RegExp or a predicate value
     // stringifies to nonsense (`"/bar/"`), so those go through `queryMatches` instead - as
     // does `.query(fn)`, which is a predicate over the whole query rather than a value at all.
-    const undiciAppliesQuery = typeof this.#path === 'string' && !ignoreQuery && isSerialisableQuery(query);
+    const undiciAppliesQuery = typeof path === 'string' && !ignoreQuery && isSerialisableQuery(query);
 
     const options: MockInterceptor.Options = {
       method: this.#method,
-      path: buildPathMatcher(this.#basePath, this.#path, ignoreQuery, undiciAppliesQuery ? undefined : query),
+      path: buildPathMatcher(this.#basePath, path, ignoreQuery, undiciAppliesQuery ? undefined : query),
       body: toBodyMatcher(this.#body),
       headers: Object.keys(this.#headers).length > 0 ? this.#headers : undefined,
     };
