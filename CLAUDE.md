@@ -80,6 +80,16 @@ Two invariants worth preserving here:
   since `formOptions` spreads it in either way, and would now be rejected.
 - **Everything that would need deep merging is resolved at create/extend time** (`hooks`, `handlers`, `retry`,
   `agent`). That's what makes a shallow spread sufficient. `formOptions` costs ~46ns; a request costs ~60µs.
+- **`searchParams` and `timeout` are the two exceptions, and both are guarded by a property read.** A per-call
+  `searchParams` replaced the client's outright, so a client carrying an api key, a tenant id or a version flag
+  lost it the moment a call named a parameter of its own — silently, and on the wire rather than at the call
+  site. got merges them (`Options.searchParams` under `_merging`): a key the override names replaces every
+  occurrence of that key, one it doesn't is kept, and one it names as `undefined` is dropped. Measured against
+  got 14, including the ordering — a replaced key moves to the end. `mergeSearchParams` only runs when *both*
+  sides carry one (~105ns when it does; nothing when it doesn't, and the spread has already picked the right
+  side). `timeout` needs no allocation at all: only `request` is supported, so replacing the object is the same
+  as merging it *except* when the override names no `request` — `{}`, or the `{request: config.timeout}` of a
+  config that didn't set one, which used to drop the client's deadline and leave the request unbounded.
 
 Header names written by a handler or a `beforeRequest` hook are folded again at dispatch, but only for clients that
 have one (`mayRewriteHeaders`) and only when a scan (`hasUnfoldedName`, which allocates nothing) actually finds an
@@ -370,6 +380,9 @@ forget a field:
 - **`normaliseStreamErrors()`** / **`normaliseBodyErrors()`** — one `_destroy` wrap behind both stream paths, so
   the upload path can't drift back into reporting undici's raw errors while the bodyless one normalises. See
   Streams.
+- **`appendQuery()`** — the `searchParams` walk, behind both `stringifyQuery` (serialise one) and
+  `mergeSearchParams` (merge two). Merging through a string round-trip on both sides cost ~300ns; walking the
+  override directly is ~105ns and cannot drift from the rules serialising applies.
 - **`messageOf()`** — the underlying error's message with a fallback, used by the two `ERR_REQUEST_ERROR` sites
   that had diverged (one reported the real message, the other a generic label).
 - **`isOk()` / `isHttpError()`** — the status predicates were spelled out inline in four places, twice with
@@ -491,6 +504,15 @@ paid by every caller to serve the few who read `rawBody` on a non-UTF-8 response
 a reason to.
 
 ### Streams
+
+**`stream` is a getter, not a method**, and hands back one memoised callable per client (`makeStreamClient`).
+got hangs the verb helpers off it — `got.stream.post(url, options)` — and those have to be bound to the client,
+which a prototype method shared by every instance has nowhere to put. Calling one used to be a `TypeError`, a
+hard stop for anything migrating that writes it the got way, and it was undocumented besides. Built on first
+read, so a client that never streams allocates nothing; `asCallable` already forwards prototype getters, so the
+callable form gets it for free. The verbs are assigned through an index signature because
+`stream[verb]` with `verb` a union of the eight names asks TypeScript to satisfy all eight return types with one
+function — `StreamClient` is what keeps the call sites honest.
 
 There are **two** stream paths, and which one runs depends on whether the request has a body:
 
@@ -672,7 +694,15 @@ arrays concatenated. Because the constructor re-evaluates the agent options, ext
 creates a fresh dispatcher.
 
 `retry` is shallow-merged rather than replaced: `extend({retry: {limit: 5}})` used to drop the parent's
-`statusCodes`/`methods` with it, silently widening what got retried.
+`statusCodes`/`methods` with it, silently widening what got retried. `timeout` and `searchParams` are merged for
+the same reason and by the same rules the per-request merge uses (see `formOptions` above) — `mergeTimeout` rather
+than `mergeRecords`, because `{request: undefined}` is a key that is *present* and a plain spread clobbers the
+parent's deadline with it.
+
+**`extend()` validates its own argument, even though the constructor validates the merged result.** Folding a bad
+`timeout` or `searchParams` into a well-formed one turns a `ValidationError` into a silently wrong client:
+`extend({timeout: 1000})` spread into `{}` and stopped throwing. Create-time work, so the second pass costs
+nothing that matters.
 
 **The merge helpers always allocate, whichever side has a value — and so does the constructor.** `mergeRecords`,
 `concatHooks` and `mergeHooks` used to return `base` unchanged when the override was absent, which handed the child
@@ -695,6 +725,24 @@ separate `RetryAgent`.
 
 The shim is a translation layer over `MockAgent`, and the translations that are easy to get wrong:
 
+- **A regex origin is keyed by its pattern, not by the RegExp object.** undici keys a non-string origin by object
+  identity, so `nock(/api\.test/)` written twice — two RegExp objects — registered two mock pools. undici resolves
+  a concrete origin against the *first* regex pool it finds and caches that pool's dispatch list under the origin,
+  so everything on the second pool was invisible and those requests went out to the **real network**. `poolKey`
+  canonicalises the pattern so one pool backs every scope written with it. Real nock matches both; measured
+  against nock 14.
+- **`cleanAll()` empties a pool's dispatch array in place rather than calling `cleanMocks()`** — which assigns a
+  *new* array, while the concrete-origin pool undici derived from a regex one still holds the old one. That left a
+  regex origin working exactly once per host per process: everything registered after the first `cleanAll()`
+  landed on an array nothing was reading, and fell through to the network. The array is reached by looking
+  undici's `dispatches` symbol up by description, since its mock symbols are module-local; if a future undici
+  moves it, `dispatchesOf` returns nothing and `cleanAll` falls back to `cleanMocks()`. Regex entries stay in the
+  `pools` map across a clean for the same reason — handing back a *different* pool is what breaks the derived
+  ones.
+- **Two scopes on one origin share an `isDone()` answer**, regex or string: a pending interceptor reports the
+  origin it was registered under and nothing finer. nock answers per scope. So does the shim's limit on
+  *different* patterns matching one host — undici consults only the first — both documented in the README rather
+  than worked around.
 - **Base paths.** `nock('https://host/base')` is legal; `mockAgent.get()` only takes an origin. `splitOrigin`
   separates them and every interceptor path gets the prefix folded in.
 - **String paths match the full request path including its query**, which is also nock's behaviour. `.query(true)`

@@ -849,3 +849,115 @@ test('restore() puts the previous global dispatcher back, and activate() re-inst
   assert.strictEqual(getGlobalDispatcher(), mocked);
   assert.strictEqual(nock.isActive(), true);
 });
+
+/*
+ * A regex origin, which nock allows and undici keys by object identity. The pool map was keyed
+ * on the origin itself, so a second `nock(/host/)` - a different RegExp object with the same
+ * pattern - missed the map and registered a *second* mock pool. undici resolves a request's
+ * origin against the first regex pool it finds and caches the dispatch list that pool was
+ * holding, so everything registered on the second scope was invisible: with `disableNetConnect`
+ * off, those requests went out to the real network. Real nock matches both; measured against
+ * nock 14.
+ */
+test('two scopes with the same regex origin both match', async () => {
+  nock(/two-scopes\.test/)
+    .get('/one')
+    .reply(200, {n: 1});
+  nock(/two-scopes\.test/)
+    .get('/two')
+    .reply(200, {n: 2});
+
+  assert.deepStrictEqual((await json.get<{n: number}>('http://two-scopes.test/one')).body, {n: 1});
+  assert.deepStrictEqual((await json.get<{n: number}>('http://two-scopes.test/two')).body, {n: 2});
+});
+
+test('a regex origin matches every host it covers', async () => {
+  nock(/covered\.test$/)
+    .persist()
+    .get('/ping')
+    .reply(200, {ok: true});
+
+  assert.deepStrictEqual((await json.get<{ok: boolean}>('http://a.covered.test/ping')).body, {ok: true});
+  assert.deepStrictEqual((await json.get<{ok: boolean}>('http://b.covered.test/ping')).body, {ok: true});
+});
+
+/*
+ * `cleanAll()` used to leave a regex origin working exactly once per host per process: the
+ * concrete-origin pool undici derives from a regex one holds the dispatch array it had at
+ * derivation time, and `cleanMocks()` hands the regex pool a *new* array rather than emptying
+ * the shared one - so everything registered afterwards landed somewhere nothing was reading,
+ * and the request fell through to the network. Measured: the second test to mock the same host
+ * by pattern matched nothing at all.
+ */
+test('a regex origin still matches after a cleanAll', async () => {
+  nock(/recycled\.test/)
+    .get('/first')
+    .reply(200, 'first');
+
+  assert.strictEqual((await client.get('http://recycled.test/first')).body, 'first');
+
+  nock.cleanAll();
+
+  nock(/recycled\.test/)
+    .get('/second')
+    .reply(200, 'second');
+
+  assert.strictEqual((await client.get('http://recycled.test/second')).body, 'second');
+});
+
+test('cleanAll clears a regex origin too', async () => {
+  nock(/cleaned\.test/)
+    .get('/warm')
+    .reply(200, 'warm');
+
+  // Consumed first, so undici has derived its concrete-origin pool from the regex one before
+  // anything is cleaned - which is the arrangement that used to leak.
+  assert.strictEqual((await client.get('http://cleaned.test/warm')).body, 'warm');
+
+  nock(/cleaned\.test/)
+    .get('/gone')
+    .reply(200, 'gone');
+
+  nock.cleanAll();
+
+  assertUnmatched(await failure(client.get('http://cleaned.test/gone')), 'the interceptor was cleaned');
+});
+
+/*
+ * Scopes on one regex origin share an answer, exactly as two scopes on one string origin do:
+ * a pending interceptor reports the origin it was registered under and nothing finer, so
+ * `isDone()` can only answer for the origin. nock answers per scope. Documented rather than
+ * fixed - the alternative is tracking every interceptor we hand to undici.
+ */
+test('isDone on a regex origin answers for the origin, not the scope', async () => {
+  const mine = nock(/answered\.test/)
+    .get('/mine')
+    .reply(200, 'mine');
+  const theirs = nock(/answered\.test/)
+    .get('/theirs')
+    .reply(200, 'theirs');
+
+  assert.strictEqual(mine.isDone(), false, 'nothing has been consumed yet');
+
+  await client.get('http://answered.test/mine');
+
+  assert.strictEqual(mine.isDone(), false, 'the other scope on this origin is still pending');
+
+  await client.get('http://answered.test/theirs');
+
+  assert.strictEqual(mine.isDone(), true);
+  assert.strictEqual(theirs.isDone(), true);
+});
+
+// An unrelated origin's pending mocks must not be counted, regex or not.
+test('isDone on a regex origin ignores another origin', async () => {
+  const mine = nock(/isolated\.test/)
+    .get('/mine')
+    .reply(200, 'mine');
+
+  nock('http://elsewhere.test').get('/theirs').reply(200, 'theirs');
+
+  await client.get('http://isolated.test/mine');
+
+  assert.strictEqual(mine.isDone(), true, 'another origin must not hold this scope open');
+});

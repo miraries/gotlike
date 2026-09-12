@@ -4629,6 +4629,354 @@ test('the client can be called with an options object alone', async () => {
 });
 
 /*
+ * The review findings, each with the got-14 measurement behind it.
+ *
+ * `searchParams` is the one option a client can set that a per-request one used to erase
+ * outright: `{...base, ...options}` replaces it wholesale, so a client carrying an api key
+ * or a tenant id in its query lost it the moment a call named a parameter of its own. got
+ * merges the two (`Options.searchParams`, `this._merging`) - measured against got 14, an
+ * `extend({searchParams: {apiKey, v}})` plus `get('items', {searchParams: {page: 2}})` goes
+ * out as `?apiKey=secret&v=1&page=2`.
+ */
+test('a per-request searchParams merges with the client’s rather than replacing it', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    searchParams: {apiKey: 'secret', v: '1'},
+  });
+
+  const inherited = await extClient.get<Echo>('echo');
+  const merged = await extClient.get<Echo>('echo', {searchParams: {page: 2}});
+
+  assert.strictEqual(inherited.body.url, '/echo?apiKey=secret&v=1');
+  assert.strictEqual(merged.body.url, '/echo?apiKey=secret&v=1&page=2');
+});
+
+// got deletes every occurrence of a key the override names before appending it, so the
+// replaced key ends up last rather than in the client's original position.
+test('a per-request searchParams key replaces the client’s, exactly once', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    searchParams: {apiKey: 'secret', v: '1'},
+  });
+
+  const response = await extClient.get<Echo>('echo', {searchParams: {apiKey: 'override'}});
+
+  assert.strictEqual(response.body.url, '/echo?v=1&apiKey=override');
+});
+
+// got's spelling of "drop the one the client set": the key is deleted from the base and
+// nothing is appended, since `undefined` is not a value.
+test('an undefined per-request searchParams value drops the client’s', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    searchParams: {apiKey: 'secret', v: '1'},
+  });
+
+  const response = await extClient.get<Echo>('echo', {searchParams: {apiKey: undefined}});
+
+  assert.strictEqual(response.body.url, '/echo?v=1');
+});
+
+test('extend merges searchParams with the parent’s', async () => {
+  const parent = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    searchParams: {apiKey: 'secret', v: '1'},
+  });
+
+  const child = parent.extend({searchParams: {tenant: 'acme'}});
+
+  const response = await child.get<Echo>('echo');
+
+  // The parent is untouched by the child's merge.
+  const parentResponse = await parent.get<Echo>('echo');
+
+  assert.strictEqual(response.body.url, '/echo?apiKey=secret&v=1&tenant=acme');
+  assert.strictEqual(parentResponse.body.url, '/echo?apiKey=secret&v=1');
+});
+
+test('searchParams merge across strings and URLSearchParams too', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    searchParams: 'a=1&b=2',
+  });
+
+  const response = await extClient.get<Echo>('echo', {searchParams: new URLSearchParams({b: '3', c: '4'})});
+
+  assert.strictEqual(response.body.url, '/echo?a=1&b=3&c=4');
+});
+
+// The merged query still replaces whatever the url carried, as an unmerged one does.
+test('a merged searchParams still replaces a query already on the url', async () => {
+  const extClient = client.extend({prefixUrl: 'http://localhost:3000', responseType: 'json', searchParams: {a: '1'}});
+
+  const response = await extClient.get<Echo>('echo?old=9', {searchParams: {b: '2'}});
+
+  assert.strictEqual(response.body.url, '/echo?a=1&b=2');
+});
+
+// An `afterResponse` retry is a merge like any other, so the hook's parameters join the
+// ones the request already carried rather than wiping them.
+test('a searchParams supplied by an afterResponse retry merges with the request’s', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    throwHttpErrors: false,
+    searchParams: {apiKey: 'secret'},
+    hooks: {
+      afterResponse: [
+        (response, retry) =>
+          (response.body as Echo).url.includes('retried') ? response : retry({searchParams: {retried: '1'}}),
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('echo', {searchParams: {page: '2'}});
+
+  assert.strictEqual(response.body.url, '/echo?apiKey=secret&page=2&retried=1');
+});
+
+/*
+ * `timeout` is an object, so the shallow spread replaced it whole: extending with a partial
+ * one - `{}`, or the `{request: config.timeout}` of a config that didn't set one - dropped
+ * the parent's deadline and left the client with no timeout at all. Only `request` is
+ * supported here, so merging matters exactly when the override doesn't name it.
+ */
+test('extend keeps the parent’s timeout when the override names none', () => {
+  const parent = client.extend({timeout: {request: 5000}});
+
+  assert.strictEqual(parent.extend({timeout: {}}).baseOptions.timeout?.request, 5000);
+  assert.strictEqual(parent.extend({timeout: {request: undefined}}).baseOptions.timeout?.request, 5000);
+  assert.strictEqual(parent.extend({timeout: {request: 100}}).baseOptions.timeout?.request, 100);
+});
+
+test('a per-request timeout that names no request keeps the client’s', async () => {
+  const extClient = client.extend({timeout: {request: 50}});
+
+  const error = await failure(extClient.get('http://localhost:3000/slow', {timeout: {request: undefined}}));
+
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+});
+
+/*
+ * got's `got.stream.post(url, options)` shorthand - the verb helpers live on `stream` there
+ * as they do on the client itself. Calling one used to be a `TypeError`, which is a hard
+ * stop for anything migrating that writes it the got way.
+ */
+test('stream carries the verb helpers got puts on it', async () => {
+  const download = await client.stream.get('http://localhost:3000/json');
+
+  assert.strictEqual(await text(download), '{"test": "value"}\n');
+
+  const upload = await client.stream.post('http://localhost:3000/echo');
+
+  upload.end('through-stream-post');
+
+  const echo = JSON.parse(await text(upload)) as Echo;
+
+  assert.strictEqual(echo.method, 'POST');
+  assert.strictEqual(echo.body, 'through-stream-post');
+});
+
+test('the stream verbs take options and hooks like any other call', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    hooks: {beforeRequest: [(options) => void (options.headers['x-hooked'] = 'yes')]},
+  });
+
+  const stream = await extClient.stream.get('headers', {headers: {'x-extra': 'here'}});
+
+  const headers = JSON.parse(await text(stream)) as Record<string, string>;
+
+  assert.strictEqual(headers['x-hooked'], 'yes');
+  assert.strictEqual(headers['x-extra'], 'here');
+});
+
+test('stream.put, stream.patch, stream.delete and stream.query send their method', async () => {
+  for (const method of ['put', 'patch', 'delete', 'query'] as const) {
+    const upload = await client.stream[method]('http://localhost:3000/echo');
+
+    upload.end('payload');
+
+    const echo = JSON.parse(await text(upload)) as Echo;
+
+    assert.strictEqual(echo.method, method.toUpperCase());
+    assert.strictEqual(echo.body, 'payload');
+  }
+});
+
+// Each client gets its own, bound to itself - `stream` is a getter rather than a method now,
+// and reading it twice must not hand back two different things.
+test('stream is the same object on each read and belongs to its own client', async () => {
+  const extClient = client.extend({prefixUrl: 'http://localhost:3000'});
+
+  assert.strictEqual(extClient.stream, extClient.stream);
+  assert.notStrictEqual(extClient.stream, client.stream);
+
+  assert.strictEqual(await text(await extClient.stream.get('json')), '{"test": "value"}\n');
+});
+
+/*
+ * Two behaviours the review called corruption, both measured against got 14 and both exactly
+ * what got does. They are locked down here so a well-meaning "fix" has to argue with the
+ * measurement rather than with a comment.
+ *
+ * A `beforeRequest` hook that appends to `options.url` runs again on the retry, over the url
+ * the first attempt went out with: got 14 sends `/items?sig=x` then `/items?sig=x&sig=x`.
+ */
+test('a retry re-runs the beforeRequest hooks over the url the first attempt used, as got does', async () => {
+  const urls: string[] = [];
+  let retried = false;
+
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          const url = String(options.url);
+
+          options.url = url + (url.includes('?') ? '&' : '?') + 'sig=x';
+          urls.push(String(options.url));
+        },
+      ],
+      afterResponse: [
+        (response, retry) => {
+          if (retried) {
+            return response;
+          }
+
+          retried = true;
+
+          return retry({headers: {'x-retried': 'yes'}});
+        },
+      ],
+    },
+  });
+
+  await extClient.get<Echo>('echo');
+
+  assert.deepStrictEqual(urls, ['http://localhost:3000/echo?sig=x', 'http://localhost:3000/echo?sig=x&sig=x']);
+});
+
+/*
+ * The same request with `searchParams`: the query is rebuilt from the option on every
+ * attempt, so a hook that signs the url signs a clean one each time rather than compounding.
+ */
+test('a retry rebuilds the query from searchParams before the hooks run', async () => {
+  const urls: string[] = [];
+  let retried = false;
+
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = String(options.url) + '&sig=x';
+          urls.push(String(options.url));
+        },
+      ],
+      afterResponse: [
+        (response, retry) => {
+          if (retried) {
+            return response;
+          }
+
+          retried = true;
+
+          return retry({headers: {'x-retried': 'yes'}});
+        },
+      ],
+    },
+  });
+
+  await extClient.get<Echo>('echo', {searchParams: {page: '1'}});
+
+  assert.deepStrictEqual(urls, ['http://localhost:3000/echo?page=1&sig=x', 'http://localhost:3000/echo?page=1&sig=x']);
+});
+
+/*
+ * A hook that transforms `options.body` sees the first attempt's transformed body again on a
+ * retry when the caller passed `body` - which is what got 14 does too (measured: `<PAY>` then
+ * `<<PAY>>`). A caller who passed `json` gets the body re-serialised from it each time, so
+ * the transformation is applied once per attempt.
+ */
+test('a retry re-serialises json rather than re-transforming the first attempt\u2019s body', async () => {
+  const bodies: string[] = [];
+  let retried = false;
+
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.body = '<' + String(options.body) + '>';
+          bodies.push(options.body);
+        },
+      ],
+      afterResponse: [
+        (response, retry) => {
+          if (retried) {
+            return response;
+          }
+
+          retried = true;
+
+          return retry({headers: {'x-retried': 'yes'}});
+        },
+      ],
+    },
+  });
+
+  await extClient.post<Echo>('echo', {json: {a: 1}});
+
+  assert.deepStrictEqual(bodies, ['<{"a":1}>', '<{"a":1}>']);
+});
+
+test('a retry re-transforms a raw body the hook already touched, as got does', async () => {
+  const bodies: string[] = [];
+  let retried = false;
+
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.body = '<' + String(options.body) + '>';
+          bodies.push(options.body);
+        },
+      ],
+      afterResponse: [
+        (response, retry) => {
+          if (retried) {
+            return response;
+          }
+
+          retried = true;
+
+          return retry({headers: {'x-retried': 'yes'}});
+        },
+      ],
+    },
+  });
+
+  await extClient.post<Echo>('echo', {body: 'PAY'});
+
+  assert.deepStrictEqual(bodies, ['<PAY>', '<<PAY>>']);
+});
+
+/*
  * Type-level assertions.
  *
  * `npm test` runs through node's type stripping, which erases types without checking them -

@@ -93,7 +93,7 @@ Supports:
 | | got | gotlike |
 | --- | --- | --- |
 | `hooks`, `handlers`, `retry`, `agent`, `http2`, `pipelining`, `dnsCache`, `dnsLookup`, `decompress` | per request or per client | **create/extend only** - passing them per request is a `ValidationError` |
-| option merging | per-option merge table, every request | **one shallow spread**; `headers` and `context` merge one level deep |
+| option merging | per-option merge table, every request | **one shallow spread**; `headers`, `context`, `searchParams` and `timeout` merge one level deep, everything else is replaced |
 | `response.rawBody` | always materialised | **computed on first access** - the bytes as received, so a `json` response still hands back the original text. On a `text`/`json` response it is a UTF-8 encoding of the decoded body, which is byte-exact for the UTF-8 that JSON and `charset=utf-8` guarantee; a response in some *other* charset is already mojibake by then, so read it with `responseType: 'buffer'` if the exact bytes matter |
 | `options.url` | normalised to a `URL` | **left a string**, rewritten to the full `prefixUrl`-resolved URL before handlers and hooks see it. Use `String(options.url)`, not `options.url.href` |
 | `response.url` | the final url | **same** - the last hop's url when redirects were followed, and the requested one otherwise. `options.url` stays the url that was *requested*, so a retry from a hook goes back through the redirect |
@@ -249,7 +249,8 @@ are for logging, metrics, and (for `beforeRedirect`) adjusting `request.headers`
 response, `error` for one that failed before its headers arrived. Exactly one of the two is set.
 
 `retryWithMergedOptions` re-runs the request with `newOptions` merged over the ones it was sent
-with (`headers` and `context` merge one level deep, everything else is replaced). It goes straight
+with (`headers`, `context`, `searchParams` and `timeout` merge one level deep, everything else is
+replaced). It goes straight
 back to the request - handlers already ran and are not re-entered.
 
 The retried response is passed to the hooks *before* the one that retried, and no further - so a
@@ -288,6 +289,12 @@ Also supported: `.persist()`, `.delay()`, `.matchHeader()`, `.replyWithError()`,
 
 Note that, as in nock, a plain string path does **not** match a request that carries a query
 string - add `.query(true)` for that.
+
+A regex origin - `nock(/\.example\.com$/)` - works, and any number of scopes may share one
+pattern. Two *different* patterns that both match the same host do not: undici resolves a concrete
+origin against the first regex pool registered for it and caches that decision, so the second
+pattern's interceptors never match. `isDone()`/`done()` answer for the origin rather than for the
+individual scope, as they already do for two scopes on one string origin.
 
 Body matchers take a string, a RegExp, a predicate, or an object/array compared against the
 request body parsed as JSON (a RegExp or function as a leaf value matches that field), as nock's
@@ -330,6 +337,16 @@ use. Pass a body-carrying method to get the writable half, and TypeScript will t
 ```ts
 const download = await gotlike.stream(url);                    // Readable
 const upload   = await gotlike.stream(url, { method: 'POST' }); // Duplex
+```
+
+`stream` carries got's verb helpers too, and they type the same way - `stream.get`, `.head` and
+`.options` resolve to a `Readable`, `stream.post`, `.put`, `.patch`, `.delete` and `.query` to the
+duplex:
+
+```ts
+const upload = await gotlike.stream.post(url);
+
+await pipeline(createReadStream('file'), upload);
 ```
 
 **Redirects and streamed bodies.** Bodyless streams follow redirects normally. A streamed request

@@ -18,8 +18,52 @@ if (process.env.NOCK_OFF !== 'true') {
   setGlobalDispatcher(mockAgent);
 }
 
-/** Pools handed out by `mockAgent.get`, kept so `cleanAll()` can reach them. */
-const pools = new Map<string, Interceptable>();
+/** A nock origin as undici keys it: an exact origin, or a pattern matching several. */
+type Origin = string | RegExp;
+
+/**
+ * Pools handed out by `mockAgent.get`, kept so `cleanAll()` can reach them - and, for a regex
+ * origin, so the *same* pool backs every scope written with the same pattern.
+ *
+ * Keyed by a canonical string rather than by the origin itself, because undici keys a regex
+ * origin by object identity: `nock(/api\.test/)` written twice is two RegExp objects, so the
+ * second missed this map and registered a second mock pool. undici resolves a request's origin
+ * against the first regex pool it finds and caches *that* pool's dispatch list under the
+ * concrete origin, so everything on the second pool was invisible - and an unmatched
+ * interceptor falls through to the real network. Real nock matches both; measured against
+ * nock 14.
+ */
+const pools = new Map<string, {pool: Interceptable; origin: Origin}>();
+
+function poolKey(origin: Origin): string {
+  // The pattern, not the object: `\u0000` can appear in neither half, so no two distinct
+  // patterns collide.
+  return typeof origin === 'string' ? origin : `re\u0000${origin.source}\u0000${origin.flags}`;
+}
+
+/**
+ * undici's per-pool dispatch list, if this version still keeps it where we expect.
+ *
+ * Reaching for it at all is about `cleanAll()` on a regex origin. `cleanMocks()` replaces the
+ * array rather than emptying it, while the concrete-origin pool undici derives from a regex
+ * one keeps a reference to the array it had at derivation time - so cleaning the pool we
+ * registered on left the derived one still matching everything registered before it, and
+ * every interceptor registered *after* the clean landed on an array nothing was reading. That
+ * is why a regex origin used to work exactly once per host per process: measured, a second
+ * `nock(/host/)` after a `cleanAll()` matched nothing at all.
+ *
+ * Emptying the array in place keeps every sharer in step. The symbol is looked up by
+ * description because undici's mock symbols are module-local; if a future undici moves or
+ * renames it the lookup fails and `cleanAll` falls back to `cleanMocks()`, which is what it
+ * always did.
+ */
+function dispatchesOf(pool: Interceptable): unknown[] | undefined {
+  const key = Object.getOwnPropertySymbols(pool).find((symbol) => symbol.description === 'dispatches');
+
+  const dispatches = key && (pool as unknown as Record<symbol, unknown>)[key];
+
+  return Array.isArray(dispatches) ? dispatches : undefined;
+}
 
 type HeaderMatcher = string | RegExp | ((fieldValue: string) => boolean);
 type PathMatcher = string | RegExp | ((path: string) => boolean);
@@ -677,22 +721,25 @@ class Interceptor {
 class Scope {
   #pool: Interceptable;
   #basePath: string;
-  #origin: string;
+  #origin: Origin;
 
   /** Set by `persist()`, and inherited by every interceptor registered after it. */
   #persist = false;
 
-  constructor(origin: string, basePath: string) {
-    let pool = pools.get(origin);
+  constructor(origin: Origin, basePath: string) {
+    const key = poolKey(origin);
+    let entry = pools.get(key);
 
-    if (!pool) {
-      pool = mockAgent.get(origin);
-      pools.set(origin, pool);
+    if (!entry) {
+      entry = {pool: mockAgent.get(origin as string), origin};
+      pools.set(key, entry);
     }
 
-    this.#pool = pool;
+    this.#pool = entry.pool;
     this.#basePath = basePath;
-    this.#origin = origin;
+    // The origin the pool was *registered* under, which for a regex is the first RegExp object
+    // written with this pattern. `isDone()` compares it by identity, as undici does.
+    this.#origin = entry.origin;
   }
 
   #verb(method: string, path: PathMatcher, body?: BodyMatcher, options?: Options): Interceptor {
@@ -767,10 +814,10 @@ class Scope {
  * Split `https://host:port/base/path` into the origin undici wants and the path prefix
  * every interceptor on the scope should inherit.
  */
-function splitOrigin(basePath: string | RegExp | Url | URL): {origin: string; path: string} {
+function splitOrigin(basePath: string | RegExp | Url | URL): {origin: Origin; path: string} {
   if (basePath instanceof RegExp) {
     // A regex origin can't carry a base path.
-    return {origin: basePath as unknown as string, path: ''};
+    return {origin: basePath, path: ''};
   }
 
   if (typeof basePath === 'string') {
@@ -830,13 +877,25 @@ Object.assign(nock, {
   },
   /** Drop every interceptor registered so far, on every origin. */
   cleanAll() {
-    for (const pool of pools.values()) {
-      (pool as unknown as {cleanMocks(): void}).cleanMocks();
-    }
+    for (const [key, {pool, origin}] of pools) {
+      const dispatches = dispatchesOf(pool);
 
-    // The pools themselves are done with too - holding them meant the map only ever grew over
-    // a suite's lifetime. `Scope` re-fetches from the agent on the next `nock(...)`.
-    pools.clear();
+      if (dispatches) {
+        // In place, so the concrete-origin pools undici derived from a regex one - which hold
+        // this very array - are cleared with it. See `dispatchesOf`.
+        dispatches.length = 0;
+      } else {
+        (pool as unknown as {cleanMocks(): void}).cleanMocks();
+      }
+
+      // String origins are dropped: holding them meant the map only ever grew over a suite's
+      // lifetime, and undici hands the same pool back for the same origin anyway. A regex one
+      // is kept, because handing back a *different* pool is exactly what breaks it - the
+      // derived pools go on reading the array this entry owns.
+      if (typeof origin === 'string') {
+        pools.delete(key);
+      }
+    }
   },
   abortPendingRequests() {
     // undici has no equivalent; interceptors are removed instead.

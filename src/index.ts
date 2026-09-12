@@ -620,7 +620,7 @@ type RetryDepth = {[retryDepth]?: number; [afterResponseLimit]?: number};
  * An array value repeats the key (`?a=1&a=2`). Falling through to `String(value)` joined it
  * with a comma into a single `?a=1%2C2` instead - a wrong query string, produced silently.
  */
-function stringifyQuery(input: NonNullable<RequestOptions['searchParams']>): string {
+function stringifyQuery(input: SearchParams): string {
   if (typeof input === 'string') {
     return input.startsWith('?') ? input.slice(1) : input;
   }
@@ -630,6 +630,28 @@ function stringifyQuery(input: NonNullable<RequestOptions['searchParams']>): str
   }
 
   const params = new URLSearchParams();
+
+  appendQuery(params, input);
+
+  return params.toString();
+}
+
+type SearchParams = NonNullable<RequestOptions['searchParams']>;
+
+/**
+ * Append one `searchParams` value onto a `URLSearchParams`.
+ *
+ * Split out of `stringifyQuery` so that merging two of them applies exactly the rules
+ * serialising one does, rather than a second copy of them.
+ */
+function appendQuery(params: URLSearchParams, input: SearchParams): void {
+  if (typeof input === 'string' || input instanceof URLSearchParams) {
+    for (const [key, value] of typeof input === 'string' ? new URLSearchParams(stringifyQuery(input)) : input) {
+      params.append(key, value);
+    }
+
+    return;
+  }
 
   for (const key in input) {
     const value = input[key];
@@ -650,8 +672,54 @@ function stringifyQuery(input: NonNullable<RequestOptions['searchParams']>): str
 
     params.append(key, queryValue(key, value));
   }
+}
 
-  return params.toString();
+/**
+ * Merge a client's `searchParams` with a call's, the way got merges them.
+ *
+ * The shallow spread `formOptions` and `extend` are built on replaced the whole query, so a
+ * client carrying an api key, a tenant id or a version flag lost it the moment a call named a
+ * parameter of its own - silently, and on the wire rather than at the call site. got merges
+ * the two (`Options.searchParams` under `_merging`): keys the override names replace every
+ * occurrence of that key, keys it doesn't are kept, and a key it names as `undefined` is
+ * dropped rather than replaced. Measured against got 14 - `{apiKey, v}` plus `{page: 2}` goes
+ * out as `?apiKey=secret&v=1&page=2`, and a replaced key moves to the end.
+ *
+ * Only ever called with both sides present: when one is missing there is nothing to merge and
+ * the spread has already picked the right one, which is what keeps the usual request free.
+ */
+function mergeSearchParams(base: SearchParams, override: SearchParams): URLSearchParams {
+  const merged = new URLSearchParams();
+
+  appendQuery(merged, base);
+
+  /*
+   * An object override is walked by its own keys, not by what it serialises to, so a key it
+   * sets to `undefined` still clears the base's - that is got's spelling of "drop the one the
+   * client set", and `appendQuery` contributes nothing for it afterwards.
+   */
+  if (typeof override === 'object' && !(override instanceof URLSearchParams)) {
+    for (const key in override) {
+      merged.delete(key);
+    }
+
+    appendQuery(merged, override);
+
+    return merged;
+  }
+
+  // A string or a `URLSearchParams` is parsed once and then used for both halves.
+  const updated = override instanceof URLSearchParams ? override : new URLSearchParams(stringifyQuery(override));
+
+  for (const key of updated.keys()) {
+    merged.delete(key);
+  }
+
+  for (const [key, value] of updated) {
+    merged.append(key, value);
+  }
+
+  return merged;
 }
 
 /**
@@ -789,6 +857,26 @@ function mergeHeaders(base: IncomingHttpHeaders, override?: IncomingHttpHeaders)
   }
 
   return merged;
+}
+
+/** The one timeout got's `timeout` object supports here. See `RequestOptions.timeout`. */
+type Timeout = {request?: number};
+
+/**
+ * Merge two `timeout` objects, keeping the base's `request` when the override names none.
+ *
+ * `mergeRecords` would not do: `{request: undefined}` is a key that is *present*, so a plain
+ * spread clobbers the parent's deadline with nothing - which is exactly the shape a config
+ * that didn't set a timeout produces (`{request: config.timeout}`). Only `request` is
+ * supported, so this is the whole merge; `formOptions` applies the same rule per request
+ * without allocating.
+ */
+function mergeTimeout(base?: Timeout, override?: Timeout): Timeout | undefined {
+  if (override === undefined) {
+    return base && {...base};
+  }
+
+  return {...base, ...override, request: override.request ?? base?.request};
 }
 
 /** Shallow-merge two optional records into a fresh object. */
@@ -1074,9 +1162,7 @@ export type RequestOptions<T = unknown> = {
    *
    * Only `request` property is supported.
    **/
-  timeout?: {
-    request?: number;
-  };
+  timeout?: Timeout;
 
   /** The HTTP method used to make the request. */
   method?: Dispatcher.HttpMethod;
@@ -1351,6 +1437,52 @@ export type GotlikeStream = Readable & {
 
 /** A `stream()` for a method that can carry a body: write the request body to it. */
 export type GotlikeUploadStream = GotlikeStream & Duplex;
+
+/**
+ * `client.stream` - callable as got's is, with got's verb helpers hanging off it.
+ *
+ * The bodyless verbs resolve to a `Readable`; the ones that can carry a body resolve to the
+ * `Duplex` whose writable half *is* the request body, which is the same split `stream()`
+ * itself makes on `method`.
+ */
+export type StreamClient = {
+  (url: string | URL, options: RequestOptions & {method: BodyMethod}): Promise<GotlikeUploadStream>;
+  (url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
+  get(url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
+  head(url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
+  options(url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
+  post(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  put(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  patch(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  delete(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  query(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
+};
+
+/** The verbs `stream` carries, each dispatching through `handle()` like the client's own. */
+const streamVerbs = ['get', 'head', 'options', 'post', 'put', 'patch', 'delete', 'query'] as const;
+
+/**
+ * Build one client's `stream` façade.
+ *
+ * A function rather than a method so the verb helpers can live on it, bound to the instance -
+ * a prototype method is shared by every client and has nowhere to put them.
+ */
+function makeStreamClient(instance: Gotlike<any>): StreamClient {
+  const stream = ((url: string | URL, options: RequestOptions = {}) =>
+    instance.handle({...options, isStream: true}, url)) as unknown as StreamClient;
+
+  for (const verb of streamVerbs) {
+    const method = verb.toUpperCase() as Dispatcher.HttpMethod;
+
+    // Through an index signature: `stream[verb]` with `verb` a union of the eight names asks
+    // TypeScript to satisfy all eight return types with one function. The declared
+    // `StreamClient` above is what keeps the call sites honest.
+    (stream as unknown as Record<string, unknown>)[verb] = (url: string | URL, options: RequestOptions = {}) =>
+      instance.handle({...options, isStream: true}, url, method);
+  }
+
+  return stream;
+}
 
 /*
  * The option shapes the request overloads discriminate on. Together they let a call site say
@@ -1789,6 +1921,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   #composedFrom?: Dispatcher;
   #composed?: Dispatcher;
 
+  /** Memoised `stream` façade; built on first use, so a client that never streams pays nothing. */
+  #stream?: StreamClient;
+
   constructor(options?: O) {
     if (options) {
       validateOptions(options, true);
@@ -2025,6 +2160,23 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // folded to lower case on the way in, so `{Authorization: ...}` replaces an instance
     // `authorization` rather than joining it.
     formed.headers = mergeHeaders(this.defaultHeaders, options.headers);
+
+    // Merged rather than replaced, as got merges them. The spread has already picked the
+    // right side whenever only one carries a query, so this costs one property read - and
+    // reads `options` first, since a client with `searchParams` is the rarer of the two.
+    if (options.searchParams !== undefined && base.searchParams !== undefined) {
+      formed.searchParams = mergeSearchParams(base.searchParams, options.searchParams);
+    }
+
+    /*
+     * Only `timeout.request` is supported, so replacing the object outright is the same thing
+     * as merging it - except when the override names no `request` at all. `{}`, or the
+     * `{request: config.timeout}` of a config that didn't set one, then dropped the client's
+     * deadline and left the request unbounded. No allocation either way.
+     */
+    if (options.timeout !== undefined && options.timeout.request === undefined && base.timeout !== undefined) {
+      formed.timeout = base.timeout;
+    }
 
     if (base.context && options.context) {
       formed.context = {...base.context, ...options.context};
@@ -2903,6 +3055,16 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       headers: mergeHeaders(lowercaseHeaders(options.headers), newOptions.headers),
     } as FormedOptions;
 
+    // A retry is a merge like any other, so a query the hook adds joins the one the request
+    // already carried instead of erasing it.
+    if (options.searchParams !== undefined && newOptions.searchParams !== undefined) {
+      merged.searchParams = mergeSearchParams(options.searchParams, newOptions.searchParams);
+    }
+
+    if (newOptions.timeout !== undefined && newOptions.timeout.request === undefined && options.timeout !== undefined) {
+      merged.timeout = options.timeout;
+    }
+
     /*
      * `call()` only derives a Basic-auth header when none is present yet, so new credentials on
      * a retry were silently ignored whenever the first attempt had already set one from its own
@@ -2999,6 +3161,11 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   }
 
   extend<E extends RequestOptions>(options: E): Gotlike<MergeClientOptions<O, E>> {
+    // Checked here as well as in the constructor, which sees the merged result: `timeout` and
+    // `searchParams` are merged below, and merging a bad value into a well-formed one turns a
+    // `ValidationError` into a silently wrong client.
+    validateOptions(options, true);
+
     const base = this.baseOptions;
 
     return new Gotlike<MergeClientOptions<O, E>>({
@@ -3011,6 +3178,13 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // Merged, not replaced: `extend({retry: {limit: 5}})` used to drop the parent's
       // `statusCodes`/`methods` along with it, silently widening what got retried.
       retry: mergeRecords(base?.retry, options.retry),
+      // The same reasoning for the same shape of mistake: `extend({timeout: {}})` dropped the
+      // parent's deadline, and an extended client that named a query lost the parent's.
+      timeout: mergeTimeout(base?.timeout, options.timeout),
+      searchParams:
+        base?.searchParams !== undefined && options.searchParams !== undefined
+          ? mergeSearchParams(base.searchParams, options.searchParams)
+          : (options.searchParams ?? base?.searchParams),
       // Handlers and hooks accumulate, so an extended client keeps the parent's.
       handlers: concatHooks(base?.handlers, options.handlers),
       hooks: mergeHooks(base?.hooks, options.hooks),
@@ -3022,11 +3196,14 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    *
    * Unlike got's, this resolves to the stream rather than returning it synchronously - the
    * `beforeRequest` hooks are async, and awaiting them is worth more than the sync return.
+   *
+   * A getter rather than a plain method, because got hangs the verb helpers off it -
+   * `got.stream.post(url, options)` - and those have to be bound to this client. Calling one
+   * here used to be a `TypeError`, which is a hard stop for code migrating from got that
+   * writes it the got way. Built once per client, on the first read.
    */
-  stream(url: string | URL, options: RequestOptions & {method: BodyMethod}): Promise<GotlikeUploadStream>;
-  stream(url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
-  stream(url: string | URL, options: RequestOptions = {}): Promise<GotlikeStream> {
-    return this.handle({...options, isStream: true}, url) as unknown as Promise<GotlikeStream>;
+  get stream(): StreamClient {
+    return (this.#stream ??= makeStreamClient(this));
   }
 
   get(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
