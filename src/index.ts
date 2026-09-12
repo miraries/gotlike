@@ -2809,14 +2809,25 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     } as FormedOptions;
 
     /*
-     * `call()` only derives a Basic-auth header when none is present yet, so new
-     * `username`/`password` on a retry were silently ignored whenever the first attempt had
-     * already set one from its own credentials - the stale header survived the merge above and
-     * `hasHeader` then read it as "already set". Cleared unless the hook set its own
-     * `authorization` explicitly, which wins as it does everywhere else.
+     * `call()` only derives a Basic-auth header when none is present yet, so new credentials on
+     * a retry were silently ignored whenever the first attempt had already set one from its own
+     * - the stale header survived the merge above and `hasHeader` then read it as "already
+     * set". Cleared unless the hook set its own `authorization` explicitly, which wins as it
+     * does everywhere else.
+     *
+     * A `url` carrying userinfo counts as new credentials, not just explicit
+     * `username`/`password`: rotating them by retrying with `http://user2:pass2@host/` is the
+     * same intent by the other route, and the first attempt's credentials went out instead.
+     * Only for a client that parses userinfo at all - with `parseUserinfo: false` nothing would
+     * re-derive the header and the retry would go out anonymous. Measured against got 14: a
+     * new url's credentials are used, while a new url *without* any keeps the previous ones,
+     * which is what leaving the header in place gives here.
      */
     if (
-      (newOptions.username !== undefined || newOptions.password !== undefined) &&
+      (newOptions.username !== undefined ||
+        newOptions.password !== undefined ||
+        // `String`, as `resolveUrl` does: a `URL` keeps its userinfo in `href`.
+        (this.parseUserinfo && newOptions.url !== undefined && splitUserinfo(String(newOptions.url)) !== undefined)) &&
       (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'authorization'))
     ) {
       delete merged.headers['authorization'];

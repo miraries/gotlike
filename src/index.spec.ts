@@ -1029,6 +1029,54 @@ test('afterResponse retry with new username/password replaces the stale Basic au
   assert.strictEqual(response.body['authorization'], expected);
 });
 
+/*
+ * Credentials written into the url are the other way to set Basic auth, and rotating them by
+ * retrying with a new url hit the same stale-header problem `username`/`password` did: the
+ * first attempt's derived `authorization` survived the merge, `call()` read a header that was
+ * already there as "leave it alone", and the new credentials never left the process. Measured
+ * against got 14, which sends the new url's credentials.
+ */
+test('afterResponse retry with credentials in a new url replaces the stale Basic auth header', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        async (_response, retryWithMergedOptions) =>
+          retryWithMergedOptions({url: 'http://user2:pass2@localhost:3000/echo'}),
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://user1:pass1@localhost:3000/echo');
+
+  assert.strictEqual(response.body.url, '/echo');
+  assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from('user2:pass2').toString('base64'));
+});
+
+/*
+ * ...but only for a client that parses userinfo at all. With `parseUserinfo: false` nothing
+ * re-derives the header, so dropping it would send the retry anonymously - the credentials in
+ * the hook's url are ignored there exactly as they are on a first request.
+ */
+test('afterResponse retry keeps its own authorization header with parseUserinfo false', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    parseUserinfo: false,
+    hooks: {
+      afterResponse: [
+        async (_response, retryWithMergedOptions) =>
+          retryWithMergedOptions({url: 'http://user2:pass2@localhost:3000/echo'}),
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://localhost:3000/echo', {
+    headers: {authorization: 'Bearer explicit'},
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer explicit');
+});
+
 test('beforeError can replace the thrown error', async () => {
   class TranslatedError extends Error {
     name = 'TranslatedError';

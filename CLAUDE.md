@@ -260,6 +260,15 @@ twice for one failure.
 `options.url` had already been resolved against it - true, but a `url` the hook supplies has *not* been, so a
 relative path was dispatched as-is and failed as an invalid url. An absolute one ignores the prefix anyway.
 
+**New credentials on the retry drop the stale `authorization`.** `call()` only derives a Basic-auth header when
+none is present yet, so the first attempt's header survived the merge and was read as "already set" — the hook's
+credentials never left the process. That covers a `url` carrying userinfo as well as explicit
+`username`/`password`, since `retry({url: 'http://user2:pass2@host/p'})` is the same intent by the other route, and
+it is gated on `parseUserinfo`: with the scan off nothing would re-derive the header and the retry would go out
+anonymous. A hook's own `authorization` header still wins. Measured against got 14, which uses a new url's
+credentials and keeps the previous ones for a new url that carries none — so a url without userinfo deliberately
+leaves the header alone.
+
 It **always reallocates `headers`**, even when the hook passed none. Aliasing the first attempt's header object
 meant `call()`'s own writes on the retry — a `content-type` for a body the retry added — landed on the options
 the *first* response reports having been sent with.
