@@ -7,24 +7,80 @@ import type {IncomingHttpHeaders} from 'undici/types/header.js';
 const {BodyTimeoutError, HeadersTimeoutError, RequestRetryError} = errors;
 
 /**
+ * Raise a synthetic stream's failure as soon as anything is listening for it, rather than
+ * only when the stream is read.
+ *
+ * got emits a stream's error whether or not the stream is ever read, and the pattern that
+ * relies on it is ordinary: attach `error` and `response` listeners, and pipe from inside the
+ * `response` handler. A request that failed before any response never fires `response`, so
+ * nothing ever read the stream, so the error was never raised and the caller waited for a
+ * stream that had already failed.
+ *
+ * Destroying it unconditionally is what can't be done: an `error` no one is listening for is
+ * an uncaught exception, and `await stream.response` - which reports this same failure, and
+ * is what the README tells callers to await - attaches no listener at all. So the error is
+ * raised when a listener exists and left to read time when none does, which covers both
+ * without turning either into a crash.
+ *
+ * `setImmediate` rather than a microtask, for the reason the `response` event uses one: a
+ * caller attaches its listeners after `await stream(...)`, which a queued microtask beats.
+ */
+function raiseWhenListening(stream: Readable, raise: () => void): void {
+  function onNewListener(event: string | symbol) {
+    if (event !== 'error') {
+      return;
+    }
+
+    stream.off('newListener', onNewListener);
+    // The listener being added isn't registered until this handler returns, so it would miss
+    // an error emitted from inside it.
+    setImmediate(raise);
+  }
+
+  setImmediate(() => {
+    if (stream.listenerCount('error') > 0) {
+      raise();
+    } else {
+      stream.on('newListener', onNewListener);
+    }
+  });
+}
+
+/**
+ * A readable with no body, standing in for a request that failed. It raises the failure when
+ * read, and `arm` hands it to `raiseWhenListening` as well - separately, so `asStream` can
+ * order that behind the `response` event it may also have to emit.
+ */
+function failedReadable(error: Error): {stream: Readable; arm: () => void} {
+  let raised = false;
+
+  const raise = () => {
+    if (raised) {
+      return;
+    }
+
+    raised = true;
+    stream.destroy(error);
+  };
+
+  const stream = new Readable({read: raise});
+
+  return {stream, arm: () => raiseWhenListening(stream, raise)};
+}
+
+/**
  * Present a response body as the stream `stream()` resolves to.
  *
- * A failure is raised by the readable itself when first read, rather than by destroying the
- * stream. Destroying has no good moment: synchronously, the error is emitted before an
- * awaiting caller has attached a listener; on a later tick, a small body has already been
- * consumed and the read finished cleanly. Raising it at read time lands whenever the caller
- * actually reads.
+ * A failure is raised by the readable itself - when first read, or when something starts
+ * listening for it - rather than by destroying the stream outright. Destroying has no good
+ * moment: synchronously, the error is emitted before an awaiting caller has attached a
+ * listener; on a later tick, a small body has already been consumed and the read finished
+ * cleanly. See `raiseWhenListening`.
  */
 function asStream(readable: Readable, head: StreamHead | undefined, error?: Error): GotlikeStream {
-  const source = error
-    ? new Readable({
-        read() {
-          this.destroy(error);
-        },
-      })
-    : readable;
-
-  const stream = source as GotlikeStream;
+  // Only built for a failure, so an ordinary response body allocates nothing extra here.
+  const failed = error === undefined ? undefined : failedReadable(error);
+  const stream = (failed?.stream ?? readable) as GotlikeStream;
 
   stream.response = head ? Promise.resolve(head) : Promise.reject(error ?? new Error('Request failed'));
   // Nothing is obliged to await this; an unhandled rejection would take the process down.
@@ -35,6 +91,10 @@ function asStream(readable: Readable, head: StreamHead | undefined, error?: Erro
     // `await stream(...)`, and a microtask queued before that await resolves fires first.
     setImmediate(() => stream.emit('response', head));
   }
+
+  // Armed after the `response` emit above is queued, so a caller listening for both sees them
+  // in that order - the head first, then the failure it carries.
+  failed?.arm();
 
   return stream;
 }
@@ -124,15 +184,17 @@ function failedUploadStream(error: Promise<Error>): GotlikeUploadStream {
 
   let raised = false;
 
-  const stream = new Duplex({
-    read() {
-      if (raised) {
-        return;
-      }
+  const raise = () => {
+    if (raised) {
+      return;
+    }
 
-      raised = true;
-      error.then((failure) => this.destroy(failure), noop);
-    },
+    raised = true;
+    error.then((failure) => stream.destroy(failure), noop);
+  };
+
+  const stream = new Duplex({
+    read: raise,
     write(_chunk, _encoding, callback) {
       // `error` always resolves - `toStreamError` returns the error rather than throwing it -
       // but a rejection handler keeps a write from hanging if that ever stops being true.
@@ -147,6 +209,10 @@ function failedUploadStream(error: Promise<Error>): GotlikeUploadStream {
     throw failure;
   });
   stream.response.catch(noop);
+
+  // As on the readable path: a caller listening for `error` and never writing would otherwise
+  // wait on a request that was never dispatched.
+  raiseWhenListening(stream, raise);
 
   return stream;
 }
@@ -267,6 +333,12 @@ class OutcomeHandler extends BaseDecoratorHandler {
 
   override onResponseError(controller: Dispatcher.DispatchController, error: Error) {
     this.#state.lastError = error;
+    // Cleared, not left behind: an attempt that failed before its headers arrived produced no
+    // status at all, and the previous one's survived here. A 503 followed by a socket reset
+    // told `beforeRetry` that the reset had come with a 503 - a status the hook was free to
+    // branch on, from a response it was never sent.
+    this.#state.lastStatusCode = undefined;
+    this.#state.lastHeaders = undefined;
 
     return super.onResponseError(controller, error);
   }
@@ -858,6 +930,24 @@ function isTimeoutReason(error: unknown, signal?: AbortSignal): boolean {
     (error as Error | undefined)?.name === 'TimeoutError' ||
     (signal?.aborted === true && (signal.reason as Error | undefined)?.name === 'TimeoutError')
   );
+}
+
+/**
+ * The underlying error's own `code`, which is what got reports: its `RequestError` takes
+ * `error.code ?? 'ERR_GOT_REQUEST_ERROR'`, so a connection refused arrives as `ECONNREFUSED`
+ * and a DNS failure as `ENOTFOUND`. Every generic failure here used to be flattened to
+ * `ERR_REQUEST_ERROR`, with the real code reachable only through `cause` - so the `err.code
+ * === 'ECONNREFUSED'` that a got caller writes matched nothing at all.
+ *
+ * Whatever undici raised is passed through as it stands, which is exact for the errno codes
+ * it surfaces from the socket and undici's own (`UND_ERR_SOCKET`) for the failures it
+ * describes itself. The fallback covers a value with no code, and a `DOMException`, whose
+ * `code` is a legacy *number* (23 for a timeout) that nothing matching on a string wants.
+ */
+function codeOf(error: unknown, fallback: string): string {
+  const code = (error as {code?: unknown} | undefined)?.code;
+
+  return typeof code === 'string' && code !== '' ? code : fallback;
 }
 
 function messageOf(error: unknown, fallback: string): string {
@@ -2253,7 +2343,12 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // The hook's own message, not a generic one - it is the only thing that says what
       // actually went wrong. Via `messageOf`, since `throw 'string'` and `throw null` are both
       // legal and `(error as Error).message` threw a TypeError of its own on the second.
-      throw await this.toRequestError(messageOf(error, 'Request error'), 'ERR_REQUEST_ERROR', error as Error, options);
+      throw await this.toRequestError(
+        messageOf(error, 'Request error'),
+        codeOf(error, 'ERR_REQUEST_ERROR'),
+        error as Error,
+        options,
+      );
     }
 
     // make request
@@ -2418,7 +2513,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // APM grouping unable to tell them apart. got reports the underlying message too.
       throw await this.toRequestError(
         messageOf(err, 'Request error'),
-        'ERR_REQUEST_ERROR',
+        codeOf(err, 'ERR_REQUEST_ERROR'),
         err as Error,
         options,
         response,
@@ -2483,7 +2578,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
         throw await this.toRequestError(
           messageOf(error, 'afterResponse hook failed'),
-          'ERR_REQUEST_ERROR',
+          codeOf(error, 'ERR_REQUEST_ERROR'),
           error as Error,
           options,
           response,
@@ -2630,7 +2725,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       );
     }
 
-    return this.toRequestError(messageOf(error, 'Request error'), 'ERR_REQUEST_ERROR', error, options);
+    return this.toRequestError(messageOf(error, 'Request error'), codeOf(error, 'ERR_REQUEST_ERROR'), error, options);
   }
 
   /**

@@ -245,6 +245,9 @@ reason.
 both inside a synchronous dispatch interceptor, so a promise returned from them is not awaited. They
 are for logging, metrics, and (for `beforeRedirect`) adjusting `request.headers` on the next hop.
 
+`beforeRetry` is told why the attempt it is retrying failed: `statusCode` for an attempt that got a
+response, `error` for one that failed before its headers arrived. Exactly one of the two is set.
+
 `retryWithMergedOptions` re-runs the request with `newOptions` merged over the ones it was sent
 with (`headers` and `context` merge one level deep, everything else is replaced). It goes straight
 back to the request - handlers already ran and are not re-entered.
@@ -363,11 +366,17 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 | `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request`, or an `AbortSignal.timeout()` fired |
 | `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType`, on a status that was otherwise fine. On an error status the status wins: the body is left as the text that arrived, the hooks still see it, and `throwHttpErrors` decides - so a 500 carrying a proxy's HTML page is an `HTTPError`, not a parse failure |
 | `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
-| `RequestError` | `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
+| `RequestError` | the underlying error's own `code`, or `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
 
 `error.message` is the underlying failure's own - `connect ECONNREFUSED 127.0.0.1:443`,
 `getaddrinfo ENOTFOUND …` - not a generic label, so a log line or an APM grouping can tell one
 transport failure from another. The originating error is also kept as `error.cause`.
+
+`error.code` comes from that same underlying error, as got's does: `ECONNREFUSED`, `ENOTFOUND`,
+`ERR_INVALID_URL`. What undici raises is passed through as it stands, so a failure undici describes
+itself arrives under its own name (`UND_ERR_SOCKET` for a connection dropped mid-body) where got -
+which does not use undici - would say `ECONNRESET`. `ERR_REQUEST_ERROR` is the fallback, for a
+failure carrying no code of its own: a throwing hook, say.
 
 Hooks are inside this: anything a `beforeRequest`, `afterResponse` or `beforeError` hook throws comes back as a `RequestError` carrying the hook's own message, not as the raw error.
 
@@ -380,6 +389,20 @@ hooks applied, whether the failure came before the response head (connection ref
 `timeout.request`), from the status (`throwHttpErrors`), or part-way through the body (a truncated
 download). `stream.errored`, the `error` event, `stream.response` and `stream.pipeline` all report
 the identical normalised error - undici's raw `SocketError`/`DOMException` never reaches you.
+
+A failure that arrives before the response head is emitted to an `error` listener whether or not
+anything ever reads the stream, so the got-shaped pattern works as written:
+
+```js
+const stream = await client.stream(url);
+
+stream.on('error', (error) => console.error(error.code));
+stream.on('response', () => stream.pipe(destination));
+```
+
+A stream nobody is listening to keeps its failure until it is read, rather than emitting an `error`
+with no handler and taking the process down - `await stream.response` reports the same failure and
+attaches no listener.
 
 ## Bodyless responses
 

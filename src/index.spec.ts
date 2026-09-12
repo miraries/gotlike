@@ -439,6 +439,34 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  /*
+   * A 503, then a killed socket, then a success. The two retries have different reasons,
+   * which is what `beforeRetry` has to report separately - the status of the attempt that
+   * produced one used to survive onto the attempt that produced the other.
+   */
+  if (req.url === '/retry-reset') {
+    const testId = req.headers['test-id']?.toString() ?? 'default';
+
+    serverState.retryCounts[testId] = serverState.retryCounts[testId] ? serverState.retryCounts[testId] + 1 : 1;
+
+    if (serverState.retryCounts[testId] === 1) {
+      res.statusCode = 503;
+      res.end();
+
+      return;
+    }
+
+    if (serverState.retryCounts[testId] === 2) {
+      req.socket.destroy();
+
+      return;
+    }
+
+    res.end('ok');
+
+    return;
+  }
+
   if (req.url === '/retry') {
     const testId = req.headers['test-id']?.toString() ?? 'default';
 
@@ -614,7 +642,7 @@ test('a failed request cancels its deadline too', async () => {
   try {
     const error = await failure(client.get('http://127.0.0.1:1/', {timeout: {request: delay}}));
 
-    assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+    assert.strictEqual(error.code, 'ECONNREFUSED');
     assert.strictEqual(deadlines.armed(), 1, 'the request should have armed a cancellable deadline');
     assert.strictEqual(deadlines.pending(), 0, 'a connection failure should cancel the deadline as well');
   } finally {
@@ -1562,7 +1590,7 @@ test('timeout error preserves the underlying undici error as cause', async () =>
 test('connection error has no response and preserves the cause', async () => {
   const err = await failure<RequestError>(client.get('http://localhost:3999/nothing-listening'));
 
-  assert.strictEqual(err.code, 'ERR_REQUEST_ERROR');
+  assert.strictEqual(err.code, 'ECONNREFUSED');
   assert.strictEqual(err.response, undefined);
   assert.ok(err.cause instanceof Error);
 });
@@ -2231,6 +2259,35 @@ test('beforeRetry reports the error for a transport failure', async () => {
 
   assert.strictEqual(seen.length, 1);
   assert.ok(seen[0] instanceof Error);
+});
+
+/*
+ * An attempt that failed before its headers arrived produced no status at all, but the
+ * previous attempt's was left on the shared state holder - so a 503 followed by a socket
+ * reset told the hook that the reset had arrived with a 503, a response it was never sent.
+ */
+test('beforeRetry reports no status for an attempt that never got one', async () => {
+  const seen: {statusCode?: number; code?: string; retryCount: number}[] = [];
+
+  const extClient = client.extend({
+    headers: {'test-id': randomUUID()},
+    retry: {limit: 3, backoffLimit: 10, statusCodes: [503], errorCodes: ['ECONNRESET', 'UND_ERR_SOCKET']},
+    hooks: {
+      beforeRetry: [
+        (error, statusCode, retryCount) => {
+          seen.push({statusCode, code: (error as RequestError | undefined)?.code, retryCount});
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get('http://localhost:3000/retry-reset');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.deepStrictEqual(seen, [
+    {statusCode: 503, code: undefined, retryCount: 1},
+    {statusCode: undefined, code: 'UND_ERR_SOCKET', retryCount: 2},
+  ]);
 });
 
 test('beforeRetry does not fire when nothing is retried', async () => {
@@ -3287,13 +3344,14 @@ test('an error thrown by a beforeRequest hook is a RequestError and runs beforeE
 test('a transport failure reports the underlying message, not a generic label', async () => {
   const refused = await failure(client.get('http://127.0.0.1:1/nothing-here'));
 
-  assert.strictEqual(refused.code, 'ERR_REQUEST_ERROR');
+  // The underlying error's own code, as got reports it - not the generic label.
+  assert.strictEqual(refused.code, 'ECONNREFUSED');
   assert.match(refused.message, /ECONNREFUSED/);
   assert.notStrictEqual(refused.message, 'Request error');
 
   const malformed = await failure(client.get('not-a-url'));
 
-  assert.strictEqual(malformed.code, 'ERR_REQUEST_ERROR');
+  assert.strictEqual(malformed.code, 'ERR_INVALID_URL');
   assert.match(malformed.message, /Invalid URL/);
 
   // The originating error is still on `cause` as well.
@@ -3722,10 +3780,62 @@ test('a connection failure on a bodyless stream is a RequestError with beforeErr
   const error = await failure(text(stream));
 
   assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
-  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
-  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+  assert.strictEqual(error.code, 'ECONNREFUSED');
+  assert.deepStrictEqual(seen, ['ECONNREFUSED']);
   // The underlying reason survives onto `message`, not just onto `cause`.
   assert.match(error.message, /ECONNREFUSED/);
+});
+
+/*
+ * got emits a stream's failure whether or not the stream is ever read, and the pattern that
+ * relies on it is ordinary: listen for `error` and `response`, pipe from inside the `response`
+ * handler. A request that failed before any response never fires `response`, so nothing ever
+ * reads the stream - and raising the error at read time alone left that caller waiting on a
+ * stream that had already failed.
+ */
+test('a pre-response stream failure reaches an error listener that never reads', async () => {
+  const stream = await client.stream('http://127.0.0.1:1/nothing-here');
+
+  const error = await failure(new Promise((_resolve, reject) => stream.on('error', reject)));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
+  assert.strictEqual(error.code, 'ECONNREFUSED');
+});
+
+// The same, for a listener attached later than the tick the stream was handed over on.
+test('a pre-response stream failure reaches an error listener attached late', async () => {
+  const stream = await client.stream('http://127.0.0.1:1/nothing-here');
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const error = await failure(new Promise((_resolve, reject) => stream.on('error', reject)));
+
+  assert.strictEqual(error.code, 'ECONNREFUSED');
+});
+
+// The stand-in duplex of a request `undici.pipeline` rejected outright, which nothing writes
+// to either once it has failed.
+test('an upload stream failure reaches an error listener that never writes', async () => {
+  const upload = await client.stream('http://::invalid-url::', {method: 'POST'});
+
+  const error = await failure(new Promise((_resolve, reject) => upload.on('error', reject)));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
+});
+
+/*
+ * The other half of the same decision: an `error` emitted with nothing listening for it is an
+ * uncaught exception, and `await stream.response` - which reports this very failure - attaches
+ * no listener at all. So a stream no one is listening to keeps its failure until it is read,
+ * and this test fails by taking the whole process down if that stops being true.
+ */
+test('a stream nobody listens to raises nothing on its own', async () => {
+  const stream = await client.stream('http://127.0.0.1:1/nothing-here');
+
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  assert.strictEqual(stream.destroyed, false);
+  assert.strictEqual((await failure(stream.response)).code, 'ECONNREFUSED');
 });
 
 test('a connection failure on an upload stream is a RequestError with beforeError applied', async () => {
@@ -3738,8 +3848,8 @@ test('a connection failure on an upload stream is a RequestError with beforeErro
   const error = await failure(text(duplex));
 
   assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
-  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
-  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+  assert.strictEqual(error.code, 'ECONNREFUSED');
+  assert.deepStrictEqual(seen, ['ECONNREFUSED']);
 });
 
 test('the response promise of a failed upload stream rejects with the normalised error', async () => {
@@ -3752,7 +3862,7 @@ test('the response promise of a failed upload stream rejects with the normalised
 
   // It used to reject with undici's raw error while the stream itself reported something else.
   assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
-  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+  assert.strictEqual(error.code, 'ECONNREFUSED');
 });
 
 test('timeout.request on an upload stream is a TimeoutError, not a DOMException', async () => {
@@ -3782,7 +3892,8 @@ test('a truncated body on a bodyless stream is a RequestError with beforeError a
   const error = await failure(text(stream));
 
   assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
-  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+  // undici describes this one itself, so its own code is what comes through.
+  assert.deepStrictEqual(seen, ['UND_ERR_SOCKET']);
 });
 
 test('a truncated body on an upload stream is a RequestError with beforeError applied', async () => {
@@ -3795,7 +3906,7 @@ test('a truncated body on an upload stream is a RequestError with beforeError ap
   const error = await failure(text(duplex));
 
   assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
-  assert.deepStrictEqual(seen, ['ERR_REQUEST_ERROR']);
+  assert.deepStrictEqual(seen, ['UND_ERR_SOCKET']);
 });
 
 test('stream.errored reports the normalised error, not undici’s raw one', async () => {
@@ -4075,7 +4186,7 @@ test('a failure inside an afterResponse retry runs beforeError exactly once', as
 
   const error = await failure(extClient.get('http://localhost:3000/json'));
 
-  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR');
+  assert.strictEqual(error.code, 'ECONNREFUSED');
   assert.strictEqual(seen.length, 1);
 });
 

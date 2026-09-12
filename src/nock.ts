@@ -32,8 +32,14 @@ type PathMatcher = string | RegExp | ((path: string) => boolean);
  */
 type BodyMatcher = string | RegExp | Record<string, any> | unknown[] | ArrayBufferView | ((body: string) => boolean);
 
-/** `true` matches any query string, an object matches those exact params. */
-type QueryMatcher = boolean | Record<string, any> | URLSearchParams | QueryPredicate;
+/**
+ * `true` matches any query string, an object matches those exact params.
+ *
+ * `true` rather than `boolean`: nock throws `Argument Error: false` for `.query(false)`, so
+ * accepting one here would take a call nock rejects outright and silently apply no query
+ * expectation at all.
+ */
+type QueryMatcher = true | Record<string, any> | URLSearchParams | QueryPredicate;
 
 /** nock's `.query(fn)`: the whole parsed query at once, repeated keys as arrays. */
 type QueryPredicate = (query: Record<string, string | string[]>) => boolean;
@@ -538,10 +544,7 @@ class Interceptor {
   #intercept(): MockInterceptor {
     // Only `.query(true)` needs a query-ignoring matcher.
     const ignoreQuery = this.#query === true;
-    const explicitQuery =
-      this.#query !== undefined && this.#query !== true && this.#query !== false
-        ? queryToObject(this.#query)
-        : undefined;
+    const explicitQuery = this.#query !== undefined && this.#query !== true ? queryToObject(this.#query) : undefined;
 
     // A literal `?` on the path itself - `nock(origin).get('/search?type=user')` - can't be
     // handed to undici alongside a `query`: `serializePathWithQuery` throws outright when the

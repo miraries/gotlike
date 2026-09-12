@@ -30,10 +30,12 @@ const json = client.extend({responseType: 'json', throwHttpErrors: false});
 /**
  * An unmatched interceptor surfaces as a normal request failure carrying undici's
  * "Mock dispatch not matched" text - on the `RequestError`'s own message as well as on the
- * cause, since `ERR_REQUEST_ERROR` reports the underlying message rather than a generic label.
+ * cause, since a transport failure reports the underlying message rather than a generic
+ * label, and the underlying `code` along with it (undici's own for a mock miss, a
+ * `MockNotMatchedError`; `ERR_REQUEST_ERROR` only when the failure carries no code).
  */
 function assertUnmatched(error: RequestError, why: string) {
-  assert.strictEqual(error.code, 'ERR_REQUEST_ERROR', why);
+  assert.strictEqual(error.code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED', why);
   assert.match(error.message, /Mock dispatch not matched|Net connect/, why);
   assert.match((error.cause as Error).message, /Mock dispatch not matched|Net connect/, why);
 }

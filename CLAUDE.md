@@ -146,9 +146,22 @@ real url carries credentials. `parseUserinfo: false` (client-only, same reasonin
 to `splitUserinfo` entirely for a client that never sees one. Explicit `username`/`password` options are
 unaffected, since they don't go through it.
 
-Every failure is normalized into a `RequestError` carrying `options` and the undici response, with `code` one of
-`ETIMEDOUT` (headers/body timeout), `ERR_BODY_PARSE_FAILURE` (JSON parse — the raw text is attached to
-`response.body` so callers can inspect it), `ERR_HTTP_ERROR`, or `ERR_REQUEST_ERROR`.
+Every failure is normalized into a `RequestError` carrying `options` and the undici response, with `code` either
+one of the codes the class decides — `ETIMEDOUT` (headers/body timeout), `ERR_BODY_PARSE_FAILURE` (JSON parse —
+the raw text is attached to `response.body` so callers can inspect it), `ERR_HTTP_ERROR`, `ERR_ABORTED` — or,
+for anything generic, **the underlying error's own `code` via `codeOf()`**, with `ERR_REQUEST_ERROR` as the
+fallback.
+
+**That passthrough is what makes `err.code === 'ECONNREFUSED'` work, which is how got callers write it.** got's
+`RequestError` takes `error.code ?? 'ERR_GOT_REQUEST_ERROR'`; every generic failure here was flattened to
+`ERR_REQUEST_ERROR` instead, with the real code reachable only through `cause` — so a connection refused, a DNS
+failure and a malformed url were indistinguishable to anything matching on `code`, exactly as they had been on
+`message` before `messageOf`. Measured against got 14: `ECONNREFUSED` and `ENOTFOUND` on both. Whatever undici
+raised is passed through as it stands, so parity is exact for the errno codes it surfaces from the socket and
+undici's own where it describes the failure itself (`UND_ERR_SOCKET` for a body cut short, where got says
+`ECONNRESET`) — the README says so rather than pretending otherwise. `codeOf` requires a **string**: a
+`DOMException`'s `code` is a legacy number (23 for a timeout) that no caller matching on the documented codes
+wants, and those paths assign their own code anyway.
 
 **`isHttpError` takes whether the request was following redirects.** A 3xx is an error only when it was: reaching
 the caller then means undici gave up on a chain longer than `maxRedirections`, and that used to resolve as a
@@ -380,8 +393,15 @@ per request. Both were lists that could silently drift.
 undici exposes no retry counter — `response.context` is `null` after a retried request, and the
 `retryOptions.retry` callback would mean reimplementing undici's default backoff to delegate to it. Instead
 `countAttempts`, a plain interceptor composed **inside** the retry interceptor, sees every re-dispatch; the
-count minus one is `retryCount`. `AttemptHandler` (a `DecoratorHandler`) records each attempt's status or
+count minus one is `retryCount`. `OutcomeHandler` (a `DecoratorHandler`) records each attempt's status or
 error so the next dispatch can report why it was retried. All public API.
+
+**`onResponseError` clears the status as well as recording the error**, which `onResponseStart` has always done
+in the other direction. An attempt that failed before its headers arrived produced no status at all, but the
+previous attempt's survived on the shared holder — so a 503 followed by a socket reset told `beforeRetry` that
+the reset had come with a 503, a response that attempt was never sent, and a hook branching on the status acted
+on it. Exactly one of `error`/`statusCode` reaches the hook now; the redirect tracker reads the same field as its
+"this hop is not a redirect" guard (`lastStatusCode === undefined`), so the two agree.
 
 `beforeRetry` fires from that interceptor and **cannot delay or cancel a retry** — undici decides to retry
 inside a synchronous dispatch, so there is nothing to await on. It is for logging and metrics; this is a
@@ -504,6 +524,26 @@ moment: synchronously, the error is emitted before an awaiting caller attaches a
 a small body has already been consumed and the read finished cleanly. The `response` event goes out on
 `setImmediate` for the same reason — a microtask queued before `await stream(...)` resolves fires first and
 is missed.
+
+**Read time is not the only trigger, though: `raiseWhenListening` also raises it as soon as something listens
+for `error`.** got emits a stream's failure whether or not the stream is ever read, and the pattern that
+depends on that is ordinary — listen for `error` and `response`, pipe from inside the `response` handler. A
+request that failed before any response never fires `response`, so nothing ever read the stream, so the error
+was never raised and the caller waited forever on a request that had already failed. (`stream.response` did
+reject throughout — the `.catch(noop)` on it only marks the rejection handled — so the failure was reachable,
+just not where a got-shaped caller was looking.)
+
+Destroying unconditionally is what can't be done, and is why this is gated on a listener existing rather than
+done on the next tick: an `error` with no handler is an uncaught exception, and `await stream.response`
+attaches no listener at all. So: a listener at `setImmediate` time gets the error then; one attached later
+gets it via a one-shot `newListener` hook (on `setImmediate` again, since the listener being added isn't
+registered until that handler returns); nothing listening leaves it at read time, as before. Armed *after*
+the `response` emit is queued, so a caller listening for both sees the head first.
+
+This applies to the two **synthetic** streams only — `asStream`'s error readable and `failedUploadStream`.
+A failure undici itself reports arrives on a real stream that undici destroys, which emits to a listener
+already: a POST to a refused port comes back as a genuine `undici.pipeline` duplex, not `failedUploadStream`,
+which is only reached when `pipeline` rejects its arguments synchronously.
 
 `stream()` resolves to a `GotlikeStream` (a `Duplex`) rather than returning one synchronously as got does —
 `beforeRequest` hooks are async and awaiting them is worth more than the sync return. The head arrives via
@@ -659,6 +699,10 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   separates them and every interceptor path gets the prefix folded in.
 - **String paths match the full request path including its query**, which is also nock's behaviour. `.query(true)`
   therefore has to become a *function* path matcher that strips the query before comparing.
+- **`QueryMatcher` is `true`, not `boolean`.** Real nock throws `Argument Error: false` for `.query(false)` —
+  verified against nock 14 — so accepting one here took a call nock rejects outright and silently applied no
+  query expectation at all. nock's "must carry no query" is `.query({})`. (A regex path with no `.query()` is
+  matched against the path *including* its query, in the shim and in nock alike; that one was checked too.)
 - **Object queries must NOT use a function matcher.** undici folds `query` into the interceptor's stored path
   string (`serializePathWithQuery`) and compares strings; a function matcher silently defeats that and matches
   every query. This was a real bug — the test `query(object) matches only those params` guards it.
