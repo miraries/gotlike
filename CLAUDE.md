@@ -849,6 +849,47 @@ unconditionally, which is how the timeout test sat green while asserting nothing
 now — `typescript/no-floating-promises` is on, with `node:test`'s own `test`/`describe`/`before`/… allowlisted so
 the ~330 test cases don't bury the one report that matters.
 
+## Parity suite
+
+`src/parity/` runs the same scenario through **real got 14** and through gotlike, against one local
+server, and asserts that both what the caller sees and what reached the server are identical. `npm run
+parity` runs it alone; `npm test` (and so `npm run check` and CI) picks it up with everything else.
+
+It exists because the "measured against got 14" claims throughout this file and the specs were
+hand-verified once, in a session, and then never re-run. They were the most valuable thing documented
+here and the easiest to silently invalidate — a fix that changes behaviour has no way of knowing it
+broke a parity claim recorded in prose. Now it does.
+
+Three pieces:
+
+- **`server.ts`** — the shared server. Deliberately separate from `index.spec.ts`'s: parity is mostly a
+  question of what the client put on the wire, so nearly every route funnels into an `/echo` that
+  reflects method, path, headers and body back. Listens on port 0, because the spec files run in
+  parallel processes and a fixed port makes the suite fail on what else is running. `reset()` clears
+  the attempt counters as well as the wire log — a scenario runs once per client, and both runs have to
+  see the same server.
+- **`harness.ts`** — `parityTest(name, scenario)`, plus the two allowlists.
+- **`parity.spec.ts`** — the scenarios, each carrying the `claim` it pins.
+
+**Everything not explicitly recorded as divergent must match exactly.** That is what makes the suite
+converge instead of drifting: there is no "close enough". Two escape hatches, and both are stricter
+than they look:
+
+- **`DIVERGENT_REQUEST_HEADERS`** — request headers allowed to differ, each with its reason. The map
+  *is* the wire-level divergence inventory.
+- **`scenario.divergence`** — an intended behavioural difference, recorded as the exact value **each**
+  client produces. This is stronger than skipping, and stronger than asserting "these differ": both
+  sides stay pinned, so the test fails if gotlike drifts *and* if a got upgrade changes got. A `skip`
+  would catch neither.
+
+The suite prints the full inventory when it finishes. Six behavioural divergences are recorded as of
+writing, and two of them are findings rather than decisions — gotlike ships no `head()` verb, and its
+`ValidationError` carries no `code` — both flagged in the reasons.
+
+**Adding a divergence is a deliberate act.** If a change makes something new diverge, the suite fails
+until someone writes down why that is acceptable. Reaching for `divergence` to make a red test green is
+how this stops being worth anything.
+
 ## Benchmark
 
 `benchmark/` is a separate npm project (ESM, its own `node_modules`). `npm run bench` from there builds the

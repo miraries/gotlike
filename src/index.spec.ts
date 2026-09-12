@@ -4830,9 +4830,14 @@ test('stream is the same object on each read and belongs to its own client', asy
 });
 
 /*
- * Two behaviours the review called corruption, both measured against got 14 and both exactly
- * what got does. They are locked down here so a well-meaning "fix" has to argue with the
- * measurement rather than with a comment.
+ * Two behaviours the review called corruption, both measured against got 14. They are locked
+ * down here so a well-meaning "fix" has to argue with the measurement rather than with a
+ * comment.
+ *
+ * Note the qualifier the parity suite added: the url append matches got only when no
+ * `searchParams` is set. With one, gotlike re-resolves the url from it on each attempt and the
+ * append does not accumulate, where got's does - see `src/parity/parity.spec.ts`, which pins
+ * both halves.
  *
  * A `beforeRequest` hook that appends to `options.url` runs again on the retry, over the url
  * the first attempt went out with: got 14 sends `/items?sig=x` then `/items?sig=x&sig=x`.

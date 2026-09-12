@@ -10,5 +10,6 @@
     "allowImportingTsExtensions": false
   },
   "include": ["src"],
-  "exclude": ["**/*.spec.ts"]
+  /* The parity harness imports `got`, which is a devDependency - it must never reach `dist/`. */
+  "exclude": ["**/*.spec.ts", "src/parity/**"]
 }
