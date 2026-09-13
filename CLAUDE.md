@@ -73,12 +73,17 @@ Two invariants worth preserving here:
   picked one — usually the stale one. Only the override side is walked on the hot path; the defaults are
   already normalised.
 - **A `url` is given as an argument or as an option, never both.** The argument used to overwrite the option
-  in silence; got refuses the combination too. **got 16 went further and dropped `url` as an option entirely**
-  (`The \`url\` option is not supported in options objects. Pass it as the first argument instead.`, a
-  `TypeError` thrown for the option whether or not an argument sits beside it — got 12 and 14 accepted it and
-  rejected only the combination). gotlike keeps the option: the callable `client({url, ...})` form is built on
-  it, and `igd-aggregator-api` is on `got-cjs@12`, where it is ordinary. Both halves of that are pinned in the
-  parity suite. The check sits inside the `url !== undefined` branch and behind `validate`, so the hot path pays
+  in silence; got refuses the combination too. **Since got 15 a `url` key in an options object is rejected
+  outright** — `assertNoUrlInOptionsObject` in `create.js` throws
+  `TypeError: The \`url\` option is not supported in options objects. Pass it as the first argument instead.`
+  for a request's options, for `extend()` and for `paginate()`, with or without an argument beside it. got 12
+  and 14 accepted the option and rejected only the combination (measured on 14.6.6). It is `url` as an *input
+  key* that is gone; a hook can still read and write `options.url`, it is simply no longer an own enumerable
+  property. got 15's release notes list this as "`url` removed from public options objects" and describe the
+  hooks half of it; the input rejection is not spelled out there, and got 16's notes and readme do not mention
+  it at all. gotlike keeps the option: the callable `client({url, ...})` form is built on it, and
+  `igd-aggregator-api` is on `got-cjs@12`, where it is ordinary. Both halves of that are pinned in the parity
+  suite. The check sits inside the `url !== undefined` branch and behind `validate`, so the hot path pays
   one property read for it. The callable form therefore passes its url in the options only - handing it over
   positionally as well was always redundant, since `formOptions` spreads it in either way, and would now be
   rejected.
@@ -962,11 +967,12 @@ note about how to measure it before believing any number you get. The last is th
 gotlike is *more* permissive than got (a leading slash under `prefixUrl`), which is now in the README's
 divergence table rather than only in a test.
 
-The sixth arrived with the got 16 bump rather than from anything changing here: **got 16 dropped `url` as
-an option**, so `got({url, ...})` and `got(url, {url})` both throw a `TypeError` where got 12 and 14 took
-the first and rejected only the second. gotlike keeps the option, because the callable `client({url, ...})`
+The sixth arrived with the bump rather than from anything changing here: **got rejects a `url` key in an
+options object**, so `got({url, ...})` and `got(url, {url})` both throw a `TypeError` where got 12 and 14
+took the first and rejected only the second. The change landed in **got 15**, not 16 — the suite was simply
+still pinned to 14 and had never seen it. gotlike keeps the option, because the callable `client({url, ...})`
 form the README advertises is built on it and `got-cjs@12` — what the consumer actually runs — accepts it.
-Both halves are pinned. This is what the bump was for: one upstream behaviour change, surfaced by a failing
+Both halves are pinned. This is what the bump was for: an upstream behaviour change surfaced by a failing
 test naming the exact value that moved, rather than by a caller finding it.
 
 **Adding a divergence is a deliberate act.** If a change makes something new diverge, the suite fails

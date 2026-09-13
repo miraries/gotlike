@@ -2571,8 +2571,8 @@ test('validation runs on create and extend, throwing synchronously', () => {
 
 /*
  * got refuses this outright rather than picking a winner; the argument used to overwrite the
- * option with nothing said. Measured against got 16, which rejects `url` in an options object
- * in every position - it dropped the option altogether. gotlike keeps it, because the
+ * option with nothing said. Measured against got 16, which rejects a `url` key in an options
+ * object in every position - a change that landed in got 15. gotlike keeps it, because the
  * options-only callable form is the legal way to pass a url as an option and has to keep
  * working; the parity suite pins both sides of that difference.
  */

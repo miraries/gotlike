@@ -527,8 +527,8 @@ parityTest('a url given both as an argument and as an option is rejected', {
   divergence: {
     reason:
       'The claim holds - both refuse, and neither sends a request. What is left is the error’s class ' +
-      'and code: got 16 throws a bare `TypeError` with no code (it has dropped `url` as an option ' +
-      'altogether, so the message is about the option rather than the combination), gotlike a ' +
+      'and code: got throws a bare `TypeError` with no code (since got 15 a `url` key in an options ' +
+      'object is refused outright, so the message is about the option rather than the combination), gotlike a ' +
       '`ValidationError` with `ERR_INVALID_OPTION`. Keeping a distinct class for "you configured this ' +
       'wrong" rather than folding it into `RequestError` is deliberate, since it is a programming error ' +
       'rather than a request that failed. got 14 threw a `RequestError`/`ERR_GOT_REQUEST_ERROR` here ' +
@@ -581,8 +581,8 @@ parityTest('a url given only as an option', {
   },
   divergence: {
     reason:
-      'got 16 dropped `url` as an option: it throws a `TypeError` rather than sending anything, in ' +
-      'this position as well as alongside a positional argument. gotlike accepts it and dispatches, ' +
+      'got refuses a `url` key in an options object as of got 15: it throws a `TypeError` rather than ' +
+      'sending anything, here as well as alongside a positional argument. gotlike accepts it and dispatches, ' +
       'because the callable `client({url, ...})` form is built on that option and got-cjs@12 - what ' +
       'the consumer this package exists for actually runs - accepts it too. Dropping it to match got ' +
       '16 would break the documented callable form for no gain.',

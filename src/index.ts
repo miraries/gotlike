@@ -2272,12 +2272,12 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     if (url !== undefined) {
       // got refuses this rather than picking a winner, and two urls in one call is always a
       // mistake worth hearing about - the argument used to quietly overwrite the option.
-      // Measured against got 16, which goes further and has dropped `url` as an option
-      // altogether (`The \`url\` option is not supported in options objects. Pass it as the
-      // first argument instead.`, thrown for the option with or without an argument beside
-      // it). The options-only callable form is built on that option, so it stays. Inside the
-      // `url !== undefined` branch and behind `validate`, so the hot path pays one property
-      // read for it.
+      // Measured against got 16, which goes further: since got 15 a `url` key in any options
+      // object is a TypeError (`The \`url\` option is not supported in options objects. Pass
+      // it as the first argument instead.`), with or without an argument beside it, and in
+      // `extend()` too. The options-only callable form is built on that option, so it stays.
+      // Inside the `url !== undefined` branch and behind `validate`, so the hot path pays one
+      // property read for it.
       if (this.validate && options.url !== undefined) {
         invalid('`url` cannot be given both as an argument and as an option');
       }
