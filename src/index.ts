@@ -430,6 +430,13 @@ function makeRedirectTracker(hooks?: Hooks['beforeRedirect']): Dispatcher.Dispat
   return trackDispatches(
     (opts) => opts.redirects,
     (state, opts) => {
+      /*
+       * Unreachable in practice, and kept anyway: `countAttempts` resets `redirects.count` to 0
+       * on a retry, so a retried attempt's first hop never reaches this callback and there is no
+       * re-dispatch left that carries no status. It still earns its place as the narrowing that
+       * makes `lastStatusCode` a `number` for the hook call below - removing it is a type error,
+       * not a no-op - and as the second guard on the bug in the comment above.
+       */
       if (state.lastStatusCode === undefined) {
         return;
       }
@@ -3003,14 +3010,20 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // Fires with the normalised error, since that is what `_destroy` hands on to be emitted.
     duplex.on('error', (error: Error) => rejectHead(error));
 
-    // `undici.pipeline` takes the request body from the duplex's writable side, not from
-    // `opts.body` - so a body supplied through the options has to be written here. A method
-    // that can't carry a body is ended straight away; anything else is left open for the
-    // caller to write to and end themselves.
+    /*
+     * `undici.pipeline` takes the request body from the duplex's writable side, not from
+     * `opts.body` - so a body supplied through the options has to be written here. With no
+     * body in the options the writable half is left open for the caller to write to and end
+     * themselves, which is the whole reason this path hands back a duplex.
+     *
+     * There is no arm here for a method that cannot carry a body: `call()` routes those to
+     * `callBodylessStream` before ever reaching this, so the only methods that get here are
+     * `bodyMethods` ones. If that routing is ever widened, this needs an `end()` for the
+     * bodyless case again - without one `undici.pipeline` never sends the request and the
+     * caller waits forever.
+     */
     if (options.body !== undefined && options.body !== null) {
       duplex.end(options.body);
-    } else if (!isBodyMethod(options.method)) {
-      duplex.end();
     }
 
     duplex.response = head;

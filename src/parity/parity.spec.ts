@@ -422,6 +422,43 @@ parityTest('prefixUrl joins without doubling the slash', {
   },
 });
 
+/*
+ * Found by the property tests, which generated a leading slash on a relative path and got two
+ * different answers. Worth pinning rather than folding away: it is the one place found so far
+ * where gotlike accepts what got refuses, and being *more* permissive than the thing you are
+ * standing in for is its own hazard - a consumer's accidental `/path` under a `prefixUrl` is a
+ * loud error in got and a silent one here.
+ */
+parityTest('a leading slash on a path under prefixUrl', {
+  claim: 'CLAUDE.md: every leading slash is stripped from `url`, not just the first.',
+  run: async (client, base) => {
+    const scoped = client.extend({prefixUrl: base, responseType: 'json'});
+
+    return capture(async () => {
+      const response = await scoped.get('/echo');
+
+      return (response.body as {path: string}).path;
+    }, base);
+  },
+  divergence: {
+    reason:
+      'got refuses the combination outright ("`url` must not start with a slash"). gotlike strips every ' +
+      'leading slash and dispatches - which is what keeps `//x` from joining as `prefix//x`, but ' +
+      'also means a caller who meant an absolute path gets a silently different request where got ' +
+      'would have stopped them. Nothing in CLAUDE.md said got rejects it; the note there only ' +
+      'covers the doubled-slash half.',
+    got: {
+      outcome: 'rejected',
+      name: 'RequestError',
+      code: 'ERR_GOT_REQUEST_ERROR',
+      message: '`url` must not start with a slash',
+      responseStatus: undefined,
+      responseBody: undefined,
+    },
+    gotlike: {outcome: 'resolved', value: '/echo'},
+  },
+});
+
 /* ----------------------------------------------------------------------- resolveBodyOnly */
 
 parityTest('resolveBodyOnly hands back the body rather than the response', {

@@ -1167,6 +1167,9 @@ test('a base path with query(true) still rejects a path outside it', async () =>
 
 // nock takes node's legacy `Url` object as well as a string or a `URL`.
 test('a legacy Url object is accepted as an origin', async () => {
+  // `url.parse` is deprecated, which is precisely why this is worth a test: nock's signature
+  // accepts the legacy `Url` object and consumers still pass one.
+  // oxlint-disable-next-line typescript/no-deprecated
   nock(parseUrl('http://legacyurl.test/base')).get('/p').reply(200, 'matched');
 
   assert.strictEqual((await client.get('http://legacyurl.test/base/p')).body, 'matched');

@@ -758,12 +758,16 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   that path is a string, so behind the function matcher a regex or function path uses for `.query({...})` the
   constraint was dropped entirely and every query matched. `queryMatches` checks it inside the matcher instead;
   `options.query` is only handed to undici when undici is the one that can apply it.
-- **A query *value* may be a RegExp, a predicate or an array**, as it may in nock. All three went through
-  `String(value)`, which turns a RegExp into the literal `"/bar/"` and an array into `"1,2"` — neither of which any
-  real query string can equal, so those interceptors silently never matched. `queryValueMatches` handles each
-  shape, and `isSerialisableQuery` keeps a RegExp or predicate value away from undici, which would serialise it
-  into its stored path. The entry count is compared against the flattened expectation, so a repeated key is only
-  satisfied by an array of the same length.
+- **A query *value* may be a RegExp, a predicate or an array.** All three went through `String(value)`, which
+  turns a RegExp into the literal `"/bar/"` and an array into `"1,2"` — neither of which any real query string
+  can equal, so those interceptors silently never matched. `queryValueMatches` handles each shape, and
+  `isSerialisableQuery` keeps a RegExp or predicate value away from undici, which would serialise it into its
+  stored path. The entry count is compared against the flattened expectation, so a repeated key is only
+  satisfied by an array of the same length. **The RegExp and the array are nock's; the predicate is not** — this
+  said "as it may in nock" and the nock parity suite measured otherwise. nock 14 compares a query value as a
+  string or a RegExp only, so a function value there matches nothing and the request goes to the real network.
+  The shim is deliberately more permissive, which is its own hazard: a mock written this way passes here and
+  fails on a move back to nock. `.query(fn)` over the whole query *is* nock's, and is the portable form.
 - **A RegExp or predicate *inside* an array counts too**, on both sides of that. The array branch compared
   `values[i] === String(item)`, and `isSerialisableQuery` only looked at top-level values — so `{tags: [/news/,
   'updates']}` was both matched by stringifying the regex and handed to undici to stringify again.
@@ -851,7 +855,7 @@ the ~330 test cases don't bury the one report that matters.
 
 ### Coverage
 
-`npm run coverage` runs the suite with coverage on and **fails below 99.5% lines / 95.5% branches / 98%
+`npm run coverage` runs the suite with coverage on and **fails below 99.8% lines / 95.9% branches / 98%
 functions**. `npm run check` runs it in place of `npm test`, so CI enforces it with no workflow change.
 `npm test` stays the plain runner for local work.
 
@@ -862,19 +866,23 @@ functions. What that pass turned up is worth knowing, because it was all public 
 `put`/`patch`/`delete` on the client and five of the eight verbs on a nock `Scope` had no test at all,
 nor did `once`/`twice`/`thrice`, `delay`, `abortPendingRequests`, or `enableNetConnect`.
 
-**Five uncovered branches remain, and all five are deliberate.** They are listed here so nobody has to
-work out a second time whether they matter:
+**Four uncovered branches remain, and all four are deliberate.** They are listed here so nobody has to work
+out a second time whether they matter:
 
 | where | why it is uncovered |
 | --- | --- |
 | `index.ts` `headersToObject`, non-array arm | One call site, and undici always hands it the flat array form at a redirect hop. Defensive. |
-| `index.ts` redirect tracker, `lastStatusCode === undefined` | Made unreachable by the fix beside it: `countAttempts` resets `redirects.count` to 0 on a retry, so the retried attempt's first hop never reaches `onRedispatch`. Two mechanisms guard one bug and the count reset is the one that works. Removable, if anyone wants to. |
+| `index.ts` redirect tracker, `lastStatusCode === undefined` | Unreachable in practice — `countAttempts` resets `redirects.count` to 0 on a retry, so a retried attempt's first hop never reaches the callback. **Not removable:** it is also the narrowing that makes `lastStatusCode` a `number` for the hook call below it, and deleting it is a type error rather than a no-op. |
 | `index.ts` `callStream` http-error readable, `raised` guard | Needs undici's duplex to pull twice before the queued destroy lands — a race, not a behaviour. Any test for it would be flaky. |
-| `index.ts` `callStream` `else if (!isBodyMethod(...))` | **Dead.** The only call site already gates on `isBodyMethod`, so the arm cannot be entered. Kept because the comment on it documents the hang that happens if the routing above ever changes — but it is dead code today. |
 | `nock.ts` `cleanAll`'s `cleanMocks()` fallback | Only runs if undici moves its `dispatches` symbol, which is the future it exists for. |
 
-**Don't chase 100%.** The number is a means of finding untested behaviour, and the five above have been
-looked at. Raising the threshold past what those allow buys a test for a race and a test for dead code.
+A fifth used to be here and is now gone: `callStream`'s `else if (!isBodyMethod(...))` arm was **dead**, since
+its only call site already gates on `isBodyMethod`. It was deleted, and the comment in its place records what
+has to come back if that routing is ever widened — without an `end()` for the bodyless case `undici.pipeline`
+never sends the request and the caller waits forever.
+
+**Don't chase 100%.** The number is a means of finding untested behaviour, and the four above have been looked
+at. Raising the threshold past what they allow buys a test for a race and a test for a type narrowing.
 
 ## Parity suite
 
@@ -896,7 +904,21 @@ Three pieces:
   the attempt counters as well as the wire log — a scenario runs once per client, and both runs have to
   see the same server.
 - **`harness.ts`** — `parityTest(name, scenario)`, plus the two allowlists.
-- **`parity.spec.ts`** — the scenarios, each carrying the `claim` it pins.
+- **`parity.spec.ts`** — the hand-written scenarios, each carrying the `claim` it pins.
+- **`property.spec.ts`** — the same comparison over *generated* inputs. The hand-written scenarios pin the
+  claims someone thought to write down; these explore the space around them, aimed at url joining, query
+  merging, header folding and body encoding — which is where this repo's bugs actually lived, each one a
+  particular character in a particular position nobody had tried. The seed is fixed (`PARITY_SEED` overrides),
+  so a red build is reproducible: a suite that generates fresh inputs per run fails on one machine and passes
+  on the next, which is worse than not running. ~2,000 cases across eight seeds currently agree with got; the
+  one disagreement it found is pinned in `parity.spec.ts` (a leading slash under `prefixUrl`).
+- **`nock-harness.ts` / `nock-parity.spec.ts`** — the same idea for the mocking shim, against **real nock 14**.
+  nock intercepts node's http stack and the shim replaces undici's global dispatcher, so each side is driven by
+  the client it can actually intercept — nock with got, the shim with gotlike — and what is compared is the only
+  question a mocking layer is being asked: did this interceptor match, and what did it reply? Every failure
+  collapses to `matched: false`, deliberately: the two report a miss through completely different machinery, and
+  comparing error shapes would say nothing about matching. Registration is inside the try as well as the
+  dispatch, because how a mock is *written* is part of the surface too.
 
 **Everything not explicitly recorded as divergent must match exactly.** That is what makes the suite
 converge instead of drifting: there is no "close enough". Two escape hatches, and both are stricter

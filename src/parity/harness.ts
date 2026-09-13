@@ -263,3 +263,110 @@ export function reportDivergences(): void {
     console.log('');
   });
 }
+
+/* ------------------------------------------------------------------- property-based cases */
+
+/** A seeded generator, so a failing case can be reproduced exactly rather than described. */
+export type Rng = {
+  int: (maxExclusive: number) => number;
+  bool: () => boolean;
+  pick: <T>(values: readonly T[]) => T;
+  /** A string of `length` characters drawn from `alphabet`. */
+  string: (alphabet: string, length: number) => string;
+};
+
+/** mulberry32 - small, fast, and good enough to explore an input space. */
+function makeRng(seed: number): Rng {
+  let state = seed >>> 0;
+
+  const next = () => {
+    state = (state + 0x6d2b79f5) >>> 0;
+
+    let t = state;
+
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+
+  const int = (maxExclusive: number) => Math.floor(next() * maxExclusive);
+
+  return {
+    int,
+    bool: () => next() < 0.5,
+    pick: (values) => values[int(values.length)]!,
+    string: (alphabet, length) => Array.from({length}, () => alphabet[int(alphabet.length)]).join(''),
+  };
+}
+
+/**
+ * The seed the generators start from.
+ *
+ * Fixed by default, so CI runs the same cases every time and a red build is reproducible -
+ * a suite that generates fresh inputs per run fails on one machine and passes on the next,
+ * which is worse than not running at all. Set `PARITY_SEED` to explore further; a seed that
+ * finds something is the thing to write down.
+ */
+const seed = Number(process.env['PARITY_SEED'] ?? 20260913);
+
+export type PropertySpec<I> = {
+  /** The claim this explores, in the words of CLAUDE.md or the README. */
+  claim: string;
+  /** How many generated cases to run. */
+  cases?: number;
+  /** Build one input. Must depend only on `rng`, so the seed reproduces it. */
+  generate: (rng: Rng) => I;
+  /** Run one input against one client. Whatever is returned is compared across the two. */
+  run: (client: ParityClient, base: string, input: I) => Promise<unknown>;
+};
+
+/**
+ * Run a scenario over generated inputs rather than one hand-written case.
+ *
+ * The hand-written scenarios pin the claims someone thought to write down. These explore the
+ * space around them, which is where the url-resolution and query-merging bugs in this repo's
+ * history actually lived - each of them a specific character in a specific position that no
+ * one had thought to try.
+ */
+export function propertyTest<I>(name: string, spec: PropertySpec<I>): void {
+  test(name, async () => {
+    assert.ok(server, 'the parity server is not running');
+
+    const rng = makeRng(seed);
+    const cases = spec.cases ?? 40;
+
+    const clients: [string, ParityClient][] = [
+      ['got', (realGot as unknown as ParityClient).extend(BASELINE)],
+      ['gotlike', (gotlike as unknown as ParityClient).extend(BASELINE)],
+    ];
+
+    for (let i = 0; i < cases; i++) {
+      const input = spec.generate(rng);
+      const observations: Record<string, unknown> = {};
+
+      for (const [label, client] of clients) {
+        server.reset();
+
+        let returned: unknown;
+
+        try {
+          returned = await spec.run(client, server.base, input);
+        } catch (error) {
+          returned = {threw: (error as Error).message};
+        }
+
+        observations[label] = {returned, wire: server.wire.map(normaliseWire)};
+      }
+
+      assert.deepStrictEqual(
+        observations['gotlike'],
+        observations['got'],
+        `${name}\n\nclaim: ${spec.claim}\n\n` +
+          `failing input (seed ${seed}, case ${i}):\n${JSON.stringify(input, undefined, 2)}\n\n` +
+          'gotlike and got 14 disagree on a generated input. Reproduce with ' +
+          `PARITY_SEED=${seed} and look at case ${i}.`,
+      );
+    }
+  });
+}
