@@ -47,8 +47,28 @@ same way.
   one. A content-negotiating upstream can answer differently than it did before.
 - **Requires node >= 22.12 and undici 8.**
 
+### Divergences from current got worth knowing
+
+Neither of these is new here; both are got moving and gotlike deliberately not following. They are
+pinned in the parity suite and listed in the README's divergence tables.
+
+- `responseType: 'buffer'` returns a **`Buffer`**; got 15 moved to a plain `Uint8Array`. `Buffer` is
+  a subclass, so it satisfies anything typed for one, and callers feeding `sharp()` need it.
+- A `300 Multiple Choices` carrying a `Location` is **followed** when `followRedirect` is on,
+  because undici's redirect interceptor treats 300 as redirectable; got 15 stopped following it.
+
 ### Added
 
+- **Credentials do not cross an origin.** A `beforeRequest` hook or an `afterResponse` retry that
+  moves the request to a different origin loses `authorization`, `cookie`, `cookie2`, `host` and
+  `proxy-authorization`, url credentials, and an unchanged body. A hook is where a url arrives from
+  somewhere else, and every one of those used to take the caller's token and payload to whatever
+  host the hook named. Anything the hook sets itself is kept. Matches got 16, which fixed the same
+  thing; undici already did it for redirects it follows.
+- **A `FormData` body is encoded as multipart.** got 15 made the `FormData` global the documented
+  multipart path and undici's `request()` cannot take one - it does not reject it either, the
+  request simply never leaves - so this used to hang. The encoding is byte-identical to got's,
+  boundary aside, and hooks still see the `FormData` before it is encoded.
 - `head()` and `query()` verbs; got's `stream.get`/`.post`/… helpers on the stream client.
 - The callable client - `gotlike(url, options)` and `gotlike({url, ...})`.
 - `searchParams` (merged with the client's, by got's rules), `form` bodies, and Basic auth from

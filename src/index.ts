@@ -634,6 +634,152 @@ function withoutQuery(url: string): string {
 }
 
 /**
+ * Headers that must not follow a request across an origin boundary, in got's own list.
+ *
+ * `host` is here because a stale one addresses the previous origin's vhost; the other four are
+ * credentials, and handing them to a host the caller did not authorise them for is the whole
+ * problem. undici already strips these when *it* follows a cross-origin redirect. Nothing did
+ * when a `beforeRequest` hook or an `afterResponse` retry moved the origin, which is the same
+ * leak by a route the client controls.
+ */
+const crossOriginHeaders = ['authorization', 'cookie', 'cookie2', 'host', 'proxy-authorization'] as const;
+
+/** The index just past `scheme://authority`: the first `/`, `?` or `#` that follows it. */
+function authorityEnd(url: string): number {
+  const scheme = url.indexOf('://');
+
+  if (scheme === -1) {
+    return 0;
+  }
+
+  for (let index = scheme + 3; index < url.length; index++) {
+    const code = url.charCodeAt(index);
+
+    // `/`, `?`, `#`
+    if (code === 47 || code === 63 || code === 35) {
+      return index;
+    }
+  }
+
+  return url.length;
+}
+
+/**
+ * Whether two absolute urls share an origin.
+ *
+ * The common case - a hook that rewrote the path or appended a signature to the query - is
+ * answered by comparing the authority text in place, which allocates nothing and parses
+ * nothing. Only when that text actually differs is `URL` reached for, and then it is answering
+ * the question properly: a default port written out (`http://h:80/` against `http://h/`), a
+ * host in a different case, or userinfo on one side are all the same origin, and got compares
+ * `URL.origin` for exactly that reason.
+ *
+ * A url that cannot be parsed is treated as a *different* origin. This decides whether
+ * credentials travel, so the unparseable case has to fail towards stripping them.
+ */
+function sameOrigin(previous: string, next: string): boolean {
+  const end = authorityEnd(previous);
+
+  if (end !== 0 && end === authorityEnd(next)) {
+    let identical = true;
+
+    for (let index = 0; index < end; index++) {
+      if (previous.charCodeAt(index) !== next.charCodeAt(index)) {
+        identical = false;
+        break;
+      }
+    }
+
+    if (identical) {
+      return true;
+    }
+  }
+
+  try {
+    return new URL(previous).origin === new URL(next).origin;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * What the request carried before the `beforeRequest` hooks ran, for the cross-origin check.
+ *
+ * One small object, and only for a client that has `beforeRequest` hooks at all - a client
+ * without them cannot move the origin here, and allocates nothing. It has to be taken eagerly:
+ * whether the origin moved is only known after the hooks have run, and by then the values it
+ * records have been overwritten.
+ */
+type CrossOriginState = {
+  authorization: unknown;
+  cookie: unknown;
+  cookie2: unknown;
+  host: unknown;
+  proxyAuthorization: unknown;
+  body: unknown;
+};
+
+function crossOriginState(options: FormedOptions): CrossOriginState {
+  const headers = options.headers;
+
+  return {
+    authorization: headers['authorization'],
+    cookie: headers['cookie'],
+    cookie2: headers['cookie2'],
+    host: headers['host'],
+    proxyAuthorization: headers['proxy-authorization'],
+    body: options.body,
+  };
+}
+
+/**
+ * Drop what must not cross an origin boundary, keeping whatever the hook set for the new one.
+ *
+ * A header the hook rewrote is the hook saying "these are the credentials for where I am
+ * sending this", so it survives; one that still holds the value it had before the hooks ran was
+ * meant for the origin being left, and goes. The body follows the same rule by identity - a
+ * hook that replaced it built it for the new origin, one that did not was not asked whether its
+ * payload should be sent somewhere else. `content-type` and `content-length` describe the body
+ * that is being dropped, and a stale `content-length` would fail the dispatch outright under
+ * undici's `strictContentLength`.
+ *
+ * Measured against got 16, which strips the same five headers, keeps a hook-set `authorization`
+ * and a hook-set body, and drops an unchanged one along with its `content-type`.
+ */
+function stripCrossOrigin(options: FormedOptions, before: CrossOriginState): void {
+  const headers = options.headers;
+
+  if (before.authorization !== undefined && headers['authorization'] === before.authorization) {
+    delete headers['authorization'];
+  }
+
+  if (before.cookie !== undefined && headers['cookie'] === before.cookie) {
+    delete headers['cookie'];
+  }
+
+  if (before.cookie2 !== undefined && headers['cookie2'] === before.cookie2) {
+    delete headers['cookie2'];
+  }
+
+  if (before.host !== undefined && headers['host'] === before.host) {
+    delete headers['host'];
+  }
+
+  if (before.proxyAuthorization !== undefined && headers['proxy-authorization'] === before.proxyAuthorization) {
+    delete headers['proxy-authorization'];
+  }
+
+  if (options.body !== undefined && options.body === before.body) {
+    options.body = undefined;
+    options.json = undefined;
+    options.form = undefined;
+
+    delete headers['content-type'];
+    delete headers['content-length'];
+  }
+}
+
+/**
  * got's phrasing for an HTTP error, **without the query string**.
  *
  * got names the full url, which is genuinely useful in a log line and is also how a signature,
@@ -1249,9 +1395,12 @@ export type RequestOptions<T = unknown> = {
   /**
    * Raw request body. Overridden by `json` and `form`.
    *
+   * A `FormData` is encoded as `multipart/form-data` with its boundary, which is got 15's
+   * documented way to send multipart. undici's `request()` cannot take one directly.
+   *
    * __Note__: per-call only, like `json`.
    */
-  body?: string | Buffer | Uint8Array | null;
+  body?: string | Buffer | Uint8Array | FormData | Readable | null;
 
   /** The parsing method. `buffer` resolves to a Node `Buffer`. */
   responseType?: 'text' | 'json' | 'buffer';
@@ -2564,6 +2713,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       }
 
       if (this.beforeRequestHooks) {
+        // Taken before the hooks run because that is the only moment it exists - see
+        // `crossOriginState`. One allocation, and only for a client that has hooks.
+        const before = crossOriginState(options);
+
         for (const hook of this.beforeRequestHooks) {
           await hook(options);
         }
@@ -2580,9 +2733,49 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
          */
         if (options.url !== url) {
           const rewritten = String(options.url ?? '');
+          const next = absoluteUrl.test(rewritten) ? rewritten : this.resolveUrl(options);
 
-          url = options.url = absoluteUrl.test(rewritten) ? rewritten : this.resolveUrl(options);
+          /*
+           * A hook that moves the request to another origin does not take the credentials with
+           * it. The `authorization` a caller set for their own api, the `cookie` their session
+           * lives in, and the body they meant for that api all went to whatever host the hook
+           * named - and a hook is exactly where a url comes from somewhere else (a signing
+           * service, a discovered endpoint, a redirect the caller resolves themselves). undici
+           * strips these when it follows a cross-origin redirect; this is the same boundary
+           * reached by the other route. got 16 does it too, which is what fixed it there.
+           */
+          if (!sameOrigin(url, next)) {
+            stripCrossOrigin(options, before);
+          }
+
+          url = options.url = next;
         }
+      }
+
+      /*
+       * A `FormData` body is encoded here, not passed through: `undici.request()` does not
+       * accept one. It does not reject it either - measured, the request simply never leaves
+       * and the caller waits forever, which is the worst way to find out. got 15 made the
+       * `FormData` global the documented way to send multipart, so a caller migrating writes
+       * exactly this.
+       *
+       * `Response` is the encoder node already ships: it produces the multipart bytes and the
+       * `content-type` carrying the boundary, which has to be the one that encoding generated.
+       * The body goes out as a stream rather than a buffer so a large upload is not
+       * materialised in memory - with the consequence, as in got, that it cannot be replayed
+       * across a redirect or a retry.
+       *
+       * After the hooks, so a hook still sees the `FormData` it was given and can add to it.
+       */
+      if (options.body instanceof FormData) {
+        const encoded = new Response(options.body);
+        const contentType = encoded.headers.get('content-type');
+
+        if (contentType !== null && !hasHeader(options.headers, 'content-type')) {
+          options.headers['content-type'] = contentType;
+        }
+
+        options.body = Readable.fromWeb(encoded.body as Parameters<typeof Readable.fromWeb>[0]);
       }
     } catch (error) {
       // The hook's own message, not a generic one - it is the only thing that says what
@@ -2864,8 +3057,13 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
     try {
       // A body is legal on a bodyless *method* - undici sends one on a GET, and this is the
-      // path that keeps it replayable across a redirect.
-      undiciResponse = await undici.request(options.url as string, {...dispatch, body: options.body});
+      // path that keeps it replayable across a redirect. The cast is for `FormData`: undici
+      // declares its own, structurally different from the global one this option accepts, and
+      // by here a `FormData` has already been encoded to a stream and cannot reach this.
+      undiciResponse = await undici.request(options.url as string, {
+        ...dispatch,
+        body: options.body as UndiciRequestOptions['body'],
+      });
     } catch (error) {
       // Nothing left to bound - the request never got off the ground.
       dispatch.release();
@@ -3228,6 +3426,55 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // does not name one.
       if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-length')) {
         delete merged.headers['content-length'];
+      }
+    }
+
+    /*
+     * A retry that names another origin is the same boundary a `beforeRequest` hook can cross,
+     * and the same rule applies: the credentials and the body belong to the origin the request
+     * started at. A refresh hook pointing at a new host gets a clean request, and anything it
+     * sets explicitly - new `authorization`, a new body - is kept, because it set those knowing
+     * where they were going.
+     *
+     * `username`/`password` go with them, or `call()` would simply derive the same
+     * `authorization` back from the first attempt's credentials and undo the strip. Userinfo on
+     * the *new* url is not touched: those are credentials for the new origin, and got uses them
+     * too.
+     *
+     * Only an absolute url can be judged here. A relative one resolves under the client's own
+     * `prefixUrl`, which is the origin the request is already on.
+     */
+    if (newOptions.url !== undefined) {
+      const next = String(newOptions.url);
+
+      if (absoluteUrl.test(next) && !sameOrigin(String(options.url), next)) {
+        for (const name of crossOriginHeaders) {
+          if (newOptions.headers === undefined || !hasHeader(newOptions.headers, name)) {
+            delete merged.headers[name];
+          }
+        }
+
+        if (newOptions.username === undefined) {
+          merged.username = undefined;
+        }
+
+        if (newOptions.password === undefined) {
+          merged.password = undefined;
+        }
+
+        if (newOptions.json === undefined && newOptions.body === undefined && newOptions.form === undefined) {
+          merged.body = undefined;
+          merged.json = undefined;
+          merged.form = undefined;
+
+          if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-type')) {
+            delete merged.headers['content-type'];
+          }
+
+          if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-length')) {
+            delete merged.headers['content-length'];
+          }
+        }
       }
     }
 

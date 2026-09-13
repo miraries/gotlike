@@ -108,6 +108,7 @@ Supports:
 | `prefixUrl` with a query or fragment | allowed | a **`ValidationError`** - the prefix is concatenated with `url`, so a `?` on it would land mid-url. Use `searchParams` |
 | `prefixUrl` with a leading slash on `url` | throws (`` `url` must not start with a slash ``) | **accepted** - every leading slash is stripped and the path is joined, so `'/items'` and `'items'` do the same thing. More permissive than got on purpose, but note the consequence: a caller who meant an absolute path gets a silently different request where got would have stopped them |
 | `url` as an option - `gotlike({ url, ... })` | **rejected since got 15** - a `TypeError` for a `url` key in any options object, `extend()` included; got 12 and 14 accepted it | **kept** - the callable form is built on it. Passing a url as an argument *and* as an option is rejected on both sides |
+| `responseType: 'buffer'` | a `Uint8Array` since got 15 | a real **`Buffer`**. `Buffer` extends `Uint8Array`, so it satisfies anything typed for one, and callers feeding `sharp()` and friends need the subclass. `response.rawBody` likewise |
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
 
 ### Forced by undici
@@ -117,6 +118,7 @@ Supports:
 | `timeout.request` | a cap on a whole **attempt**, as got's is - it covers every phase, and it starts over for each retry rather than being a budget for the sequence. undici's own `headersTimeout`/`bodyTimeout` are per-phase and `bodyTimeout` restarts on every chunk, so a slowly trickling response would never trip them - a deadline signal enforces the total on top. That also sidesteps undici's coarse 1s timer wheel, so sub-second timeouts fire on time |
 | `retry` | maps onto undici's `retry` interceptor. `limit` defaults to got's 2, and `Retry-After` is honoured, but `calculateDelay`/`noise` are not implemented and `maxRetryAfter` degrades to "honour the header or don't". The retried **status codes and methods are undici's defaults**, not got's - set `statusCodes`/`methods` explicitly if that matters |
 | `beforeRedirect`, `beforeRetry` | **cannot delay or cancel** - undici decides both inside a synchronous dispatch interceptor, so a returned promise is not awaited |
+| `300 Multiple Choices` | **followed** when `followRedirect` is on, because undici's redirect interceptor counts 300 as redirectable. got 15 stopped following it (RFC 9110 makes it a SHOULD for user agents) and hands the 300 back instead. 304 is not followed by either |
 | streamed request bodies | **not replayed across a 307/308**, which must preserve method and body. 301/302/303 are fine (they rewrite to GET and drop the body); non-streamed bodies replay normally |
 
 ### Smaller surface
@@ -243,6 +245,35 @@ re-derived from whatever `options.body` ends up as - unless you set one explicit
 keep in step: undici checks an explicit `content-length` against the body it is about to send and fails the
 request on a mismatch.
 
+### Credentials do not cross an origin
+
+A `beforeRequest` hook or a `retryWithMergedOptions` that moves the request to a **different
+origin** loses `authorization`, `cookie`, `cookie2`, `host` and `proxy-authorization`, along with
+url credentials and the request body:
+
+```ts
+gotlike.extend({
+  hooks: {
+    beforeRequest: [(options) => { options.url = await resolveEndpoint(); }],
+  },
+}).post('https://my-api.test/thing', {
+  body: payload,
+  headers: { authorization: 'Bearer …' },
+});
+// if resolveEndpoint() returns another host, that host sees no token, no cookie and no body
+```
+
+A hook is where a url arrives from somewhere else - a signing service, a discovered endpoint, a
+redirect you follow yourself - and sending the caller's credentials to whatever host it names is
+the leak undici already prevents when *it* follows a cross-origin redirect. This is the same
+boundary reached by the other route, and matches got 16.
+
+Anything the hook sets **itself** survives, because it set it knowing where the request was going:
+a new `authorization`, a new `body`. So a token refresh that also changes origin has to re-supply
+the body it wants sent. A same-origin rewrite - the ordinary signing case - is untouched, and a
+url written differently (`http://h:80/` against `http://h/`, a host in another case) is still the
+same origin.
+
 `beforeError` runs for streamed requests too - for *every* stream failure, not just an error status
 - and a stream's `HTTPError` carries the same `error.response` a non-streamed one does.
 
@@ -362,6 +393,31 @@ await pipeline(createReadStream('file'), upload);
 body cannot be replayed, so a 307/308 - which must preserve method and body - resolves with the
 redirect response itself rather than following it. A 301/302/303 on a POST is fine, since those
 rewrite to GET and drop the body anyway. Non-streamed bodies replay normally.
+
+## Request bodies
+
+`json` and `form` are serialised for you and set a `content-type` unless one is already present.
+`body` is sent as given - a string, a `Buffer`, a `Uint8Array`, a `Readable`, or a `FormData`:
+
+```ts
+const form = new FormData();
+
+form.set('name', 'value');
+form.set('file', new Blob([bytes], { type: 'image/png' }), 'shot.png');
+
+await gotlike.post(url, { body: form });
+// multipart/form-data; boundary=… , encoded byte-for-byte as got encodes it
+```
+
+`FormData` is got 15's documented multipart path. undici's `request()` cannot take one directly -
+it does not reject it either, the request simply never leaves - so gotlike encodes it and sets the
+`content-type` with the boundary that encoding produced. An explicit `content-type` wins, as it
+does for `json` and `form`, and then the boundary is yours to get right. The body goes out as a
+stream, so a large upload is not held in memory and, as in got, cannot be replayed across a
+redirect or a retry.
+
+`beforeRequest` hooks see the `FormData` itself, before it is encoded, so a hook can still add a
+signed field to it.
 
 ## Compression
 

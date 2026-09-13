@@ -4358,6 +4358,357 @@ test('a beforeRequest hook rewriting options.url changes where the request goes'
   assert.strictEqual(response.body.url, '/echo/rewritten');
 });
 
+/*
+ * Cross-origin hook rewrites.
+ *
+ * `127.0.0.1` and `localhost` are different origins that reach the same server here, which is
+ * what lets one `/echo` route answer both sides of the boundary.
+ *
+ * The leak this rules out: a hook is exactly where a url arrives from somewhere else - a
+ * signing service, a discovered endpoint, a redirect the caller follows themselves - and every
+ * one of those used to take the caller's `authorization`, their session `cookie` and the body
+ * meant for their own api along to whatever host the hook named. undici already strips these
+ * when it follows a cross-origin redirect; got 16 does it for hooks, and all of this is
+ * measured against it.
+ */
+test('a beforeRequest hook that changes origin does not take the credentials with it', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://localhost:3000/echo/moved';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://127.0.0.1:3000/json', {
+    body: 'PAYLOAD',
+    headers: {
+      authorization: 'Bearer secret',
+      cookie: 'sid=1',
+      // The rest of got's list. `host` is here because a stale one addresses the previous
+      // origin's vhost; the other two are credentials like the first two.
+      cookie2: '$Version=1; sid=1',
+      host: '127.0.0.1:3000',
+      'proxy-authorization': 'Basic cHJveHk6cHc=',
+    },
+  });
+
+  assert.strictEqual(response.body.url, '/echo/moved');
+  assert.strictEqual(response.body.headers['authorization'], undefined);
+  assert.strictEqual(response.body.headers['cookie'], undefined);
+  assert.strictEqual(response.body.headers['cookie2'], undefined);
+  assert.strictEqual(response.body.headers['proxy-authorization'], undefined);
+  // undici supplies its own once the caller's is gone, so this asserts the stale one went
+  // rather than that no host was sent at all.
+  assert.strictEqual(response.body.headers['host'], 'localhost:3000');
+  assert.strictEqual(response.body.body, '');
+  assert.strictEqual(response.body.headers['content-type'], undefined);
+});
+
+/*
+ * A url that cannot be parsed has to fail towards stripping: this decides whether credentials
+ * travel, and "I could not tell" is not a reason to send them. A hook writing a relative url on
+ * a client with no `prefixUrl` is how that happens - the request then fails as an invalid url,
+ * but only after the header has already been taken off it.
+ */
+test('a hook rewriting to an unresolvable url is treated as cross-origin', async () => {
+  let sent: Record<string, unknown> | undefined;
+
+  const extClient = client.extend({
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'not-a-url/at-all';
+          sent = options.headers;
+        },
+      ],
+    },
+  });
+
+  await assert.rejects(
+    () => extClient.get('http://localhost:3000/json', {headers: {authorization: 'Bearer secret'}}),
+    (error: Error) => error instanceof RequestError,
+  );
+
+  // The same headers object the hook was handed, read after the strip ran on it.
+  assert.strictEqual(sent?.['authorization'], undefined);
+});
+
+// The hook set these knowing where the request was going, so they are not the caller's
+// credentials leaking - they are the hook's, for the new origin.
+test('a cross-origin hook keeps the authorization and body it set itself', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://localhost:3000/echo/moved';
+          options.headers['authorization'] = 'Bearer fresh';
+          options.body = 'NEWBODY';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://127.0.0.1:3000/json', {
+    body: 'PAYLOAD',
+    headers: {authorization: 'Bearer secret'},
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer fresh');
+  assert.strictEqual(response.body.body, 'NEWBODY');
+});
+
+// The common case, and the one that must not pay for any of this: a signing hook rewriting the
+// path or the query of the url it was already going to.
+test('a same-origin hook rewrite keeps everything', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://localhost:3000/echo/signed';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://localhost:3000/json', {
+    body: 'PAYLOAD',
+    headers: {authorization: 'Bearer secret', cookie: 'sid=1'},
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer secret');
+  assert.strictEqual(response.body.headers['cookie'], 'sid=1');
+  assert.strictEqual(response.body.body, 'PAYLOAD');
+});
+
+// A default port written out is the same origin, which is why the comparison falls back to
+// `URL` rather than trusting the authority text.
+test('a hook rewrite to the same origin written differently is not treated as cross-origin', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://LOCALHOST:3000/echo/cased';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://localhost:3000/json', {
+    headers: {authorization: 'Bearer secret'},
+  });
+
+  assert.strictEqual(response.body.url, '/echo/cased');
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer secret');
+});
+
+// The same boundary by the other route. A refresh hook that points the retry at a new host gets
+// a clean request rather than the previous origin's credentials.
+test('an afterResponse retry to another origin drops the credentials and the body', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) =>
+          response.statusCode === 401 ? retryWithMergedOptions({url: 'http://localhost:3000/echo/moved'}) : response,
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://127.0.0.1:3000/status?code=401', {
+    body: 'PAYLOAD',
+    headers: {authorization: 'Bearer secret', cookie: 'sid=1'},
+  });
+
+  assert.strictEqual(response.body.url, '/echo/moved');
+  assert.strictEqual(response.body.headers['authorization'], undefined);
+  assert.strictEqual(response.body.headers['cookie'], undefined);
+  assert.strictEqual(response.body.body, '');
+});
+
+/*
+ * Credentials in the url are the same credentials by another spelling: `call()` turns them into
+ * an `authorization` header before the hooks run, so the strip has to reach the derived header
+ * or the userinfo route would quietly keep working where the explicit one stopped.
+ */
+test('a cross-origin retry drops credentials that came from the url', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) =>
+          response.statusCode === 401 ? retryWithMergedOptions({url: 'http://localhost:3000/echo/moved'}) : response,
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://user:pass@127.0.0.1:3000/status?code=401');
+
+  assert.strictEqual(response.body.headers['authorization'], undefined);
+});
+
+// A retry that supplies credentials of its own is the hook saying these are for where it is
+// sending the request, so they survive - as they do in got.
+test('a cross-origin retry keeps an authorization it set itself', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) =>
+          response.statusCode === 401
+            ? retryWithMergedOptions({
+                url: 'http://localhost:3000/echo/moved',
+                headers: {authorization: 'Bearer fresh'},
+                body: 'NEWBODY',
+              })
+            : response,
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://127.0.0.1:3000/status?code=401', {
+    body: 'PAYLOAD',
+    headers: {authorization: 'Bearer secret'},
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer fresh');
+  assert.strictEqual(response.body.body, 'NEWBODY');
+});
+
+/*
+ * The shape a token refresh actually has: new credentials, same payload. The credentials are
+ * kept because the hook set them; the body still goes, because nobody asked whether it should
+ * be sent to the new host. Worth knowing rather than discovering - a refresh that also changes
+ * origin has to re-supply the body. Measured against got 16, which does the same.
+ */
+test('a cross-origin retry that sets only headers still drops the body', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) =>
+          response.statusCode === 401
+            ? retryWithMergedOptions({
+                url: 'http://localhost:3000/echo/moved',
+                headers: {authorization: 'Bearer fresh', 'x-trace': 'keep-me'},
+              })
+            : response,
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://127.0.0.1:3000/status?code=401', {
+    body: 'PAYLOAD',
+    headers: {authorization: 'Bearer secret', 'content-type': 'text/plain'},
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer fresh');
+  assert.strictEqual(response.body.headers['x-trace'], 'keep-me');
+  assert.strictEqual(response.body.body, '');
+  assert.strictEqual(response.body.headers['content-type'], undefined);
+});
+
+// A relative url on a retry resolves under the client's own `prefixUrl`, which is the origin it
+// is already on - so there is no boundary to cross and nothing to strip.
+test('a retry to a relative url keeps the credentials', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) =>
+          response.statusCode === 401 ? retryWithMergedOptions({url: 'echo/moved'}) : response,
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('status?code=401', {
+    headers: {authorization: 'Bearer secret'},
+  });
+
+  assert.strictEqual(response.body.url, '/echo/moved');
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer secret');
+});
+
+/*
+ * `FormData` is got 15's documented multipart path. undici's `request()` does not accept one -
+ * it does not reject it either, it simply never sends the request - so this used to hang until
+ * the deadline or fail as a socket error.
+ */
+test('a FormData body is encoded as multipart with its boundary', async () => {
+  const form = new FormData();
+
+  form.set('name', 'value');
+  form.set('file', new Blob(['hello'], {type: 'text/plain'}), 'f.txt');
+
+  const response = await client.post<Echo>('http://localhost:3000/echo', {
+    body: form,
+    responseType: 'json',
+  });
+
+  const contentType = response.body.headers['content-type'] ?? '';
+  const boundary = /boundary=(.+)$/.exec(contentType)?.[1];
+
+  assert.match(contentType, /^multipart\/form-data; boundary=/);
+  assert.ok(boundary);
+  assert.ok(response.body.body.startsWith(`--${boundary}`));
+  assert.match(response.body.body, /Content-Disposition: form-data; name="name"/);
+  assert.match(response.body.body, /filename="f\.txt"/);
+  assert.match(response.body.body, /Content-Type: text\/plain/);
+  assert.match(response.body.body, /hello/);
+});
+
+// An explicit content-type wins, as it does for `json` and `form` - even though the boundary
+// then has to be the caller's problem.
+test('an explicit content-type is not overwritten by the FormData encoding', async () => {
+  const form = new FormData();
+
+  form.set('name', 'value');
+
+  const response = await client.post<Echo>('http://localhost:3000/echo', {
+    body: form,
+    headers: {'content-type': 'multipart/form-data; boundary=mine'},
+    responseType: 'json',
+  });
+
+  assert.strictEqual(response.body.headers['content-type'], 'multipart/form-data; boundary=mine');
+});
+
+// A hook still sees the `FormData` itself, which is what lets it add a signed field.
+test('a beforeRequest hook sees the FormData before it is encoded', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          assert.ok(options.body instanceof FormData);
+          options.body.set('signature', 'abc');
+        },
+      ],
+    },
+  });
+
+  const form = new FormData();
+
+  form.set('name', 'value');
+
+  const response = await extClient.post<Echo>('http://localhost:3000/echo', {body: form});
+
+  assert.match(response.body.body, /name="signature"/);
+  assert.match(response.body.body, /abc/);
+});
+
 // A hook that leaves a relative url still gets `prefixUrl` applied.
 test('a beforeRequest hook can rewrite to a path under prefixUrl', async () => {
   const extClient = client.extend({
@@ -4977,7 +5328,9 @@ test('a retry re-serialises json rather than re-transforming the first attempt\u
     hooks: {
       beforeRequest: [
         (options) => {
-          options.body = '<' + String(options.body) + '>';
+          // Cast rather than `String(...)`: `body` now also types as `FormData`/`Readable`, and
+          // this test supplies a string.
+          options.body = '<' + (options.body as string) + '>';
           bodies.push(options.body);
         },
       ],
@@ -5011,7 +5364,9 @@ test('a retry re-transforms a raw body the hook already touched, as got does', a
     hooks: {
       beforeRequest: [
         (options) => {
-          options.body = '<' + String(options.body) + '>';
+          // Cast rather than `String(...)`: `body` now also types as `FormData`/`Readable`, and
+          // this test supplies a string.
+          options.body = '<' + (options.body as string) + '>';
           bodies.push(options.body);
         },
       ],

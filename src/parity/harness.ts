@@ -79,16 +79,32 @@ export function setupParityServer(): () => ParityServer {
   };
 }
 
+/**
+ * A multipart boundary is random per request by design, so two clients can never put the same
+ * bytes on the wire for one `FormData`. Both the `content-type` and the body are rewritten to a
+ * fixed marker, which leaves everything else about the encoding - part order, part headers,
+ * filenames, the trailing `--` - compared exactly. Only applied to a multipart request, so an
+ * ordinary body containing dashes is untouched.
+ */
+const boundaryInHeader = /boundary=[-\w]+/;
+const boundaryInBody = /-{2,}[-\w]+/g;
+
 function normaliseWire(record: WireRecord): unknown {
   const headers: Record<string, unknown> = {};
+  const multipart = String(record.headers['content-type'] ?? '').startsWith('multipart/');
 
   for (const [name, value] of Object.entries(record.headers)) {
-    if (!(name in DIVERGENT_REQUEST_HEADERS)) {
-      headers[name] = value;
+    if (name in DIVERGENT_REQUEST_HEADERS) {
+      continue;
     }
+
+    headers[name] =
+      multipart && name === 'content-type' ? String(value).replace(boundaryInHeader, 'boundary=<b>') : value;
   }
 
-  return {method: record.method, path: record.path, headers, body: record.body};
+  const body = multipart ? record.body.replace(boundaryInBody, '<b>') : record.body;
+
+  return {method: record.method, path: record.path, headers, body};
 }
 
 /**

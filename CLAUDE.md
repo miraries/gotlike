@@ -230,6 +230,13 @@ they must be composed onto a dispatcher up front. The `agent` getter does this:
 - the composition is memoised against the base dispatcher's identity (`#composedFrom`), so the chain is built
   once per dispatcher rather than once per request.
 
+**undici follows a `300`, and got 15 stopped.** `redirectableStatusCodes` in undici's
+`lib/handler/redirect-handler.js` includes 300, so a client with `followRedirect: true` follows a
+`300 Multiple Choices` carrying a `Location` where got hands the 300 back (RFC 9110 makes it a SHOULD
+for user agents, not a MUST). Changing it would mean owning redirect handling, which the performance
+note further down rules out; it is in the README's "Forced by undici" table instead. 304 is followed
+by neither.
+
 HTTP/2 works over TLS via `allowH2`; cleartext h2c needs the caller to pass `agent: new H2CClient(origin)`,
 since `H2CClient` is single-origin and can't back a general-purpose client.
 
@@ -328,6 +335,36 @@ spreads carry it while `for...in` validation and `Object.keys` never see it. A h
 status it never stops seeing — an auth refresh that silently fails — used to recurse until the process died.
 Cutting the hook array at the retrying hook (above) is what actually rules that out now, since each retry has
 strictly fewer hooks left to run; the depth bound stays as a guard for `retryWithMergedOptions` called directly.
+
+**A hook that moves the request to another origin does not take the credentials with it.**
+`authorization`, `cookie`, `cookie2`, `host` and `proxy-authorization` are dropped, along with the
+body, when a `beforeRequest` hook rewrites `options.url` across an origin boundary or an
+`afterResponse` retry names a url on another origin. A hook is exactly where a url arrives from
+somewhere else — a signing service, a discovered endpoint, a redirect the caller resolves — and
+every one of those used to carry the caller's token, their session cookie and the payload meant for
+their own api to whatever host the hook named. undici already strips these when *it* follows a
+cross-origin redirect (see the `beforeRedirect` note below); this is the same boundary reached by
+the route the client controls, and got 16 fixed it there for the same reason.
+
+What the hook sets *itself* survives — a header whose value differs from the one it had before the
+hooks ran is the hook saying "these are the credentials for where I am sending this", and a body it
+replaced was built for the new origin. An unchanged body goes, and takes `content-type` and
+`content-length` with it (a stale `content-length` would fail the dispatch under undici's
+`strictContentLength`). On the retry path the same test is "did `newOptions` name it", and
+`username`/`password` are cleared too — otherwise `call()` derives the same `authorization` straight
+back from the first attempt's credentials and undoes the strip. Userinfo on the *new* url is left
+alone: those are credentials for the new origin, and got uses them too.
+
+`sameOrigin` answers the question. The common case — a signing hook that rewrote the path or
+appended to the query — is settled by comparing the authority text in place, which allocates
+nothing and parses nothing; `URL` is only reached for when that text actually differs, and then it
+is the right answer for a default port written out, a host in another case, or userinfo on one
+side. **A url that cannot be parsed counts as a different origin**: this decides whether credentials
+travel, so the unparseable case has to fail towards stripping them. The snapshot of what the
+request carried before the hooks (`crossOriginState`) is one small object, taken only for a client
+that has `beforeRequest` hooks at all — it has to be eager, since whether the origin moved is only
+known once the hooks have run. All of it is measured against got 16 in the parity suite, including
+the cases where nothing is stripped.
 
 `beforeError` hooks may return a replacement error; anything that isn't an `Error` is ignored. They run for
 **every** failure path, streams included — see Streams — and for anything a `beforeRequest` or `afterResponse`
@@ -480,8 +517,22 @@ instance-level and drives two things that must agree: composing `interceptors.de
 `accept-encoding` header. undici's interceptor decompresses based on the response only — it never asks for
 compression — so without the header nothing upstream compresses in the first place.
 
+**A `FormData` body is encoded here, not passed through.** `undici.request()` does not accept one -
+and does not reject it either: measured, the request simply never leaves and the caller waits
+forever, which is the worst way to find out. got 15 made the `FormData` global the documented way to
+send multipart, so a caller migrating writes exactly that. `new Response(form)` is the encoder node
+already ships; it produces the multipart bytes and the `content-type` carrying the boundary, which
+has to be the one that encoding generated. The body goes out as a `Readable` rather than a buffer,
+so a large upload is not materialised - with the consequence, as in got, that it cannot be replayed
+across a redirect or a retry. Encoded *after* the `beforeRequest` hooks, so a hook still sees the
+`FormData` it was handed and can add a signed field to it. Byte-identical to got's encoding,
+boundary aside, in the parity suite.
+
 `responseType: 'buffer'` returns a real Node `Buffer`, not the `ArrayBuffer` undici hands back. Callers feed
-this to things like `sharp()` which reject anything else.
+this to things like `sharp()` which reject anything else. **got 15 moved the other way**, to a plain
+`Uint8Array` for both `body` and `rawBody`. `Buffer` is a subclass of it, so gotlike's value satisfies
+anything typed for a `Uint8Array` while keeping the methods those callers reach for; the difference is in
+the README's divergence table rather than followed.
 
 `acceptEncoding` is computed once at module load from what this runtime's `zlib` actually provides —
 `createZstdDecompress` only exists from node 22.15 and `engines` allows 22.12, so a hardcoded header would

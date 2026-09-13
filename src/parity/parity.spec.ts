@@ -595,3 +595,226 @@ parityTest('a url given only as an option', {
     gotlike: {outcome: 'resolved', statusCode: 204},
   },
 });
+
+/* ------------------------------------------------------------- cross-origin hook rewrites */
+
+/*
+ * `127.0.0.1` and `localhost` are different origins reaching the same server, which is what
+ * lets one echo route answer both sides of the boundary without a second listener.
+ */
+const otherOrigin = (base: string) => base.replace('127.0.0.1', 'localhost');
+
+type EchoBody = {path: string; headers: Record<string, string>; body: string};
+
+const echoed = (body: unknown) => {
+  const echo = body as EchoBody;
+
+  return {
+    path: echo.path,
+    authorization: echo.headers['authorization'],
+    cookie: echo.headers['cookie'],
+    contentType: echo.headers['content-type'],
+    body: echo.body,
+  };
+};
+
+parityTest('a beforeRequest hook that changes origin drops the credentials and the body', {
+  claim: 'CLAUDE.md: a hook that moves the request to another origin does not take the credentials with it.',
+  run: async (client, base) => {
+    const hooked = client.extend({
+      responseType: 'json',
+      // A block body, deliberately: got treats a value returned from `beforeRequest` as a
+      // response to answer with, so an arrow returning the assignment fails inside got.
+      hooks: {
+        beforeRequest: [
+          (options: {url: unknown}) => {
+            options.url = `${otherOrigin(base)}/echo/moved`;
+          },
+        ],
+      },
+    });
+
+    const response = await hooked.post(`${base}/echo`, {
+      body: 'PAYLOAD',
+      headers: {authorization: 'Bearer secret', cookie: 'sid=1'},
+    });
+
+    return echoed(response.body);
+  },
+});
+
+parityTest('a cross-origin hook keeps the authorization and the body it set itself', {
+  claim: 'CLAUDE.md: a header the hook rewrote is the credentials for where it is sending the request.',
+  run: async (client, base) => {
+    const hooked = client.extend({
+      responseType: 'json',
+      hooks: {
+        beforeRequest: [
+          (options: {url: unknown; headers: Record<string, string>; body: unknown}) => {
+            options.url = `${otherOrigin(base)}/echo/moved`;
+            options.headers['authorization'] = 'Bearer fresh';
+            options.body = 'NEWBODY';
+          },
+        ],
+      },
+    });
+
+    const response = await hooked.post(`${base}/echo`, {
+      body: 'PAYLOAD',
+      headers: {authorization: 'Bearer secret'},
+    });
+
+    return echoed(response.body);
+  },
+});
+
+parityTest('a same-origin hook rewrite keeps everything', {
+  claim: 'CLAUDE.md: the common case - a signing hook rewriting the url it was already going to.',
+  run: async (client, base) => {
+    const hooked = client.extend({
+      responseType: 'json',
+      hooks: {
+        beforeRequest: [
+          (options: {url: unknown}) => {
+            options.url = `${base}/echo/signed`;
+          },
+        ],
+      },
+    });
+
+    const response = await hooked.post(`${base}/echo`, {
+      body: 'PAYLOAD',
+      headers: {authorization: 'Bearer secret', cookie: 'sid=1'},
+    });
+
+    return echoed(response.body);
+  },
+});
+
+parityTest('an afterResponse retry to another origin drops the credentials and the body', {
+  claim: 'CLAUDE.md: the same boundary by the other route - a refresh hook pointing at a new host.',
+  run: async (client, base) => {
+    let retried = false;
+
+    const hooked = client.extend({
+      responseType: 'json',
+      throwHttpErrors: false,
+      hooks: {
+        afterResponse: [
+          (response: {statusCode: number}, retry: (options: unknown) => unknown) => {
+            if (!retried && response.statusCode === 401) {
+              retried = true;
+
+              return retry({url: `${otherOrigin(base)}/echo/moved`});
+            }
+
+            return response;
+          },
+        ],
+      },
+    });
+
+    const response = await hooked.post(`${base}/status?code=401`, {
+      body: 'PAYLOAD',
+      headers: {authorization: 'Bearer secret', cookie: 'sid=1'},
+    });
+
+    return echoed(response.body);
+  },
+});
+
+parityTest('a cross-origin retry keeps the authorization and body it set itself', {
+  claim: 'CLAUDE.md: anything the retry sets explicitly is kept, because it set it knowing where it goes.',
+  run: async (client, base) => {
+    let retried = false;
+
+    const hooked = client.extend({
+      responseType: 'json',
+      throwHttpErrors: false,
+      hooks: {
+        afterResponse: [
+          (response: {statusCode: number}, retry: (options: unknown) => unknown) => {
+            if (!retried && response.statusCode === 401) {
+              retried = true;
+
+              return retry({
+                url: `${otherOrigin(base)}/echo/moved`,
+                headers: {authorization: 'Bearer fresh'},
+                body: 'NEWBODY',
+              });
+            }
+
+            return response;
+          },
+        ],
+      },
+    });
+
+    const response = await hooked.post(`${base}/status?code=401`, {
+      body: 'PAYLOAD',
+      headers: {authorization: 'Bearer secret'},
+    });
+
+    return echoed(response.body);
+  },
+});
+
+parityTest('a cross-origin retry that sets only headers still drops the body', {
+  claim: 'CLAUDE.md: the body goes unless the retry supplied one, even when the headers were refreshed.',
+  run: async (client, base) => {
+    let retried = false;
+
+    const hooked = client.extend({
+      responseType: 'json',
+      throwHttpErrors: false,
+      hooks: {
+        afterResponse: [
+          (response: {statusCode: number}, retry: (options: unknown) => unknown) => {
+            if (!retried && response.statusCode === 401) {
+              retried = true;
+
+              return retry({
+                url: `${otherOrigin(base)}/echo/moved`,
+                headers: {authorization: 'Bearer fresh', 'x-trace': 'keep-me'},
+              });
+            }
+
+            return response;
+          },
+        ],
+      },
+    });
+
+    const response = await hooked.post(`${base}/status?code=401`, {
+      body: 'PAYLOAD',
+      headers: {authorization: 'Bearer secret', 'content-type': 'text/plain'},
+    });
+
+    return echoed(response.body);
+  },
+});
+
+/* ------------------------------------------------------------- FormData bodies */
+
+/*
+ * got 15 made the `FormData` global the documented way to send multipart. The boundary is
+ * random per request, so the harness rewrites it on both sides - everything else about the
+ * encoding is compared byte for byte, here and on the wire.
+ */
+parityTest('a FormData body is encoded the way got encodes it', {
+  claim: 'README: a `FormData` body is encoded as multipart/form-data with its boundary.',
+  run: async (client, base) => {
+    const form = new FormData();
+
+    form.set('name', 'value');
+    form.set('file', new Blob(['hello'], {type: 'text/plain'}), 'f.txt');
+
+    const response = await client.post(`${base}/echo`, {body: form, responseType: 'json'});
+    const echo = response.body as EchoBody;
+
+    return {
+      contentType: (echo.headers['content-type'] ?? '').replace(/boundary=[-\w]+/, 'boundary=<b>'),
+      body: echo.body.replaceAll(/-{2,}[-\w]+/g, '<b>'),
+    };
+  },
+});
