@@ -92,11 +92,11 @@ parityTest('an unparseable body on an error status runs afterResponse and throws
   },
   divergence: {
     reason:
-      'Down to the message alone now. `code` was `ERR_HTTP_ERROR` here and is got’s ' +
-      '`ERR_NON_2XX_3XX_RESPONSE` since; `name`, `response.statusCode` and the raw body always matched. ' +
-      'The message is left as the terse `Response code 500` deliberately: got’s embeds the full request ' +
-      'url, which puts whatever a query string carries - tokens, signatures - into every log line that ' +
-      'prints the error.',
+      'Down to the query string alone now. `code`, `name`, `response.statusCode`, the raw body and the ' +
+      'message’s whole phrasing all match got; the url in it is truncated at the `?`. That is the one ' +
+      'deliberate difference: got names the full url, which is how an api key, a signature or a session ' +
+      'token in a query string ends up in every log line and APM group that prints the error. The path ' +
+      'identifies the request, the query is what leaks, so the path stays and the query goes.',
     got: {
       seen: [500],
       outcome: {
@@ -114,7 +114,7 @@ parityTest('an unparseable body on an error status runs afterResponse and throws
         outcome: 'rejected',
         name: 'HTTPError',
         code: 'ERR_NON_2XX_3XX_RESPONSE',
-        message: 'Response code 500',
+        message: 'Request failed with status code 500 (Internal Server Error): GET <base>/html-error',
         responseStatus: 500,
         responseBody: '<html><body>Gateway problem</body></html>',
       },

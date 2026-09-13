@@ -35,7 +35,7 @@
     "test": "node --test \"src/**/*.spec.ts\"",
     "test:watch": "node --test --watch \"src/**/*.spec.ts\"",
     "parity": "node --test \"src/parity/**/*.spec.ts\"",
-    "coverage": "node --test --experimental-test-coverage --test-coverage-exclude='src/**/*.spec.ts' --test-coverage-exclude='src/parity/**' --test-coverage-lines=99.8 --test-coverage-branches=95.9 --test-coverage-functions=98 \"src/**/*.spec.ts\"",
+    "coverage": "node --test --experimental-test-coverage --test-coverage-exclude='src/**/*.spec.ts' --test-coverage-exclude='src/parity/**' --test-coverage-lines=99.8 --test-coverage-branches=96 --test-coverage-functions=98 \"src/**/*.spec.ts\"",
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "lint": "oxlint --type-aware src && oxlint benchmark",

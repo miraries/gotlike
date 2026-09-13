@@ -390,6 +390,12 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 | `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
 | `RequestError` | the underlying error's own `code`, or `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
 
+An `HTTPError`'s message is got's - `Request failed with status code 403 (Forbidden): GET
+http://host/path` - with one deliberate difference: **the query string is removed**. got names the
+full url, which is how an api key, a signature or a session token in a query string ends up in every
+log line and APM group that prints the error. The path identifies the request; the query is what
+leaks. `error.response.request.options.url` still carries the url the request actually went to.
+
 `ValidationError` (`ERR_INVALID_OPTION`) is the one failure that is **not** a `RequestError`, and
 deliberately so: it means the client was configured wrong rather than that a request failed, and it
 is thrown synchronously from create, extend or the call itself, before anything reaches the network.

@@ -1271,8 +1271,49 @@ test('throw error on non-2xx if throwHttpErrors is true', async () => {
     },
     {
       code: 'ERR_NON_2XX_3XX_RESPONSE',
-      message: 'Response code 403',
+      // got's phrasing, minus the query - see the redaction test below.
+      message: 'Request failed with status code 403 (Forbidden): GET http://localhost:3000/status',
     },
+  );
+});
+
+/*
+ * The whole reason the message is not got's verbatim. got names the full url, which is how an api
+ * key, a signature or a session token in a query string ends up in every log line and APM group
+ * that prints the error. The path identifies the request; the query is what leaks.
+ */
+test('an http error message names the url but never its query', async () => {
+  const error = await failure(
+    client.get('http://localhost:3000/status', {
+      searchParams: {code: '500', apiKey: 'super-secret-token', sig: 'deadbeef'},
+    }),
+  );
+
+  assert.match(error.message, /GET http:\/\/localhost:3000\/status$/);
+  assert.doesNotMatch(error.message, /super-secret-token|deadbeef|apiKey|sig=/);
+
+  // The url the request actually went to is untouched - only the message is redacted.
+  assert.match(String(error.response?.request.options.url), /apiKey=super-secret-token/);
+});
+
+/*
+ * A status node has no canonical text for: the parenthetical is dropped rather than reading
+ * `(undefined)`. Non-standard codes in the 5xx range are common enough from proxies and
+ * gateways that this is not a hypothetical.
+ */
+test('an http error message omits the status text when there is none', async () => {
+  const error = await failure(client.get('http://localhost:3000/status-empty?code=599'));
+
+  assert.strictEqual(error.message, 'Request failed with status code 599: GET http://localhost:3000/status-empty');
+});
+
+// A fragment comes off with the query, and a url carrying neither is named in full.
+test('an http error message keeps a url that has no query', async () => {
+  const error = await failure(client.get('http://localhost:3000/status-empty?code=418#anchor'));
+
+  assert.strictEqual(
+    error.message,
+    "Request failed with status code 418 (I'm a Teapot): GET http://localhost:3000/status-empty",
   );
 });
 

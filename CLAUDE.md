@@ -948,9 +948,13 @@ the suite found rather than recording it:
 What is left is left on purpose, and the reason travels with each pin. Three are cases where gotlike is
 the better of the two and the note says so (a 204 read as json giving `undefined` rather than `""`; a
 `beforeRequest` url append not accumulating a signature across a retry; a `ValidationError` class kept
-distinct from `RequestError`). One is a deliberate refusal to copy got: `HTTPError`'s message stays the
-terse `Response code 500`, because got's embeds the full request url and puts whatever the query string
-carries — tokens, signatures — into every log line that prints the error. The last is the one place
+distinct from `RequestError`). One is a narrowed refusal to copy got: `HTTPError`'s message is now got's
+phrasing in full — `Request failed with status code 403 (Forbidden): GET http://host/path` — **minus the
+query string**, because got's embeds the whole url and puts whatever the query carries (tokens,
+signatures) into every log line and APM group that prints the error. The path is what identifies the
+request; the query is what leaks. `withoutQuery` does the cut and is shared with `resolveUrl`, where it
+measured *faster* than the inline code it replaced — see the note on it before changing it, and read the
+note about how to measure it before believing any number you get. The last is the one place
 gotlike is *more* permissive than got (a leading slash under `prefixUrl`), which is now in the README's
 divergence table rather than only in a test.
 
