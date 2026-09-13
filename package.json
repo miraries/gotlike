@@ -1,6 +1,6 @@
 {
   "name": "gotlike",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Barebones got-like undici-based http client for node.js",
   "keywords": [
     "undici",
@@ -26,7 +26,9 @@
     "node": ">=22.12"
   },
   "files": [
-    "dist"
+    "dist",
+    "src/index.ts",
+    "src/nock.ts"
   ],
   "type": "module",
   "main": "dist/index.js",
@@ -46,7 +48,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.20.2",
-    "got": "^14.6.6",
+    "got": "^16.0.0",
     "nock": "^14.0.17",
     "oxfmt": "^0.60.0",
     "oxlint": "^1.82.0",
