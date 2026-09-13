@@ -124,6 +124,13 @@ Supports:
 hooks can be awaited. An absolute `url` overrides `prefixUrl` instead of being rejected outright.
 got's `init` hook, `pagination`, `allowGetBody` and `methodRewriting` are not implemented.
 
+**No `user-agent` is sent.** got identifies itself as `got (https://github.com/sindresorhus/got)`;
+undici has no default and gotlike adds none, so requests go out with the header absent entirely -
+which an upstream that rate-limits, gates or just logs by agent will see. Set one per client if that
+matters: `gotlike.extend({ headers: { 'user-agent': 'my-service/1.2' } })`. It is the only request
+header that differs between the two clients on the same runtime; `accept-encoding` differs only
+below node 22.15, where `zstd` cannot be decoded and so is not advertised (see Compression).
+
 This is also a much younger library than got, with a correspondingly smaller amount of production
 mileage behind it. The behaviour above is covered by tests; the long tail beyond it is not.
 
@@ -489,7 +496,7 @@ await api.get('/x', { responseType: 'text' })  // Response<string> - the call st
 
 A client-level `resolveBodyOnly: true` carries through the same way.
 
-The same overloads are on `post`/`put`/`patch`/`delete`/`query`, on the callable form
+The same overloads are on `post`/`put`/`patch`/`delete`/`head`/`query`, on the callable form
 (`gotlike<User>('/x')`) and on `handle`.
 
 `Response` itself is not a tagged union over `responseType` - there is nothing on `Response<T>` to

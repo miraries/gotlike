@@ -48,7 +48,7 @@ Three source files, all in `src/`:
 
 ### Request pipeline
 
-`get`/`post`/`put`/`patch`/`delete`/`query`/`stream` are thin wrappers that set `url`/`method` and call `handle()`.
+`get`/`post`/`put`/`patch`/`delete`/`head`/`query`/`stream` are thin wrappers that set `url`/`method` and call `handle()`.
 
 **`handle()` unwraps `resolveBodyOnly` from the options that reached `call()`, not the ones the caller passed**,
 and reads them after the chain resolves — a handler may await something of its own, so the decision isn't
@@ -855,7 +855,7 @@ the ~330 test cases don't bury the one report that matters.
 
 ### Coverage
 
-`npm run coverage` runs the suite with coverage on and **fails below 99.8% lines / 95.9% branches / 98%
+`npm run coverage` runs the suite with coverage on and **fails below 99.8% lines / 96% branches / 98%
 functions**. `npm run check` runs it in place of `npm test`, so CI enforces it with no workflow change.
 `npm test` stays the plain runner for local work.
 
