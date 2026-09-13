@@ -931,9 +931,28 @@ than they look:
   sides stay pinned, so the test fails if gotlike drifts *and* if a got upgrade changes got. A `skip`
   would catch neither.
 
-The suite prints the full inventory when it finishes. Six behavioural divergences are recorded as of
-writing, and two of them are findings rather than decisions — gotlike ships no `head()` verb, and its
-`ValidationError` carries no `code` — both flagged in the reasons.
+The suite prints the full inventory when it finishes: **four request headers and five behaviours**
+against got, and two against nock. It started at five and seven; what closed the gap was fixing what
+the suite found rather than recording it:
+
+- **an `accept` derived from `responseType`**, which got sends and this did not — the one that changed
+  what comes *back*, since a content-negotiating upstream could answer gotlike with HTML where it
+  answered got with JSON;
+- **a `head()` verb**, which got has and this did not, so `client.head(url)` was a `TypeError`;
+- **`HTTPError.code`**, now got's `ERR_NON_2XX_3XX_RESPONSE` rather than `ERR_HTTP_ERROR`. Nothing in
+  `igd-aggregator-api` branches on it, but `BTi.ts` hand-writes got's spelling for its own synthetic
+  errors in four places, so the two codes would have split one condition across the error reporting;
+- **a `code` on `ValidationError`** (`ERR_INVALID_OPTION`) — every other error carried one;
+- **the `ParseError` message**, which now carries got's ` in "<url>"` suffix.
+
+What is left is left on purpose, and the reason travels with each pin. Three are cases where gotlike is
+the better of the two and the note says so (a 204 read as json giving `undefined` rather than `""`; a
+`beforeRequest` url append not accumulating a signature across a retry; a `ValidationError` class kept
+distinct from `RequestError`). One is a deliberate refusal to copy got: `HTTPError`'s message stays the
+terse `Response code 500`, because got's embeds the full request url and puts whatever the query string
+carries — tokens, signatures — into every log line that prints the error. The last is the one place
+gotlike is *more* permissive than got (a leading slash under `prefixUrl`), which is now in the README's
+divergence table rather than only in a test.
 
 **Adding a divergence is a deliberate act.** If a change makes something new diverge, the suite fails
 until someone writes down why that is acceptable. Reaching for `divergence` to make a red test green is

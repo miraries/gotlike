@@ -42,14 +42,6 @@ export const DIVERGENT_REQUEST_HEADERS: Record<string, string> = {
     'got hardcodes its own list. Deliberate - a hardcoded header can advertise an encoding node 22.12 cannot decode.',
   connection: 'node:http and undici negotiate keep-alive independently of the client wrapper.',
   host: 'carries the ephemeral port the server bound to; identical in practice, excluded for stability.',
-  /*
-   * UNRESOLVED - this one is a behavioural gap, not a cosmetic one. got derives an `accept`
-   * from `responseType` (`application/json` for json); gotlike sends none at all, so an
-   * upstream doing content negotiation can answer a gotlike request with HTML where it would
-   * have answered got's with JSON. Listed here so the rest of the suite can run, but it is a
-   * candidate fix rather than a settled divergence.
-   */
-  accept: 'got sends `accept: application/json` for `responseType: json`; gotlike sends nothing. See README.',
 };
 
 /**

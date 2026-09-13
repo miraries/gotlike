@@ -106,6 +106,7 @@ Supports:
 | `stream()` and `afterResponse` | promise API only | **same** - there is no parsed body to hand over and no way to replay a streamed request. Every other hook does fire for streams |
 | `prefixUrl` with an absolute `url` | throws | the **absolute url wins**, silently. `prefixUrl` therefore does *not* pin the host: if `url` can be influenced from outside, validate it yourself |
 | `prefixUrl` with a query or fragment | allowed | a **`ValidationError`** - the prefix is concatenated with `url`, so a `?` on it would land mid-url. Use `searchParams` |
+| `prefixUrl` with a leading slash on `url` | throws (`` `url` must not start with a slash ``) | **accepted** - every leading slash is stripped and the path is joined, so `'/items'` and `'items'` do the same thing. More permissive than got on purpose, but note the consequence: a caller who meant an absolute path gets a silently different request where got would have stopped them |
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
 
 ### Forced by undici
@@ -366,6 +367,10 @@ advertised, since nothing uses them.
 
 Set `decompress: false` on create/extend to skip the interceptor and send no `accept-encoding`.
 
+An `accept` header is derived from `responseType` the way got derives one: `application/json` for
+`responseType: 'json'`, and nothing at all for `text`, `buffer` or an unset one. An explicit `accept`
+always wins.
+
 > [!NOTE]
 > undici's decompress interceptor is still flagged experimental, so node prints
 > `ExperimentalWarning: DecompressInterceptor is experimental and subject to change` the first
@@ -379,11 +384,15 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 
 | class | `code` | when |
 | --- | --- | --- |
-| `HTTPError` | `ERR_HTTP_ERROR` | `throwHttpErrors` is on and the status is outside 2xx - plus a 3xx that reached you *while following redirects*, which means the chain outran `maxRedirects`. A 3xx with `followRedirect` off is not an error, and a 304 never is |
+| `HTTPError` | `ERR_NON_2XX_3XX_RESPONSE` | `throwHttpErrors` is on and the status is outside 2xx - plus a 3xx that reached you *while following redirects*, which means the chain outran `maxRedirects`. A 3xx with `followRedirect` off is not an error, and a 304 never is |
 | `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request`, or an `AbortSignal.timeout()` fired |
 | `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType`, on a status that was otherwise fine. On an error status the status wins: the body is left as the text that arrived, the hooks still see it, and `throwHttpErrors` decides - so a 500 carrying a proxy's HTML page is an `HTTPError`, not a parse failure |
 | `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
 | `RequestError` | the underlying error's own `code`, or `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
+
+`ValidationError` (`ERR_INVALID_OPTION`) is the one failure that is **not** a `RequestError`, and
+deliberately so: it means the client was configured wrong rather than that a request failed, and it
+is thrown synchronously from create, extend or the call itself, before anything reaches the network.
 
 `error.message` is the underlying failure's own - `connect ECONNREFUSED 127.0.0.1:443`,
 `getaddrinfo ENOTFOUND …` - not a generic label, so a log line or an APM grouping can tell one

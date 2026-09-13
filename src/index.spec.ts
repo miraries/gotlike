@@ -961,7 +961,9 @@ test('afterResponse sees error statuses before throwHttpErrors applies', async (
     },
   });
 
-  await assert.rejects(() => extClient.get('http://localhost:3000/status?code=401'), {code: 'ERR_HTTP_ERROR'});
+  await assert.rejects(() => extClient.get('http://localhost:3000/status?code=401'), {
+    code: 'ERR_NON_2XX_3XX_RESPONSE',
+  });
 
   assert.strictEqual(seenStatus, 401);
 });
@@ -1120,7 +1122,7 @@ test('beforeError can replace the thrown error', async () => {
     () => extClient.get('http://localhost:3000/status?code=500'),
     (err: Error) => {
       assert.ok(err instanceof TranslatedError);
-      assert.strictEqual(err.message, 'translated: ERR_HTTP_ERROR');
+      assert.strictEqual(err.message, 'translated: ERR_NON_2XX_3XX_RESPONSE');
 
       return true;
     },
@@ -1268,7 +1270,7 @@ test('throw error on non-2xx if throwHttpErrors is true', async () => {
       await client.get('http://localhost:3000/status?code=403&message=Forbidden');
     },
     {
-      code: 'ERR_HTTP_ERROR',
+      code: 'ERR_NON_2XX_3XX_RESPONSE',
       message: 'Response code 403',
     },
   );
@@ -1397,7 +1399,7 @@ test('stream errors on a non-2xx when throwHttpErrors is on', async () => {
   const err = await failure<Error>(text(duplex));
 
   assert.ok(err instanceof HTTPError, `expected an HTTPError, got ${err}`);
-  assert.strictEqual(err.code, 'ERR_HTTP_ERROR');
+  assert.strictEqual(err.code, 'ERR_NON_2XX_3XX_RESPONSE');
 });
 
 test('stream does not error on a non-2xx when throwHttpErrors is off', async () => {
@@ -1496,7 +1498,7 @@ test('exhausted retries throw when throwHttpErrors is set', async () => {
     },
   });
 
-  await assert.rejects(() => extClient.get('http://localhost:3000/retry'), {code: 'ERR_HTTP_ERROR'});
+  await assert.rejects(() => extClient.get('http://localhost:3000/retry'), {code: 'ERR_NON_2XX_3XX_RESPONSE'});
 });
 
 test('retry limit of 0 disables retries', async () => {
@@ -1549,7 +1551,7 @@ test('http error carries the parsed body, timings and request options', async ()
   const err = await failure<RequestError>(extClient.get('http://localhost:3000/unauthorized'));
 
   assert.ok(err instanceof RequestError);
-  assert.strictEqual(err.code, 'ERR_HTTP_ERROR');
+  assert.strictEqual(err.code, 'ERR_NON_2XX_3XX_RESPONSE');
   assert.strictEqual(err.response?.statusCode, 401);
   // The whole point: a parsed body, not a consumed BodyReadable.
   assert.deepStrictEqual(err.response?.body, {error: 'token expired'});
@@ -2187,7 +2189,7 @@ test('errors use named classes and stay instanceof RequestError', async () => {
   assert.ok(httpError instanceof HTTPError);
   assert.ok(httpError instanceof RequestError);
   assert.strictEqual(httpError.name, 'HTTPError');
-  assert.strictEqual((httpError as HTTPError).code, 'ERR_HTTP_ERROR');
+  assert.strictEqual((httpError as HTTPError).code, 'ERR_NON_2XX_3XX_RESPONSE');
 
   const timeoutError = await failure(
     client.get('http://localhost:3000/timeout', {
@@ -2320,7 +2322,7 @@ test('error responses are decompressed too', async () => {
     }),
   );
 
-  assert.strictEqual(err.code, 'ERR_HTTP_ERROR');
+  assert.strictEqual(err.code, 'ERR_NON_2XX_3XX_RESPONSE');
   assert.deepStrictEqual(err.response?.body, {error: 'OP_ERROR_INVALID_TOKEN'});
 });
 
@@ -3270,7 +3272,7 @@ test('a directly constructed client throws on error statuses, like the singleton
   const error = await failure<HTTPError>(bare.get('status?code=500'));
 
   assert.ok(error instanceof HTTPError);
-  assert.strictEqual(error.code, 'ERR_HTTP_ERROR');
+  assert.strictEqual(error.code, 'ERR_NON_2XX_3XX_RESPONSE');
 });
 
 test('a directly constructed client defaults to text, not buffer', async () => {
@@ -3718,7 +3720,7 @@ test('beforeError runs for a stream, and the error carries the response', async 
   const error = await failure<HTTPError>(text(duplex));
 
   assert.ok(error instanceof HTTPError);
-  assert.deepStrictEqual(seen, ['ERR_HTTP_ERROR']);
+  assert.deepStrictEqual(seen, ['ERR_NON_2XX_3XX_RESPONSE']);
   assert.strictEqual(error.response?.statusCode, 503);
   assert.strictEqual(error.response?.ok, false);
 });
@@ -3745,7 +3747,7 @@ test('beforeError runs for an upload stream too', async () => {
   const error = await failure<HTTPError>(text(duplex));
 
   assert.ok(error instanceof HTTPError, `expected an HTTPError, got ${error}`);
-  assert.deepStrictEqual(seen, ['ERR_HTTP_ERROR']);
+  assert.deepStrictEqual(seen, ['ERR_NON_2XX_3XX_RESPONSE']);
   assert.strictEqual(error.response?.statusCode, 500);
 });
 
@@ -4004,7 +4006,7 @@ test('a redirect chain that exceeds the limit is an HTTPError', async () => {
 
   const error = await failure(redirecting.get('http://localhost:3000/hop/0'));
 
-  assert.strictEqual(error.code, 'ERR_HTTP_ERROR');
+  assert.strictEqual(error.code, 'ERR_NON_2XX_3XX_RESPONSE');
   assert.strictEqual(error.name, 'HTTPError');
   assert.strictEqual(error.response?.statusCode, 302);
 });
@@ -4381,7 +4383,7 @@ test('an unparseable body on an error status runs afterResponse and throws HTTPE
   const error = await failure(extClient.get('http://localhost:3000/html-error?code=500'));
 
   assert.deepStrictEqual(seen, [500], 'the afterResponse hook must see the error status');
-  assert.strictEqual(error.code, 'ERR_HTTP_ERROR');
+  assert.strictEqual(error.code, 'ERR_NON_2XX_3XX_RESPONSE');
   assert.strictEqual(error.name, 'HTTPError');
   assert.match(String(error.response?.body), /Gateway problem/);
 });
@@ -5013,6 +5015,65 @@ test('put, patch and delete send their own methods', async () => {
   const removed = await extClient.delete<Echo>('echo');
 
   assert.deepStrictEqual([put.body.method, patch.body.method, removed.body.method], ['PUT', 'PATCH', 'DELETE']);
+});
+
+// got has `got.head(url)`; this had no such verb, so a drop-in caller writing it got a TypeError.
+test('head sends a HEAD and has no body to parse', async () => {
+  const response = await client.head('http://localhost:3000/echo');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.body, '');
+
+  // Also reachable through the callable form, which is where the verbs are forwarded.
+  const viaCallable = await client('http://localhost:3000/echo', {method: 'HEAD'});
+
+  assert.strictEqual(viaCallable.statusCode, 200);
+});
+
+/*
+ * got derives an `accept` from `responseType`, and sending none meant a content-negotiating
+ * upstream could answer this client with HTML where it answered got with JSON. Measured against
+ * got 14: `application/json` for `json` and nothing at all for the others.
+ */
+test('responseType json asks for json, and only json does', async () => {
+  const asJson = await client.get<Record<string, string>>('http://localhost:3000/headers', {responseType: 'json'});
+
+  assert.strictEqual(asJson.body['accept'], 'application/json');
+
+  const asText = JSON.parse((await client.get('http://localhost:3000/headers')).body) as Record<string, string>;
+
+  assert.strictEqual(asText['accept'], undefined, 'a text response must not ask for json');
+
+  const asBuffer = JSON.parse(
+    (await client.get('http://localhost:3000/headers', {responseType: 'buffer'})).body.toString(),
+  ) as Record<string, string>;
+
+  assert.strictEqual(asBuffer['accept'], undefined, 'a buffer response must not ask for json');
+});
+
+test('an explicit accept header wins over the one responseType would derive', async () => {
+  const response = await client.get<Record<string, string>>('http://localhost:3000/headers', {
+    responseType: 'json',
+    headers: {Accept: 'application/vnd.custom+json'},
+  });
+
+  assert.strictEqual(response.body['accept'], 'application/vnd.custom+json');
+});
+
+// Every other error this package raises carries a `code`; this one used to carry none, so
+// `err.code` was undefined for exactly the failures hit while wiring a client up.
+test('a ValidationError carries a code', () => {
+  const error = (() => {
+    try {
+      client.extend({timeout: 1000 as never});
+    } catch (err) {
+      return err as ValidationError & {code?: string};
+    }
+
+    throw new assert.AssertionError({message: 'expected extend to throw'});
+  })();
+
+  assert.strictEqual(error.code, 'ERR_INVALID_OPTION');
 });
 
 test('retry must be an object', () => {

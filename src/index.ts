@@ -596,6 +596,16 @@ const defaultRetryLimit = 2;
 const maxRedirections = 10;
 
 /**
+ * The code on an `HTTPError`, and got's own spelling of it.
+ *
+ * This used to be `ERR_HTTP_ERROR`. got says `ERR_NON_2XX_3XX_RESPONSE`, and the difference is
+ * not cosmetic for a drop-in: a consumer that hand-writes got's code for its own synthetic
+ * errors - which `igd-aggregator-api` does in four places - ends up reporting one condition
+ * under two codes, half from the client and half from itself.
+ */
+const httpErrorCode = 'ERR_NON_2XX_3XX_RESPONSE';
+
+/**
  * How many times an `afterResponse` hook may call `retryWithMergedOptions` for one request.
  * Generous enough that no real refresh-and-retry flow reaches it, and finite so that a hook
  * which always sees the status it retries on fails with this error instead of recursing until
@@ -1754,6 +1764,12 @@ const knownOptions = new Set(Object.keys(knownOptionMap));
 
 export class ValidationError extends Error {
   override name = 'ValidationError';
+  /**
+   * Every other error this package raises carries a `code`, and this one carried none - so
+   * `err.code` was `undefined` for exactly the failures a caller is most likely to be
+   * matching on while wiring a client up.
+   */
+  code = 'ERR_INVALID_OPTION';
 }
 
 function invalid(message: string): never {
@@ -2466,6 +2482,22 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         }
       }
 
+      /*
+       * got derives an `accept` from `responseType`, and sending none meant an upstream doing
+       * content negotiation could answer a gotlike request with HTML where it answered got's
+       * with JSON - a difference in what comes *back*, which is the one thing a drop-in
+       * replacement must not have. Measured against got 14: `application/json` for `json` and
+       * nothing at all for `text`, `buffer` or an unset `responseType`, with an explicit
+       * `accept` always winning.
+       *
+       * Per request rather than folded into `defaultHeaders` like `accept-encoding`, because
+       * `responseType` can be overridden per call: a json client making one text call must not
+       * still ask for json. The header scan only runs when the call is a json one.
+       */
+      if (options.responseType === 'json' && !hasHeader(options.headers, 'accept')) {
+        options.headers['accept'] = 'application/json';
+      }
+
       // Explicit options win over the url's own userinfo, as they do in got - setting
       // `username` there overwrites whatever the url carried.
       const username = options.username ?? userinfo?.username;
@@ -2623,8 +2655,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       }
 
       if (parseFailed) {
+        // got appends the url to V8's message, and a parse failure with no url in it is hard to
+        // place in a log line. Measured against got 14, down to the quoting.
         throw await this.toRequestError(
-          (err as Error).message,
+          `${(err as Error).message} in "${String(options.url)}"`,
           'ERR_BODY_PARSE_FAILURE',
           err as Error,
           options,
@@ -2748,7 +2782,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     if (options.throwHttpErrors && isHttpError(response.statusCode, this.follows(options))) {
       throw await this.toRequestError(
         `Response code ${response.statusCode}`,
-        'ERR_HTTP_ERROR',
+        httpErrorCode,
         undefined,
         options,
         response,
@@ -2824,7 +2858,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // `new HTTPError(...)` skipped entirely for streams.
     const error = await this.toRequestError(
       `Response code ${streamHead.statusCode}`,
-      'ERR_HTTP_ERROR',
+      httpErrorCode,
       undefined,
       options,
       new GotlikeResponse<undefined>(
@@ -2950,7 +2984,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
          */
         const failure = this.toRequestError(
           `Response code ${statusCode}`,
-          'ERR_HTTP_ERROR',
+          httpErrorCode,
           undefined,
           options,
           new GotlikeResponse<undefined>(
@@ -3253,6 +3287,24 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   delete<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
   delete<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
     return this.handle<T>(options, url, 'DELETE');
+  }
+
+  /*
+   * got has `got.head(url)`, and this had no such verb: HEAD was a supported method and
+   * `hasNoBody()` already handled it, but the only way to reach it was
+   * `client(url, {method: 'HEAD'})` - so a drop-in caller writing `client.head(url)` got a
+   * TypeError. Found by the parity suite, which could not run its HEAD scenario at all.
+   */
+  head(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  head(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  head(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  head(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
+  head(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  head(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
+  head<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
+  head<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  head<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
+    return this.handle<T>(options, url, 'HEAD');
   }
 
   put(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;

@@ -92,10 +92,11 @@ parityTest('an unparseable body on an error status runs afterResponse and throws
   },
   divergence: {
     reason:
-      'The claim itself holds - the hook sees the 500, the body stays as the text that arrived, and an ' +
-      'HTTPError is thrown. What differs is the error’s `code` and `message`: got says ' +
-      '`ERR_NON_2XX_3XX_RESPONSE`, gotlike says `ERR_HTTP_ERROR`. A got caller matching on `code` has to ' +
-      'change; one matching on `name` or `response.statusCode` does not.',
+      'Down to the message alone now. `code` was `ERR_HTTP_ERROR` here and is got’s ' +
+      '`ERR_NON_2XX_3XX_RESPONSE` since; `name`, `response.statusCode` and the raw body always matched. ' +
+      'The message is left as the terse `Response code 500` deliberately: got’s embeds the full request ' +
+      'url, which puts whatever a query string carries - tokens, signatures - into every log line that ' +
+      'prints the error.',
     got: {
       seen: [500],
       outcome: {
@@ -112,7 +113,7 @@ parityTest('an unparseable body on an error status runs afterResponse and throws
       outcome: {
         outcome: 'rejected',
         name: 'HTTPError',
-        code: 'ERR_HTTP_ERROR',
+        code: 'ERR_NON_2XX_3XX_RESPONSE',
         message: 'Response code 500',
         responseStatus: 500,
         responseBody: '<html><body>Gateway problem</body></html>',
@@ -371,15 +372,6 @@ parityTest('a HEAD request has no body to parse', {
 
     return {statusCode: response.statusCode, body: response.body};
   },
-  divergence: {
-    reason:
-      'GAP, not a design choice: gotlike ships no `head()` verb at all. HEAD is a supported method and ' +
-      '`hasNoBody()` handles it, but it is only reachable as `client(url, {method: "HEAD"})`. got has ' +
-      '`got.head()`, so a drop-in consumer calling it gets a TypeError. Adding the verb would close this ' +
-      'and let the scenario compare properly.',
-    got: {statusCode: 200, body: ''},
-    gotlike: {threw: 'client.head is not a function'},
-  },
 });
 
 /* ----------------------------------------------------------------------- parse failures */
@@ -387,27 +379,6 @@ parityTest('a HEAD request has no body to parse', {
 parityTest('an unparseable body on an ok status is a parse failure', {
   claim: 'CLAUDE.md: only a parse failure on an otherwise-ok status is a ParseError.',
   run: async (client, base) => capture(() => client.get(`${base}/not-json`, {responseType: 'json'}), base),
-  divergence: {
-    reason:
-      'Name, code, status and raw body all match. got appends ` in "<url>"` to the parse message; gotlike ' +
-      'reports V8’s message unchanged. Cosmetic, but it is what a log line greps on.',
-    got: {
-      outcome: 'rejected',
-      name: 'ParseError',
-      code: 'ERR_BODY_PARSE_FAILURE',
-      message: `Unexpected token 'h', "this is not json" is not valid JSON in "<base>/not-json"`,
-      responseStatus: 200,
-      responseBody: 'this is not json',
-    },
-    gotlike: {
-      outcome: 'rejected',
-      name: 'ParseError',
-      code: 'ERR_BODY_PARSE_FAILURE',
-      message: `Unexpected token 'h', "this is not json" is not valid JSON`,
-      responseStatus: 200,
-      responseBody: 'this is not json',
-    },
-  },
 });
 
 /* ---------------------------------------------------------------------------- prefixUrl */
@@ -547,10 +518,11 @@ parityTest('a url given both as an argument and as an option is rejected', {
   run: async (client, base) => capture(() => client.get(`${base}/echo`, {url: `${base}/status?code=404`}), base),
   divergence: {
     reason:
-      'The claim holds - both refuse, and neither sends a request. The error differs: got throws a ' +
-      '`RequestError` with code `ERR_GOT_REQUEST_ERROR`, gotlike a `ValidationError` with **no code at ' +
-      'all**. The missing code is worth noting on its own: every other gotlike error carries one, so ' +
-      '`err.code` is undefined exactly here.',
+      'The claim holds - both refuse, and neither sends a request. What is left is the error’s class ' +
+      'and code: got throws a `RequestError` with `ERR_GOT_REQUEST_ERROR`, gotlike a `ValidationError` ' +
+      'with `ERR_INVALID_OPTION`. gotlike’s used to carry no code at all, which is fixed; keeping a ' +
+      'distinct class for "you configured this wrong" rather than folding it into `RequestError` is ' +
+      'deliberate, since it is a programming error rather than a request that failed.',
     got: {
       outcome: 'rejected',
       name: 'RequestError',
@@ -562,7 +534,7 @@ parityTest('a url given both as an argument and as an option is rejected', {
     gotlike: {
       outcome: 'rejected',
       name: 'ValidationError',
-      code: undefined,
+      code: 'ERR_INVALID_OPTION',
       message: '`url` cannot be given both as an argument and as an option',
       responseStatus: undefined,
       responseBody: undefined,
