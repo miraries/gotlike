@@ -165,7 +165,7 @@ export type Scenario = {
 const inventory: {name: string; reason: string}[] = [];
 
 /**
- * Register a differential test: the scenario is run against real got 14 and against gotlike,
+ * Register a differential test: the scenario is run against real got 16 and against gotlike,
  * and both the value it returns and everything that reached the server must match.
  */
 export function parityTest(name: string, scenario: Scenario): void {
@@ -205,7 +205,7 @@ export function parityTest(name: string, scenario: Scenario): void {
       assert.deepStrictEqual(
         (observations['got'] as {returned: unknown}).returned,
         got,
-        `${name}\n\ngot 14 no longer produces the value this divergence was recorded against. ` +
+        `${name}\n\ngot 16 no longer produces the value this divergence was recorded against. ` +
           'The recorded behaviour is stale - re-measure it before trusting the note.',
       );
 
@@ -222,7 +222,7 @@ export function parityTest(name: string, scenario: Scenario): void {
       observations['gotlike'],
       observations['got'],
       `${name}\n\nclaim: ${scenario.claim}\n\n` +
-        'gotlike and got 14 disagree. Either the claim is no longer true, or the divergence ' +
+        'gotlike and got 16 disagree. Either the claim is no longer true, or the divergence ' +
         'is intended - in which case record it as `divergence` on the scenario (or, for a ' +
         'header, in DIVERGENT_REQUEST_HEADERS) so both sides stay pinned.',
     );
@@ -239,7 +239,7 @@ export function reportDivergences(): void {
   test.after(() => {
     const headers = Object.entries(DIVERGENT_REQUEST_HEADERS);
 
-    console.log('\n  gotlike vs got 14 - recorded divergences\n');
+    console.log('\n  gotlike vs got 16 - recorded divergences\n');
     console.log(`  request headers (${headers.length}):`);
 
     for (const [header, reason] of headers) {
@@ -356,7 +356,7 @@ export function propertyTest<I>(name: string, spec: PropertySpec<I>): void {
         observations['got'],
         `${name}\n\nclaim: ${spec.claim}\n\n` +
           `failing input (seed ${seed}, case ${i}):\n${JSON.stringify(input, undefined, 2)}\n\n` +
-          'gotlike and got 14 disagree on a generated input. Reproduce with ' +
+          'gotlike and got 16 disagree on a generated input. Reproduce with ' +
           `PARITY_SEED=${seed} and look at case ${i}.`,
       );
     }

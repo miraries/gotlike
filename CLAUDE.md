@@ -73,11 +73,15 @@ Two invariants worth preserving here:
   picked one — usually the stale one. Only the override side is walked on the hot path; the defaults are
   already normalised.
 - **A `url` is given as an argument or as an option, never both.** The argument used to overwrite the option
-  in silence; got refuses the combination outright (`The \`url\` option is mutually exclusive with the
-  \`input\` argument`, measured against got 14). The check sits inside the `url !== undefined` branch and
-  behind `validate`, so the hot path pays one property read for it. The callable `client({url, ...})` form
-  therefore passes its url in the options only - handing it over positionally as well was always redundant,
-  since `formOptions` spreads it in either way, and would now be rejected.
+  in silence; got refuses the combination too. **got 16 went further and dropped `url` as an option entirely**
+  (`The \`url\` option is not supported in options objects. Pass it as the first argument instead.`, a
+  `TypeError` thrown for the option whether or not an argument sits beside it — got 12 and 14 accepted it and
+  rejected only the combination). gotlike keeps the option: the callable `client({url, ...})` form is built on
+  it, and `igd-aggregator-api` is on `got-cjs@12`, where it is ordinary. Both halves of that are pinned in the
+  parity suite. The check sits inside the `url !== undefined` branch and behind `validate`, so the hot path pays
+  one property read for it. The callable form therefore passes its url in the options only - handing it over
+  positionally as well was always redundant, since `formOptions` spreads it in either way, and would now be
+  rejected.
 - **Everything that would need deep merging is resolved at create/extend time** (`hooks`, `handlers`, `retry`,
   `agent`). That's what makes a shallow spread sufficient. `formOptions` costs ~46ns; a request costs ~60µs.
 - **`searchParams` and `timeout` are the two exceptions, and both are guarded by a property read.** A per-call
@@ -85,7 +89,7 @@ Two invariants worth preserving here:
   lost it the moment a call named a parameter of its own — silently, and on the wire rather than at the call
   site. got merges them (`Options.searchParams` under `_merging`): a key the override names replaces every
   occurrence of that key, one it doesn't is kept, and one it names as `undefined` is dropped. Measured against
-  got 14, including the ordering — a replaced key moves to the end. `mergeSearchParams` only runs when *both*
+  got 16, including the ordering — a replaced key moves to the end. `mergeSearchParams` only runs when *both*
   sides carry one (~105ns when it does; nothing when it doesn't, and the spread has already picked the right
   side). `timeout` needs no allocation at all: only `request` is supported, so replacing the object is the same
   as merging it *except* when the override names no `request` — `{}`, or the `{request: config.timeout}` of a
@@ -166,7 +170,7 @@ fallback.
 `RequestError` takes `error.code ?? 'ERR_GOT_REQUEST_ERROR'`; every generic failure here was flattened to
 `ERR_REQUEST_ERROR` instead, with the real code reachable only through `cause` — so a connection refused, a DNS
 failure and a malformed url were indistinguishable to anything matching on `code`, exactly as they had been on
-`message` before `messageOf`. Measured against got 14: `ECONNREFUSED` and `ENOTFOUND` on both. Whatever undici
+`message` before `messageOf`. Measured against got 16: `ECONNREFUSED` and `ENOTFOUND` on both. Whatever undici
 raised is passed through as it stands, so parity is exact for the errno codes it surfaces from the socket and
 undici's own where it describes the failure itself (`UND_ERR_SOCKET` for a body cut short, where got says
 `ECONNRESET`) — the README says so rather than pretending otherwise. `codeOf` requires a **string**: a
@@ -288,7 +292,7 @@ none is present yet, so the first attempt's header survived the merge and was re
 credentials never left the process. That covers a `url` carrying userinfo as well as explicit
 `username`/`password`, since `retry({url: 'http://user2:pass2@host/p'})` is the same intent by the other route, and
 it is gated on `parseUserinfo`: with the scan off nothing would re-derive the header and the retry would go out
-anonymous. A hook's own `authorization` header still wins. Measured against got 14, which uses a new url's
+anonymous. A hook's own `authorization` header still wins. Measured against got 16, which uses a new url's
 credentials and keeps the previous ones for a new url that carries none — so a url without userinfo deliberately
 leaves the header alone.
 
@@ -326,8 +330,8 @@ hook throws. The `afterResponse` loop was the last uncovered path; it has its ow
 
 **`json`/`form` are serialised into `options.body` *before* the `beforeRequest` hooks run**, which is where got
 does it too, so a hook that rewrites `options.json` is writing to something already consumed and the original body
-goes out. Measured against got 14, which is *louder* about it rather than different: assigning `options.json` in a
-got hook throws (`Expected value which is undefined, received value of type string`), because got's `json` setter
+goes out. Measured against got 16, which is *louder* about it rather than different: assigning `options.json` in a
+got hook throws (``Expected value which is `undefined`, received value of type `string`.``), because got's `json` setter
 asserts that `body` is still unset. **Write `options.body` instead** — that works here, and `content-length` is
 re-derived from it (in got it is not, and the stale length gets the request rejected). Reordering the two to make
 `options.json` writable would be a divergence from got, so it is documented rather than changed.
@@ -345,7 +349,7 @@ a caller matching on `instanceof RequestError` missed it entirely.
 **A parse failure on an error status is not a parse failure.** An upstream answering a 500 with an HTML error
 page used to raise `ERR_BODY_PARSE_FAILURE` *before* the `afterResponse` hooks ran, so a refresh hook never saw
 the status that triggers it. The body is left as the text that arrived, the hooks look at it, and
-`throwHttpErrors` decides. Measured against got 14: the hooks run and `HTTPError` is thrown, and with
+`throwHttpErrors` decides. Measured against got 16: the hooks run and `HTTPError` is thrown, and with
 `throwHttpErrors: false` it *resolves* with the raw body - got never raises a parse error there. Only a parse
 failure on an otherwise-ok status is a `ParseError`.
 
@@ -645,7 +649,7 @@ to roughly a second. Both are covered by tests (`/trickle`, and a 50ms timeout a
 
 **The deadline bounds an attempt, not the retry sequence.** One signal is handed to undici and spans every attempt
 it makes, so the deadline was a cumulative budget: measured, a `timeout: {request: 400}` with `retry: {limit: 4}`
-against an upstream answering in 150ms ran all five attempts in got 14 (1045ms) and gave up after three here
+against an upstream answering in 150ms ran all five attempts in got 16 (1045ms) and gave up after three here
 (404ms) - a client configured to retry was denied most of its retries, and the README claimed got's semantics
 while not having them. `requestSignal` therefore hands back a `restart` alongside `release`, and `countAttempts`
 calls it on every re-dispatch, which is after undici's backoff wait and so doesn't charge the wait to the attempt.
@@ -886,11 +890,11 @@ at. Raising the threshold past what they allow buys a test for a race and a test
 
 ## Parity suite
 
-`src/parity/` runs the same scenario through **real got 14** and through gotlike, against one local
+`src/parity/` runs the same scenario through **real got 16** and through gotlike, against one local
 server, and asserts that both what the caller sees and what reached the server are identical. `npm run
 parity` runs it alone; `npm test` (and so `npm run check` and CI) picks it up with everything else.
 
-It exists because the "measured against got 14" claims throughout this file and the specs were
+It exists because the "measured against got 16" claims throughout this file and the specs were
 hand-verified once, in a session, and then never re-run. They were the most valuable thing documented
 here and the easiest to silently invalidate — a fix that changes behaviour has no way of knowing it
 broke a parity claim recorded in prose. Now it does.
@@ -931,8 +935,8 @@ than they look:
   sides stay pinned, so the test fails if gotlike drifts *and* if a got upgrade changes got. A `skip`
   would catch neither.
 
-The suite prints the full inventory when it finishes: **four request headers and five behaviours**
-against got, and two against nock. It started at five and seven; what closed the gap was fixing what
+The suite prints the full inventory when it finishes: **four request headers and six behaviours**
+against got 16, and two against nock. It started at five and seven; what closed the gap was fixing what
 the suite found rather than recording it:
 
 - **an `accept` derived from `responseType`**, which got sends and this did not — the one that changed
@@ -957,6 +961,13 @@ measured *faster* than the inline code it replaced — see the note on it before
 note about how to measure it before believing any number you get. The last is the one place
 gotlike is *more* permissive than got (a leading slash under `prefixUrl`), which is now in the README's
 divergence table rather than only in a test.
+
+The sixth arrived with the got 16 bump rather than from anything changing here: **got 16 dropped `url` as
+an option**, so `got({url, ...})` and `got(url, {url})` both throw a `TypeError` where got 12 and 14 took
+the first and rejected only the second. gotlike keeps the option, because the callable `client({url, ...})`
+form the README advertises is built on it and `got-cjs@12` — what the consumer actually runs — accepts it.
+Both halves are pinned. This is what the bump was for: one upstream behaviour change, surfaced by a failing
+test naming the exact value that moved, rather than by a caller finding it.
 
 **Adding a divergence is a deliberate act.** If a change makes something new diverge, the suite fails
 until someone writes down why that is acceptable. Reaching for `divergence` to make a red test green is

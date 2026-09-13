@@ -753,7 +753,7 @@ function appendQuery(params: URLSearchParams, input: SearchParams): void {
  * parameter of its own - silently, and on the wire rather than at the call site. got merges
  * the two (`Options.searchParams` under `_merging`): keys the override names replace every
  * occurrence of that key, keys it doesn't are kept, and a key it names as `undefined` is
- * dropped rather than replaced. Measured against got 14 - `{apiKey, v}` plus `{page: 2}` goes
+ * dropped rather than replaced. Measured against got 16 - `{apiKey, v}` plus `{page: 2}` goes
  * out as `?apiKey=secret&v=1&page=2`, and a replaced key moves to the end.
  *
  * Only ever called with both sides present: when one is missing there is nothing to merge and
@@ -1057,7 +1057,7 @@ function requestSignal(options: FormedOptions): {signal?: AbortSignal; release: 
      * `timeout.request` bounds an *attempt*, as got's does and as undici's own
      * `headersTimeout`/`bodyTimeout` do - so a retry starts the clock again. One signal spans
      * every attempt undici makes, so without this the deadline was a cumulative budget for the
-     * whole retry sequence: measured against got 14, a `timeout: {request: 400}` with
+     * whole retry sequence: measured against got 16, a `timeout: {request: 400}` with
      * `retry: {limit: 4}` against an upstream answering in 150ms ran all five attempts there
      * (1045ms) and gave up after three here (404ms). A request configured to retry was being
      * denied most of its retries, which is the opposite of what either option asks for. The
@@ -2270,11 +2270,14 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     if (url !== undefined) {
-      // got refuses the combination outright (`The \`url\` option is mutually exclusive with
-      // the \`input\` argument`, measured against got 14) rather than picking a winner, and
-      // two urls in one call is always a mistake worth hearing about - the argument used to
-      // quietly overwrite the option. Inside the `url !== undefined` branch and behind
-      // `validate`, so the hot path pays one property read for it.
+      // got refuses this rather than picking a winner, and two urls in one call is always a
+      // mistake worth hearing about - the argument used to quietly overwrite the option.
+      // Measured against got 16, which goes further and has dropped `url` as an option
+      // altogether (`The \`url\` option is not supported in options objects. Pass it as the
+      // first argument instead.`, thrown for the option with or without an argument beside
+      // it). The options-only callable form is built on that option, so it stays. Inside the
+      // `url !== undefined` branch and behind `validate`, so the hot path pays one property
+      // read for it.
       if (this.validate && options.url !== undefined) {
         invalid('`url` cannot be given both as an argument and as an option');
       }
@@ -2537,7 +2540,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
        * got derives an `accept` from `responseType`, and sending none meant an upstream doing
        * content negotiation could answer a gotlike request with HTML where it answered got's
        * with JSON - a difference in what comes *back*, which is the one thing a drop-in
-       * replacement must not have. Measured against got 14: `application/json` for `json` and
+       * replacement must not have. Measured against got 16: `application/json` for `json` and
        * nothing at all for `text`, `buffer` or an unset `responseType`, with an explicit
        * `accept` always winning.
        *
@@ -2655,7 +2658,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
            * that a proxy had wrapped in HTML. The body is left as the text that arrived, the
            * hooks get to look at it, and `throwHttpErrors` decides from there.
            *
-           * Measured against got 14: a 500 with an unparseable body runs the hooks and throws
+           * Measured against got 16: a 500 with an unparseable body runs the hooks and throws
            * `HTTPError`, and with `throwHttpErrors: false` it *resolves*, body and all. Only a
            * parse failure on an otherwise-ok response is a `ParseError`.
            */
@@ -2707,7 +2710,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
       if (parseFailed) {
         // got appends the url to V8's message, and a parse failure with no url in it is hard to
-        // place in a log line. Measured against got 14, down to the quoting.
+        // place in a log line. Measured against got 16, down to the quoting.
         throw await this.toRequestError(
           `${(err as Error).message} in "${String(options.url)}"`,
           'ERR_BODY_PARSE_FAILURE',
@@ -3174,7 +3177,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      * `username`/`password`: rotating them by retrying with `http://user2:pass2@host/` is the
      * same intent by the other route, and the first attempt's credentials went out instead.
      * Only for a client that parses userinfo at all - with `parseUserinfo: false` nothing would
-     * re-derive the header and the retry would go out anonymous. Measured against got 14: a
+     * re-derive the header and the retry would go out anonymous. Measured against got 16: a
      * new url's credentials are used, while a new url *without* any keeps the previous ones,
      * which is what leaving the header in place gives here.
      */

@@ -1064,7 +1064,7 @@ test('afterResponse retry with new username/password replaces the stale Basic au
  * retrying with a new url hit the same stale-header problem `username`/`password` did: the
  * first attempt's derived `authorization` survived the merge, `call()` read a header that was
  * already there as "leave it alone", and the new credentials never left the process. Measured
- * against got 14, which sends the new url's credentials.
+ * against got 16, which sends the new url's credentials.
  */
 test('afterResponse retry with credentials in a new url replaces the stale Basic auth header', async () => {
   const extClient = client.extend({
@@ -2570,10 +2570,11 @@ test('validation runs on create and extend, throwing synchronously', () => {
 });
 
 /*
- * got refuses this outright rather than picking a winner (`The `url` option is mutually
- * exclusive with the `input` argument`, measured against got 14); the argument used to
- * overwrite the option with nothing said. The options-only callable form is the legal way to
- * pass a url as an option and has to keep working.
+ * got refuses this outright rather than picking a winner; the argument used to overwrite the
+ * option with nothing said. Measured against got 16, which rejects `url` in an options object
+ * in every position - it dropped the option altogether. gotlike keeps it, because the
+ * options-only callable form is the legal way to pass a url as an option and has to keep
+ * working; the parity suite pins both sides of that difference.
  */
 test('a url given both as an argument and as an option is rejected', async () => {
   await assert.rejects(
@@ -2780,7 +2781,7 @@ test('a stream given a body in its options still follows redirects', async () =>
  * `timeout.request` bounds an attempt, not the whole retry sequence - as got's does, and as
  * undici's own per-phase timeouts do. The deadline signal spans every attempt undici makes, so
  * it used to be a cumulative budget: four 100ms attempts under a 250ms timeout died on the
- * third. Measured against got 14, which runs all of them.
+ * third. Measured against got 16, which runs all of them.
  */
 test('timeout.request bounds each attempt rather than the whole retry sequence', async () => {
   const extClient = client.extend({
@@ -4402,7 +4403,7 @@ test('a rewritten absolute url keeps its own query against searchParams', async 
  * a proxy's HTML error page - used to fail as `ERR_BODY_PARSE_FAILURE` *before* the
  * `afterResponse` hooks ran, so a refresh hook never saw the status that triggers it.
  *
- * Measured against got 14: the hooks run, the body stays as the text that arrived, and the
+ * Measured against got 16: the hooks run, the body stays as the text that arrived, and the
  * HTTP error is what is thrown.
  */
 test('an unparseable body on an error status runs afterResponse and throws HTTPError', async () => {
@@ -4686,7 +4687,7 @@ test('the client can be called with an options object alone', async () => {
  * `searchParams` is the one option a client can set that a per-request one used to erase
  * outright: `{...base, ...options}` replaces it wholesale, so a client carrying an api key
  * or a tenant id in its query lost it the moment a call named a parameter of its own. got
- * merges the two (`Options.searchParams`, `this._merging`) - measured against got 14, an
+ * merges the two (`Options.searchParams`, `this._merging`) - measured against got 16, an
  * `extend({searchParams: {apiKey, v}})` plus `get('items', {searchParams: {page: 2}})` goes
  * out as `?apiKey=secret&v=1&page=2`.
  */
@@ -4873,7 +4874,7 @@ test('stream is the same object on each read and belongs to its own client', asy
 });
 
 /*
- * Two behaviours the review called corruption, both measured against got 14. They are locked
+ * Two behaviours the review called corruption, both measured against got 16. They are locked
  * down here so a well-meaning "fix" has to argue with the measurement rather than with a
  * comment.
  *
@@ -4883,7 +4884,7 @@ test('stream is the same object on each read and belongs to its own client', asy
  * both halves.
  *
  * A `beforeRequest` hook that appends to `options.url` runs again on the retry, over the url
- * the first attempt went out with: got 14 sends `/items?sig=x` then `/items?sig=x&sig=x`.
+ * the first attempt went out with: got 16 sends `/items?sig=x` then `/items?sig=x&sig=x`.
  */
 test('a retry re-runs the beforeRequest hooks over the url the first attempt used, as got does', async () => {
   const urls: string[] = [];
@@ -4961,7 +4962,7 @@ test('a retry rebuilds the query from searchParams before the hooks run', async 
 
 /*
  * A hook that transforms `options.body` sees the first attempt's transformed body again on a
- * retry when the caller passed `body` - which is what got 14 does too (measured: `<PAY>` then
+ * retry when the caller passed `body` - which is what got 16 does too (measured: `<PAY>` then
  * `<<PAY>>`). A caller who passed `json` gets the body re-serialised from it each time, so
  * the transformation is applied once per attempt.
  */
@@ -5074,7 +5075,7 @@ test('head sends a HEAD and has no body to parse', async () => {
 /*
  * got derives an `accept` from `responseType`, and sending none meant a content-negotiating
  * upstream could answer this client with HTML where it answered got with JSON. Measured against
- * got 14: `application/json` for `json` and nothing at all for the others.
+ * got 16: `application/json` for `json` and nothing at all for the others.
  */
 test('responseType json asks for json, and only json does', async () => {
   const asJson = await client.get<Record<string, string>>('http://localhost:3000/headers', {responseType: 'json'});

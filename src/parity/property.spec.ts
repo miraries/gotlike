@@ -75,7 +75,7 @@ propertyTest('a prefixUrl and a relative path join the way got joins them', {
  * disagree on ordering as easily as on content.
  */
 propertyTest('a client searchParams and a per-call one merge the way got merges them', {
-  claim: 'CLAUDE.md: measured against got 14, including the ordering - a replaced key moves to the end.',
+  claim: 'CLAUDE.md: measured against got 16, including the ordering - a replaced key moves to the end.',
   cases: 60,
   generate: (rng) => {
     const base = query(rng, 1 + rng.int(3));

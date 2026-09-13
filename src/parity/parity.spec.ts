@@ -1,4 +1,12 @@
-import {capture, parityTest, reportDivergences, setupParityServer, summarise, type ParityClient} from './harness.ts';
+import {
+  capture,
+  parityTest,
+  reportDivergences,
+  setupParityServer,
+  summarise,
+  type AnyResponse,
+  type ParityClient,
+} from './harness.ts';
 
 setupParityServer();
 reportDivergences();
@@ -61,7 +69,7 @@ parityTest('a refused connection reports ECONNREFUSED with the underlying messag
 });
 
 parityTest('an unresolvable host reports ENOTFOUND', {
-  claim: 'CLAUDE.md: measured against got 14 - ECONNREFUSED and ENOTFOUND on both.',
+  claim: 'CLAUDE.md: measured against got 16 - ECONNREFUSED and ENOTFOUND on both.',
   run: async (client) => capture(() => client.get('http://does-not-exist.invalid/nothing')),
 });
 
@@ -69,7 +77,7 @@ parityTest('an unresolvable host reports ENOTFOUND', {
 
 parityTest('an unparseable body on an error status runs afterResponse and throws HTTPError', {
   claim:
-    'CLAUDE.md: measured against got 14 - the hooks run, the body stays as the text that arrived, ' +
+    'CLAUDE.md: measured against got 16 - the hooks run, the body stays as the text that arrived, ' +
     'and the HTTP error is what is thrown.',
   run: async (client, base) => {
     const seen: number[] = [];
@@ -169,7 +177,7 @@ parityTest('a retry re-runs only the afterResponse hooks before the one that ret
 });
 
 parityTest('an afterResponse retry with credentials in a new url replaces the stale Basic auth header', {
-  claim: 'CLAUDE.md: measured against got 14, which sends the new url’s credentials.',
+  claim: 'CLAUDE.md: measured against got 16, which sends the new url’s credentials.',
   run: async (client, base) => {
     const first = base.replace('http://', 'http://user1:pass1@');
     const second = base.replace('http://', 'http://user2:pass2@');
@@ -201,7 +209,7 @@ parityTest('an afterResponse retry with credentials in a new url replaces the st
 /* ------------------------------------------------------------------------ beforeRequest */
 
 parityTest('a retry re-runs the beforeRequest hooks over the url the first attempt used', {
-  claim: 'CLAUDE.md: got 14 sends `/echo?sig=x` then `/echo?sig=x&sig=x`.',
+  claim: 'CLAUDE.md: got 16 sends `/echo?sig=x` then `/echo?sig=x&sig=x`.',
   run: async (client, base) => {
     const urls: string[] = [];
     let retried = false;
@@ -257,7 +265,7 @@ parityTest('a retry re-runs the beforeRequest hooks over the url the first attem
  * than a blanket difference in how the hook is re-run.
  */
 parityTest('a beforeRequest url append accumulates across a retry when no searchParams is set', {
-  claim: 'CLAUDE.md: got 14 sends `/items?sig=x` then `/items?sig=x&sig=x`.',
+  claim: 'CLAUDE.md: got 16 sends `/items?sig=x` then `/items?sig=x&sig=x`.',
   run: async (client, base) => {
     const urls: string[] = [];
     let retried = false;
@@ -498,7 +506,7 @@ parityTest('beforeError may replace the error that is thrown', {
 /* ----------------------------------------------------------------------------- timeouts */
 
 parityTest('timeout.request bounds each attempt rather than the whole retry sequence', {
-  claim: 'CLAUDE.md: measured against got 14, which runs all of the attempts.',
+  claim: 'CLAUDE.md: measured against got 16, which runs all of the attempts.',
   run: async (client, base) => {
     const scoped = client.extend({retry: {limit: 3, backoffLimit: 10, statusCodes: [503], methods: ['GET']}});
 
@@ -519,15 +527,18 @@ parityTest('a url given both as an argument and as an option is rejected', {
   divergence: {
     reason:
       'The claim holds - both refuse, and neither sends a request. What is left is the error’s class ' +
-      'and code: got throws a `RequestError` with `ERR_GOT_REQUEST_ERROR`, gotlike a `ValidationError` ' +
-      'with `ERR_INVALID_OPTION`. gotlike’s used to carry no code at all, which is fixed; keeping a ' +
-      'distinct class for "you configured this wrong" rather than folding it into `RequestError` is ' +
-      'deliberate, since it is a programming error rather than a request that failed.',
+      'and code: got 16 throws a bare `TypeError` with no code (it has dropped `url` as an option ' +
+      'altogether, so the message is about the option rather than the combination), gotlike a ' +
+      '`ValidationError` with `ERR_INVALID_OPTION`. Keeping a distinct class for "you configured this ' +
+      'wrong" rather than folding it into `RequestError` is deliberate, since it is a programming error ' +
+      'rather than a request that failed. got 14 threw a `RequestError`/`ERR_GOT_REQUEST_ERROR` here ' +
+      'with the message "The `url` option is mutually exclusive with the `input` argument"; the change ' +
+      'came with the got 16 bump and is the whole reason this is pinned rather than skipped.',
     got: {
       outcome: 'rejected',
-      name: 'RequestError',
-      code: 'ERR_GOT_REQUEST_ERROR',
-      message: 'The `url` option is mutually exclusive with the `input` argument',
+      name: 'TypeError',
+      code: undefined,
+      message: 'The `url` option is not supported in options objects. Pass it as the first argument instead.',
       responseStatus: undefined,
       responseBody: undefined,
     },
@@ -539,5 +550,48 @@ parityTest('a url given both as an argument and as an option is rejected', {
       responseStatus: undefined,
       responseBody: undefined,
     },
+  },
+});
+
+/* ------------------------------------------------------------- url as an option alone */
+
+/**
+ * The callable form's own signature, and a divergence that only exists as of got 16.
+ *
+ * `client({url, ...})` is documented and is how a caller passes a url alongside everything
+ * else in one object. got 12 and 14 took it; got 16 removed the option and answers with a
+ * `TypeError` in every position. gotlike keeps it - `igd-aggregator-api` is on `got-cjs@12`,
+ * where this is the ordinary spelling - so the two now disagree about a form the README
+ * advertises. Pinned on both sides so neither can move without the suite noticing.
+ */
+parityTest('a url given only as an option', {
+  claim: 'README: the callable client takes `gotlike({url, ...})` as well as `gotlike(url, options)`.',
+  run: async (client, base) => {
+    const callable = client as unknown as (options: Record<string, unknown>) => Promise<AnyResponse>;
+
+    try {
+      const response = await callable({url: `${base}/status?code=204`});
+
+      return {outcome: 'resolved', statusCode: response.statusCode};
+    } catch (error) {
+      const failure = error as Error & {code?: string};
+
+      return {outcome: 'rejected', name: failure.name, code: failure.code, message: failure.message};
+    }
+  },
+  divergence: {
+    reason:
+      'got 16 dropped `url` as an option: it throws a `TypeError` rather than sending anything, in ' +
+      'this position as well as alongside a positional argument. gotlike accepts it and dispatches, ' +
+      'because the callable `client({url, ...})` form is built on that option and got-cjs@12 - what ' +
+      'the consumer this package exists for actually runs - accepts it too. Dropping it to match got ' +
+      '16 would break the documented callable form for no gain.',
+    got: {
+      outcome: 'rejected',
+      name: 'TypeError',
+      code: undefined,
+      message: 'The `url` option is not supported in options objects. Pass it as the first argument instead.',
+    },
+    gotlike: {outcome: 'resolved', statusCode: 204},
   },
 });

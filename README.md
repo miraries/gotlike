@@ -107,6 +107,7 @@ Supports:
 | `prefixUrl` with an absolute `url` | throws | the **absolute url wins**, silently. `prefixUrl` therefore does *not* pin the host: if `url` can be influenced from outside, validate it yourself |
 | `prefixUrl` with a query or fragment | allowed | a **`ValidationError`** - the prefix is concatenated with `url`, so a `?` on it would land mid-url. Use `searchParams` |
 | `prefixUrl` with a leading slash on `url` | throws (`` `url` must not start with a slash ``) | **accepted** - every leading slash is stripped and the path is joined, so `'/items'` and `'items'` do the same thing. More permissive than got on purpose, but note the consequence: a caller who meant an absolute path gets a silently different request where got would have stopped them |
+| `url` as an option - `gotlike({ url, ... })` | **removed in got 16** - a `TypeError` in any position; got 12 and 14 accepted it | **kept** - the callable form is built on it. Passing a url as an argument *and* as an option is rejected on both sides |
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
 
 ### Forced by undici
