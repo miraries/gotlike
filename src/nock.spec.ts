@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert';
 import {getGlobalDispatcher} from 'undici';
+import {parse as parseUrl} from 'node:url';
 import nock, {type ReplyFunctionResult} from './nock.ts';
 import client, {type RequestError} from './index.ts';
 
@@ -960,4 +961,224 @@ test('isDone on a regex origin ignores another origin', async () => {
   await client.get('http://isolated.test/mine');
 
   assert.strictEqual(mine.isDone(), true, 'another origin must not hold this scope open');
+});
+
+/*
+ * Coverage-driven tests.
+ *
+ * Most of what follows is public shim API that had no test at all - the repeat counts, the
+ * delay, and five of the eight verbs. A consumer migrating from nock reaches for these by
+ * name, and nothing here checked they worked.
+ */
+
+test('once, twice and thrice set the repeat count', async () => {
+  nock('http://repeats.test').get('/once').once().reply(200, 'a');
+  nock('http://repeats.test').get('/twice').twice().reply(200, 'b');
+  nock('http://repeats.test').get('/thrice').thrice().reply(200, 'c');
+
+  assert.strictEqual((await client.get('http://repeats.test/once')).body, 'a');
+  assertUnmatched(
+    await failure(client.get('http://repeats.test/once')),
+    'a `once` interceptor must be consumed after one request',
+  );
+
+  for (let i = 0; i < 2; i++) {
+    assert.strictEqual((await client.get('http://repeats.test/twice')).body, 'b');
+  }
+
+  assertUnmatched(await failure(client.get('http://repeats.test/twice')), 'twice means twice');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual((await client.get('http://repeats.test/thrice')).body, 'c');
+  }
+
+  assertUnmatched(await failure(client.get('http://repeats.test/thrice')), 'thrice means thrice');
+});
+
+test('delay holds the reply back', async () => {
+  nock('http://delayed.test').get('/slow').delay(60).reply(200, 'late');
+
+  const started = Date.now();
+  const response = await client.get('http://delayed.test/slow');
+
+  assert.strictEqual(response.body, 'late');
+  assert.ok(Date.now() - started >= 50, `expected the reply to be held back, took ${Date.now() - started}ms`);
+});
+
+// Five of the eight verbs had no test. `#verb` is shared, but nothing checked each passes the
+// method it names - a copy-paste slip there is invisible until a consumer hits it.
+test('every verb registers under its own method', async () => {
+  const scope = nock('http://verbs.test');
+
+  scope.put('/p').reply(200, 'put');
+  scope.patch('/p').reply(200, 'patch');
+  scope.delete('/p').reply(200, 'delete');
+  scope.head('/p').reply(200);
+  scope.options('/p').reply(200, 'options');
+  scope.query('/p').reply(200, 'query');
+
+  assert.strictEqual((await client.put('http://verbs.test/p')).body, 'put');
+  assert.strictEqual((await client.patch('http://verbs.test/p')).body, 'patch');
+  assert.strictEqual((await client.delete('http://verbs.test/p')).body, 'delete');
+  assert.strictEqual((await client('http://verbs.test/p', {method: 'HEAD'})).statusCode, 200);
+  assert.strictEqual((await client('http://verbs.test/p', {method: 'OPTIONS'})).body, 'options');
+  assert.strictEqual((await client.query('http://verbs.test/p')).body, 'query');
+});
+
+/* ----------------------------------------------------------------------- matcher branches */
+
+// A body announcing json that isn't json is handed to the callback as text, not thrown over.
+test('a reply callback gets an unparseable json body as text', async () => {
+  let seen: unknown;
+
+  nock('http://badjson.test')
+    .post('/p')
+    .reply(function (_uri, requestBody): ReplyFunctionResult {
+      seen = requestBody;
+
+      return [200, 'ok'];
+    });
+
+  await client.post('http://badjson.test/p', {
+    body: 'not json at all',
+    headers: {'content-type': 'application/json'},
+  });
+
+  assert.strictEqual(seen, 'not json at all');
+});
+
+// An object body matcher against a body that parsed to something else entirely.
+test('an object body matcher does not match a non-object body', async () => {
+  nock('http://bodyshape.test').post('/p', {a: 1}).reply(200, 'matched');
+
+  const error = await failure(client.post('http://bodyshape.test/p', {json: [1, 2, 3]}));
+
+  assertUnmatched(error, 'an array body must not satisfy an object matcher');
+});
+
+// A base path constrains the path: anything outside it is simply not this scope's.
+test('a base path does not match a request outside it', async () => {
+  nock('http://based.test/base').get('/inside').reply(200, 'in');
+
+  assert.strictEqual((await client.get('http://based.test/base/inside')).body, 'in');
+
+  nock('http://based.test/base').get('/inside').reply(200, 'in');
+
+  assertUnmatched(
+    await failure(client.get('http://based.test/elsewhere/inside')),
+    'a path outside the base path must not match',
+  );
+});
+
+// A literal query on the path with no `.query()` chained after it.
+test('a literal query on the path is matched on its own', async () => {
+  nock('http://literal.test').get('/p?a=1').reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://literal.test/p?a=1')).body, 'matched');
+
+  nock('http://literal.test').get('/p?a=1').reply(200, 'matched');
+
+  assertUnmatched(await failure(client.get('http://literal.test/p?a=2')), 'a different query must not match');
+});
+
+// Three occurrences of one key: the second appends to the array the first two produced.
+test('a query key repeated three times is collected as one array', async () => {
+  nock('http://thrice-query.test')
+    .get('/p')
+    .query({a: ['1', '2', '3']})
+    .reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://thrice-query.test/p?a=1&a=2&a=3')).body, 'matched');
+});
+
+/* --------------------------------------------------------------------------- entry points */
+
+test('a URL instance is accepted as an origin', async () => {
+  nock(new URL('http://urlobject.test/base')).get('/p').reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://urlobject.test/base/p')).body, 'matched');
+});
+
+test('enableNetConnect with no argument allows everything again', () => {
+  // Re-disabled immediately: the rest of the suite depends on net connect being off, and the
+  // assertion here is only that neither overload throws.
+  assert.doesNotThrow(() => nock.enableNetConnect());
+  assert.doesNotThrow(() => nock.enableNetConnect('allowed.test'));
+
+  nock.disableNetConnect();
+});
+
+/*
+ * A literal query on the path *and* a chained `.query()`. An object query is folded into
+ * undici's stored path, so the two are merged there; a predicate cannot be, and the literal's
+ * own values are compared one by one in the shim instead. Both forms are checked, since only
+ * the second reaches that comparison.
+ */
+test('a literal path query and a chained object query are both applied', async () => {
+  nock('http://folded.test').get('/p?a=1').query({b: '2'}).reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://folded.test/p?a=1&b=2')).body, 'matched');
+
+  nock('http://folded.test').get('/p?a=1').query({b: '2'}).reply(200, 'matched');
+
+  assertUnmatched(
+    await failure(client.get('http://folded.test/p?a=9&b=2')),
+    'the path’s own literal query must still have to match',
+  );
+});
+
+test('a literal path query is still applied alongside a query predicate', async () => {
+  const predicate = (query: Record<string, string | string[]>) => query['b'] === '2';
+
+  nock('http://foldedfn.test').get('/p?a=1').query(predicate).reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://foldedfn.test/p?a=1&b=2')).body, 'matched');
+
+  nock('http://foldedfn.test').get('/p?a=1').query(predicate).reply(200, 'matched');
+
+  assertUnmatched(
+    await failure(client.get('http://foldedfn.test/p?a=9&b=2')),
+    'the predicate passing must not excuse the path’s own literal query',
+  );
+});
+
+// `Object.fromEntries` would keep only the last; three occurrences exercise the append that
+// two do not, since the second is what creates the array.
+test('a URLSearchParams query keeps a key repeated three times', async () => {
+  nock('http://triple.test').get('/p').query(new URLSearchParams('a=1&a=2&a=3')).reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://triple.test/p?a=1&a=2&a=3')).body, 'matched');
+});
+
+// A base path with a query-ignoring matcher over it: the matcher is a function here, so the
+// base path is checked in the shim rather than folded into undici's stored path.
+test('a base path with query(true) still rejects a path outside it', async () => {
+  nock('http://basedq.test/base').get('/inside').query(true).reply(200, 'in');
+
+  assert.strictEqual((await client.get('http://basedq.test/base/inside?anything=1')).body, 'in');
+
+  nock('http://basedq.test/base').get('/inside').query(true).reply(200, 'in');
+
+  assertUnmatched(
+    await failure(client.get('http://basedq.test/outside/inside?anything=1')),
+    'a path outside the base path must not match even with query(true)',
+  );
+});
+
+// nock takes node's legacy `Url` object as well as a string or a `URL`.
+test('a legacy Url object is accepted as an origin', async () => {
+  nock(parseUrl('http://legacyurl.test/base')).get('/p').reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://legacyurl.test/base/p')).body, 'matched');
+});
+
+test('abortPendingRequests drops every registered interceptor', async () => {
+  nock('http://aborted.test').get('/p').reply(200, 'never');
+
+  nock.abortPendingRequests();
+
+  assertUnmatched(
+    await failure(client.get('http://aborted.test/p')),
+    'abortPendingRequests must leave nothing registered',
+  );
 });

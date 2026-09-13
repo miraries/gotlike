@@ -849,6 +849,33 @@ unconditionally, which is how the timeout test sat green while asserting nothing
 now — `typescript/no-floating-promises` is on, with `node:test`'s own `test`/`describe`/`before`/… allowlisted so
 the ~330 test cases don't bury the one report that matters.
 
+### Coverage
+
+`npm run coverage` runs the suite with coverage on and **fails below 99.5% lines / 95.5% branches / 98%
+functions**. `npm run check` runs it in place of `npm test`, so CI enforces it with no workflow change.
+`npm test` stays the plain runner for local work.
+
+The gate exists because an untested branch is where every bug in this repo's history has lived — the
+uncovered list *is* the bug surface, written out. It went in alongside a pass that closed most of it:
+`index.ts` from 93.56% to 95.69% branches, `nock.ts` from 92.20% to 96.23% and from 86.08% to **100%**
+functions. What that pass turned up is worth knowing, because it was all public API nobody had called:
+`put`/`patch`/`delete` on the client and five of the eight verbs on a nock `Scope` had no test at all,
+nor did `once`/`twice`/`thrice`, `delay`, `abortPendingRequests`, or `enableNetConnect`.
+
+**Five uncovered branches remain, and all five are deliberate.** They are listed here so nobody has to
+work out a second time whether they matter:
+
+| where | why it is uncovered |
+| --- | --- |
+| `index.ts` `headersToObject`, non-array arm | One call site, and undici always hands it the flat array form at a redirect hop. Defensive. |
+| `index.ts` redirect tracker, `lastStatusCode === undefined` | Made unreachable by the fix beside it: `countAttempts` resets `redirects.count` to 0 on a retry, so the retried attempt's first hop never reaches `onRedispatch`. Two mechanisms guard one bug and the count reset is the one that works. Removable, if anyone wants to. |
+| `index.ts` `callStream` http-error readable, `raised` guard | Needs undici's duplex to pull twice before the queued destroy lands — a race, not a behaviour. Any test for it would be flaky. |
+| `index.ts` `callStream` `else if (!isBodyMethod(...))` | **Dead.** The only call site already gates on `isBodyMethod`, so the arm cannot be entered. Kept because the comment on it documents the hang that happens if the routing above ever changes — but it is dead code today. |
+| `nock.ts` `cleanAll`'s `cleanMocks()` fallback | Only runs if undici moves its `dispatches` symbol, which is the future it exists for. |
+
+**Don't chase 100%.** The number is a means of finding untested behaviour, and the five above have been
+looked at. Raising the threshold past what those allow buys a test for a race and a test for dead code.
+
 ## Parity suite
 
 `src/parity/` runs the same scenario through **real got 14** and through gotlike, against one local

@@ -7,7 +7,7 @@ import {Readable, Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {text} from 'node:stream/consumers';
 import {randomUUID} from 'node:crypto';
-import {Agent, Dispatcher, getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
+import {Agent, Dispatcher, getGlobalDispatcher, interceptors, MockAgent, setGlobalDispatcher} from 'undici';
 import nock from './nock.ts';
 import client, {
   AbortError,
@@ -4988,6 +4988,243 @@ test('a retry re-transforms a raw body the hook already touched, as got does', a
   await extClient.post<Echo>('echo', {body: 'PAY'});
 
   assert.deepStrictEqual(bodies, ['<PAY>', '<<PAY>>']);
+});
+
+/*
+ * Coverage-driven tests.
+ *
+ * Each of these was written against a branch the suite never entered, found by running
+ * `npm run coverage`. They are grouped because they share a cause rather than a subject: an
+ * untested branch is where every bug in this repo's history has lived, so the uncovered list
+ * is the bug surface written out.
+ */
+
+// `maxAfterResponseRetries` is not exported; the bound is part of the documented contract, so
+// the test states it rather than reaching for the internal.
+const maxRetriesUnderTest = 20;
+
+// The three verbs had no test at all - `handle()` is shared, but nothing checked these three
+// pass the method they name.
+test('put, patch and delete send their own methods', async () => {
+  const extClient = client.extend({prefixUrl: 'http://localhost:3000', responseType: 'json'});
+
+  const put = await extClient.put<Echo>('echo', {body: 'p'});
+  const patch = await extClient.patch<Echo>('echo', {body: 'p'});
+  const removed = await extClient.delete<Echo>('echo');
+
+  assert.deepStrictEqual([put.body.method, patch.body.method, removed.body.method], ['PUT', 'PATCH', 'DELETE']);
+});
+
+test('retry must be an object', () => {
+  assert.throws(() => client.extend({retry: 5 as never}), /`retry` must be an object/);
+});
+
+/*
+ * `retryWithMergedOptions` handed to a hook always travels with that hook's index, so the
+ * retried request runs a strictly shorter hook array and the chain is bounded by the array
+ * rather than by the depth guard. Driving the method directly is the case the guard is
+ * actually for - no hook index, so the whole array runs every time - and the case that used
+ * to recurse until the process died.
+ */
+test('retryWithMergedOptions driven directly is bounded by maxAfterResponseRetries', async () => {
+  const extClient = client.extend({throwHttpErrors: false});
+
+  const first = await extClient.get('http://localhost:3000/json');
+
+  const error = await failure(
+    (async () => {
+      let options = first.request.options;
+
+      // Each retry's own options carry the depth forward, which is what makes the chain
+      // accumulate rather than restart.
+      for (let i = 0; i < maxRetriesUnderTest + 5; i++) {
+        options = (await extClient.retryWithMergedOptions(options, {})).request.options;
+      }
+    })(),
+  );
+
+  assert.strictEqual(error.code, 'ERR_TOO_MANY_RETRIES');
+  assert.match(error.message, new RegExp(`more than ${maxRetriesUnderTest} times`));
+});
+
+/*
+ * A retry naming a `timeout` that sets no `request` must not drop the deadline the first
+ * attempt ran under - the same hole `formOptions` has for `{request: config.timeout}` where the
+ * config didn't set one.
+ */
+test('an afterResponse retry keeps the deadline when its timeout names no request', async () => {
+  let seen: number | undefined;
+  let retried = false;
+
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [(options) => void (seen = options.timeout?.request)],
+      afterResponse: [
+        (response, retry) => {
+          if (retried) {
+            return response;
+          }
+
+          retried = true;
+
+          return retry({timeout: {}});
+        },
+      ],
+    },
+  });
+
+  await extClient.get<Echo>('http://localhost:3000/echo', {timeout: {request: 2000}});
+
+  assert.strictEqual(seen, 2000, 'the retry must inherit the first attempt\u2019s deadline');
+});
+
+/* ------------------------------------------------------- redirect tracker, on a re-dispatch */
+
+/*
+ * The tracker's "this re-dispatch is not a redirect hop" guard. A retry re-dispatches through
+ * the whole chain, so the redirect interceptor sees a second dispatch for a request that never
+ * redirected - and `countAttempts`, composed outside it, has just cleared `lastStatusCode`
+ * precisely so this is recognisable. Without the guard the retried attempt is recorded as a
+ * redirect hop, `beforeRedirect` fires for a redirect that never happened, and `response.url`
+ * reports the wrong url.
+ *
+ * The existing redirect-plus-retry tests all redirect *first*, which leaves a status recorded
+ * and steps over the guard.
+ */
+test('a retry that followed no redirect is not recorded as a redirect hop', async () => {
+  const hops: string[] = [];
+  const testId = randomUUID();
+
+  const extClient = client.extend({
+    followRedirect: true,
+    retry: {limit: 2, backoffLimit: 10, statusCodes: [503]},
+    hooks: {beforeRedirect: [(request) => hops.push(String(request.path))]},
+  });
+
+  const response = await extClient.get('http://localhost:3000/flaky-target', {headers: {'test-id': testId}});
+
+  assert.strictEqual(response.body, 'flaky ok');
+  assert.strictEqual(response.retryCount, 1);
+  assert.deepStrictEqual(hops, [], 'no redirect happened, so beforeRedirect must not have fired');
+  assert.strictEqual(String(response.url), 'http://localhost:3000/flaky-target');
+});
+
+/* -------------------------------------------------- stream failure paths that had no test */
+
+// The writable half's `final` had no coverage: every existing test writes to a failed upload,
+// and none of them just ends it. `pipeline` on an empty source does exactly that.
+test('a failed upload stream reports on end as well as on write', async () => {
+  const upload = await client.stream('http://::invalid-url::', {method: 'POST'});
+
+  const error = await failure(pipeline(Readable.from([]), upload));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error?.constructor?.name}`);
+});
+
+/*
+ * `raise` is idempotent, and nothing exercised the second call. Reading twice is the realistic
+ * way in: node calls `_read` again as soon as the first returns without pushing.
+ */
+test('a failed upload stream raises its failure only once', async () => {
+  const upload = await client.stream('http://::invalid-url::', {method: 'POST'});
+  const seen: Error[] = [];
+
+  upload.on('error', (error: Error) => seen.push(error));
+
+  upload.read();
+  upload.read();
+
+  await new Promise((resolve) => upload.once('close', resolve));
+
+  assert.strictEqual(seen.length, 1, 'the failure must be raised once, not once per read');
+});
+
+/*
+ * `raiseWhenListening` installs a `newListener` hook when nothing is listening for `error` yet,
+ * and that hook has to ignore every other event. Nothing had ever added a non-error listener
+ * while it was armed, so the guard was never entered.
+ */
+test('the newListener hook ignores events other than error', async () => {
+  const upload = await client.stream('http://::invalid-url::', {method: 'POST'});
+
+  // Before the arming `setImmediate` runs, so it sees no error listener and installs the hook.
+  // Deliberately not `data`, which would start the stream flowing and raise via `read`.
+  upload.on('close', () => {});
+
+  await new Promise((resolve) => setImmediate(resolve));
+
+  // Armed now: a non-error listener must leave it armed rather than raising or unhooking.
+  upload.on('finish', () => {});
+
+  const error = await new Promise<Error>((resolve) => upload.once('error', resolve));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error?.constructor?.name}`);
+});
+
+/*
+ * Not tested: the `raised` guard on the http-error readable at the bottom of `callStream`.
+ * Reaching it needs undici's duplex to pull from that readable twice before the queued destroy
+ * lands, which is a race rather than a behaviour - any test for it would be flaky. It is a
+ * defensive guard on a path whose first read is covered, and it is left uncovered deliberately.
+ */
+
+// `toStreamError`'s abort branch: every existing abort test goes through `call()`, not a stream.
+test('an aborted stream is reported as an AbortError', async () => {
+  const controller = new AbortController();
+  const stream = await client.stream('http://localhost:3000/stream', {signal: controller.signal});
+
+  controller.abort();
+
+  const error = await failure(text(stream));
+
+  assert.strictEqual(error.name, 'AbortError');
+  assert.strictEqual(error.code, 'ERR_ABORTED');
+});
+
+/* ------------------------------------------------- undici's own timeouts, not the deadline */
+
+/*
+ * `timeout.request` arms undici's per-phase timeouts *and* a deadline signal, and the deadline
+ * is what normally fires first - so the mapping of undici's own `HeadersTimeoutError` was
+ * never reached. A custom agent carrying `headersTimeout` and no `timeout.request` is the way
+ * in, and it is a real configuration: it is how a caller bounds headers without bounding the
+ * whole request.
+ */
+test('undici’s own headers timeout is mapped to a TimeoutError', async () => {
+  const extClient = client.extend({agent: new Agent({headersTimeout: 50})});
+
+  const error = await failure(extClient.get('http://localhost:3000/slow'));
+
+  assert.strictEqual(error.name, 'TimeoutError');
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+});
+
+test('undici’s own headers timeout is mapped on a stream too', async () => {
+  const extClient = client.extend({agent: new Agent({headersTimeout: 50})});
+
+  const error = await failure(extClient.stream('http://localhost:3000/slow').then(text));
+
+  assert.strictEqual(error.name, 'TimeoutError');
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+});
+
+/*
+ * gotlike forces `throwOnError: false` on its own retry interceptor, so a `RequestRetryError`
+ * can only reach `call()` from a retry interceptor the caller composed themselves - which the
+ * `agent` seam explicitly allows. The branch exists to carry the last response onto the error
+ * rather than losing it, and nothing tested that it does.
+ */
+test('a RequestRetryError from a caller’s own retry interceptor keeps the last response', async () => {
+  const extClient = client.extend({
+    agent: new Agent().compose(
+      interceptors.retry({maxRetries: 1, minTimeout: 10, maxTimeout: 10, statusCodes: [503], methods: ['GET']}),
+    ),
+  });
+
+  const error = await failure(extClient.get('http://localhost:3000/status?code=503'));
+
+  assert.strictEqual(error.response?.statusCode, 503, 'the exhausted retry must carry its last response');
 });
 
 /*
