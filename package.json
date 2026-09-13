@@ -44,7 +44,8 @@
     "lint:fix": "oxlint --type-aware --fix src && oxlint --fix benchmark",
     "fmt": "oxfmt src benchmark",
     "fmt:check": "oxfmt --check src benchmark",
-    "check": "npm run typecheck && npm run lint && npm run fmt:check && npm run coverage"
+    "check": "npm run typecheck && npm run lint && npm run fmt:check && npm run coverage",
+    "prepublishOnly": "npm run check && npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.20.2",

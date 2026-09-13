@@ -426,6 +426,12 @@ forget a field:
 - **`normaliseStreamErrors()`** / **`normaliseBodyErrors()`** — one `_destroy` wrap behind both stream paths, so
   the upload path can't drift back into reporting undici's raw errors while the bodyless one normalises. See
   Streams.
+- **`makeStreamHead()`** / **`streamHttpError()`** — the response head and the `throwHttpErrors` failure, which
+  `callBodylessStream` and `callStream` each spelled out in full. Both copies had to remember that `url` is the
+  url that *answered* rather than `options.url`, that `retryCount` comes off the shared attempt holder, and
+  that the error carries a `GotlikeResponse` with no body (it has been dumped or resumed by then). The error
+  helper deliberately does **not** await: the bodyless path awaits it, and the pipeline path needs the promise
+  so its readable can raise at read time rather than throwing synchronously.
 - **`appendQuery()`** — the `searchParams` walk, behind both `stringifyQuery` (serialise one) and
   `mergeSearchParams` (merge two). Merging through a string round-trip on both sides cost ~300ns; walking the
   override directly is ~105ns and cannot drift from the rules serialising applies.
@@ -437,7 +443,10 @@ forget a field:
   repeated expression.
 - **`GotlikeResponse` is constructed directly.** There used to be a `formResponse()` wrapper that took
   `(body, statusCode, headers, …)` and called the constructor as `(body, headers, statusCode, …)` — an
-  invisible swap, one edit from a silent bug.
+  invisible swap, one edit from a silent bug. Don't bring one back: the two remaining hand-written sites are
+  both in `call()` (the success path and the catch), where they are three lines apart and the arguments are
+  read from the same locals. `streamHttpError` is not a counter-example — it takes a `StreamHead` and reads
+  the fields off it by name, so there is no positional list to transpose.
 
 `formOptions()` deliberately still hand-rolls its merge rather than sharing one with `extend()` and
 `retryWithMergedOptions()`: it is the hot path (~120ns including validation, measured), and the other two run
@@ -445,7 +454,13 @@ once per client or once per refresh.
 
 `knownOptionMap` is `satisfies Record<keyof RequestOptions, true>`, so **adding an option to the type without
 registering it is a compile error**. `clientOnlyOptions` is a `Set` because validation consults it per option
-per request. Both were lists that could silently drift.
+per request, and it **spreads `agentOptions` rather than relisting them**: every agent-level option is
+client-only by definition, since it decides which dispatcher is built, and one missing from the set would be
+accepted per request and then ignored. Both were lists that could silently drift.
+
+`validateOptions` itself is **not exported**. It is reached only through the constructor, `formOptions` and
+`extend`, and its `atCreation` flag is an internal distinction — exporting it would freeze that signature as
+public API for no caller that exists.
 
 ### retryCount and beforeRetry
 

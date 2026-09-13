@@ -97,11 +97,12 @@ export function nockParityTest(name: string, scenario: NockScenario): void {
      * one scenario can be written against either, and a parameter type cannot be widened by
      * assignment - so the step is required however unnecessary it looks from one side.
      */
-    // oxlint-disable-next-line typescript/no-unnecessary-type-assertion
+    /* oxlint-disable typescript/no-unnecessary-type-assertion */
     const implementations: [string, NockLike, ParityClient][] = [
       ['nock', realNock as unknown as NockLike, realGot as unknown as ParityClient],
       ['shim', shimNock as unknown as NockLike, gotlike as unknown as ParityClient],
     ];
+    /* oxlint-enable typescript/no-unnecessary-type-assertion */
 
     const observations: Record<string, unknown> = {};
 

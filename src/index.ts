@@ -1704,6 +1704,37 @@ function makeStreamClient(instance: Gotlike<any>): StreamClient {
   return stream;
 }
 
+/**
+ * The response head both stream paths hand back, built once rather than twice.
+ *
+ * `callBodylessStream` and `callStream` each spelled this literal out, and each had to
+ * remember that `url` is the url that *answered* (not `options.url`, which is the one that was
+ * requested and is not where a redirect chain ended), that `retryCount` comes off the shared
+ * attempt holder rather than from nowhere, and that `total` is measured from the request's own
+ * start. Three fields, two copies, and every one of them a place to forget one.
+ */
+function makeStreamHead(
+  statusCode: number,
+  headers: IncomingHttpHeaders,
+  options: FormedOptions,
+  dispatch: SharedDispatchOptions,
+  startTime?: [number, number],
+): StreamHead {
+  return {
+    statusCode,
+    ok: isOk(statusCode),
+    headers,
+    // Where the response came from, which is not `options.url` once redirects moved it.
+    url: dispatch.redirects?.lastUrl ?? (options.url as string | URL),
+    retryCount: retriesFrom(dispatch.attempts),
+    timings: {
+      phases: {
+        total: elapsedMs(startTime),
+      },
+    },
+  };
+}
+
 /*
  * The option shapes the request overloads discriminate on. Together they let a call site say
  * what it gets back without a cast: `responseType` pins the body type for `text` and
@@ -1887,28 +1918,6 @@ function isBodyMethod(method?: string): boolean {
  *
  * A Set, not an array: this is consulted once per option on every validated request.
  */
-const clientOnlyOptions = new Set<keyof RequestOptions>([
-  'agent',
-  'retry',
-  'http2',
-  'pipelining',
-  'dnsLookup',
-  'dnsCache',
-  'connections',
-  'keepAliveTimeout',
-  'keepAliveMaxTimeout',
-  'connectTimeout',
-  'cache',
-  'dedupe',
-  'decompress',
-  'handlers',
-  'hooks',
-  // `validate` and `parseUserinfo` are read from the instance, so a per-request value would
-  // do nothing.
-  'validate',
-  'parseUserinfo',
-]);
-
 /** Agent-level options: any of these present means building a dedicated dispatcher. */
 const agentOptions = [
   'http2',
@@ -1919,6 +1928,26 @@ const agentOptions = [
   'keepAliveMaxTimeout',
   'connectTimeout',
 ] as const satisfies readonly (keyof RequestOptions)[];
+
+const clientOnlyOptions = new Set<keyof RequestOptions>([
+  // Every agent-level option is client-only by definition - it decides which dispatcher gets
+  // built, and that happens once per client. Spread rather than listed again so the two cannot
+  // drift: an agent option missing from here would be accepted per request and then ignored,
+  // which is the exact failure this set exists to prevent.
+  ...agentOptions,
+  'agent',
+  'retry',
+  'dnsCache',
+  'cache',
+  'dedupe',
+  'decompress',
+  'handlers',
+  'hooks',
+  // `validate` and `parseUserinfo` are read from the instance, so a per-request value would
+  // do nothing.
+  'validate',
+  'parseUserinfo',
+]);
 
 /**
  * Every option name, as a map rather than a list so `satisfies` can check it against
@@ -1987,7 +2016,7 @@ function invalid(message: string): never {
  * `atCreation` distinguishes the two call sites: `hooks` and `retry` are meaningful on a
  * client but inert on a single call, and saying so beats being quietly ignored.
  */
-export function validateOptions(options: RequestOptions, atCreation: boolean): void {
+function validateOptions(options: RequestOptions, atCreation: boolean): void {
   for (const key in options) {
     // Own properties only. `for...in` walks the prototype chain, so anything that had added an
     // enumerable property to `Object.prototype` failed every request with `Unknown option`.
@@ -3079,22 +3108,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // closes it too, so the error path releases through the same listener.
     releaseOnClose(undiciResponse.body, dispatch.release);
 
-    const retryCount = retriesFrom(dispatch.attempts);
-    // Where the response came from, which is not `options.url` once redirects moved it.
-    const finalUrl = dispatch.redirects?.lastUrl;
-
-    const streamHead: StreamHead = {
-      statusCode: undiciResponse.statusCode,
-      ok: isOk(undiciResponse.statusCode),
-      headers: undiciResponse.headers,
-      url: finalUrl ?? (options.url as string | URL),
-      retryCount,
-      timings: {
-        phases: {
-          total: elapsedMs(startTime),
-        },
-      },
-    };
+    const streamHead = makeStreamHead(undiciResponse.statusCode, undiciResponse.headers, options, dispatch, startTime);
 
     if (!options.throwHttpErrors || !isHttpError(undiciResponse.statusCode, this.follows(options))) {
       // The head arrived, but the body can still fail: a socket reset part-way through a
@@ -3108,27 +3122,42 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // Built through `toRequestError` like every other failure: it carries the response the
     // way the docs promise, and it runs the `beforeError` hooks, which a bare
     // `new HTTPError(...)` skipped entirely for streams.
-    const error = await this.toRequestError(
-      httpErrorMessage(streamHead.statusCode, options),
+    const error = await this.streamHttpError(streamHead, options, dispatch);
+
+    // The body was dumped just above, so there is nothing left to present - the error readable
+    // `asStream` builds for a failure is what the caller reads.
+    return asStream(Readable.from([]), streamHead, error);
+  }
+
+  /**
+   * The `HTTPError` for a stream whose status `throwHttpErrors` refuses, on both stream paths.
+   *
+   * Built through `toRequestError` like every other failure, so it carries the response the way
+   * the docs promise and runs the `beforeError` hooks - a bare `new HTTPError(...)` skipped them
+   * entirely for streams. The body has already been dumped or resumed by the time this is
+   * called, so the response it carries has none.
+   *
+   * Not awaited here: the bodyless path awaits it, and the pipeline path has to keep the promise
+   * so the readable it returns can raise it at read time rather than throwing synchronously.
+   */
+  streamHttpError(head: StreamHead, options: FormedOptions, dispatch: SharedDispatchOptions): Promise<Error> {
+    return this.toRequestError(
+      httpErrorMessage(head.statusCode, options),
       httpErrorCode,
       undefined,
       options,
       new GotlikeResponse<undefined>(
         undefined,
-        streamHead.headers,
-        streamHead.statusCode,
-        retryCount,
-        streamHead.timings.phases.total,
+        head.headers,
+        head.statusCode,
+        head.retryCount,
+        head.timings.phases.total,
         options,
         undefined,
-        finalUrl,
+        dispatch.redirects?.lastUrl,
       ),
       HTTPError,
     );
-
-    // The body was dumped just above, so there is nothing left to present - the error readable
-    // `asStream` builds for a failure is what the caller reads.
-    return asStream(Readable.from([]), streamHead, error);
   }
 
   /**
@@ -3201,21 +3230,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
     try {
       duplex = undici.pipeline(options.url as string, dispatch, ({statusCode, headers, body}) => {
-        // Where the response came from, which is not `options.url` once redirects moved it.
-        const finalUrl = dispatch.redirects?.lastUrl;
-
-        const streamHead: StreamHead = {
-          statusCode,
-          ok: isOk(statusCode),
-          headers,
-          url: finalUrl ?? (options.url as string | URL),
-          retryCount: retriesFrom(dispatch.attempts),
-          timings: {
-            phases: {
-              total: elapsedMs(startTime),
-            },
-          },
-        };
+        const streamHead = makeStreamHead(statusCode, headers, options, dispatch, startTime);
 
         resolveHead(streamHead);
         duplex.emit('response', streamHead);
@@ -3234,23 +3249,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
          * failure skipped the hooks entirely and arrived with `error.response` undefined,
          * which the documented contract says only happens when no response ever came.
          */
-        const failure = this.toRequestError(
-          httpErrorMessage(statusCode, options),
-          httpErrorCode,
-          undefined,
-          options,
-          new GotlikeResponse<undefined>(
-            undefined,
-            headers,
-            statusCode,
-            streamHead.retryCount,
-            streamHead.timings.phases.total,
-            options,
-            undefined,
-            finalUrl,
-          ),
-          HTTPError,
-        );
+        const failure = this.streamHttpError(streamHead, options, dispatch);
 
         // Nothing is obliged to read the stream, and an unhandled rejection would take the
         // process down.
@@ -3354,6 +3353,12 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       headers: mergeHeaders(lowercaseHeaders(options.headers), newOptions.headers),
     } as FormedOptions;
 
+    // Every header this function drops asks the same question first - did the hook name it
+    // itself? A header the hook set is the hook saying what the retry should carry, and wins
+    // over anything inherited from the first attempt. It was spelled out six times, which is
+    // six places to write `||` where `&&` was meant and silently keep a stale credential.
+    const hookSet = (name: string): boolean => newOptions.headers !== undefined && hasHeader(newOptions.headers, name);
+
     // A retry is a merge like any other, so a query the hook adds joins the one the request
     // already carried instead of erasing it.
     if (options.searchParams !== undefined && newOptions.searchParams !== undefined) {
@@ -3384,7 +3389,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         newOptions.password !== undefined ||
         // `String`, as `resolveUrl` does: a `URL` keeps its userinfo in `href`.
         (this.parseUserinfo && newOptions.url !== undefined && splitUserinfo(String(newOptions.url)) !== undefined)) &&
-      (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'authorization'))
+      !hookSet('authorization')
     ) {
       delete merged.headers['authorization'];
     }
@@ -3412,7 +3417,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // The first attempt's `content-type` described the body being replaced, and `call()`
       // only sets one when none is present - so a json-then-form retry went out as a form
       // body labelled `application/json`. Dropped unless the hook named one itself.
-      if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-type')) {
+      if (!hookSet('content-type')) {
         delete merged.headers['content-type'];
       }
 
@@ -3424,7 +3429,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // cause was a header left over from the previous attempt. Dropping it lets undici
       // derive the length from the new body, which is what it does for every request that
       // does not name one.
-      if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-length')) {
+      if (!hookSet('content-length')) {
         delete merged.headers['content-length'];
       }
     }
@@ -3449,7 +3454,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
       if (absoluteUrl.test(next) && !sameOrigin(String(options.url), next)) {
         for (const name of crossOriginHeaders) {
-          if (newOptions.headers === undefined || !hasHeader(newOptions.headers, name)) {
+          if (!hookSet(name)) {
             delete merged.headers[name];
           }
         }
@@ -3467,11 +3472,11 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
           merged.json = undefined;
           merged.form = undefined;
 
-          if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-type')) {
+          if (!hookSet('content-type')) {
             delete merged.headers['content-type'];
           }
 
-          if (newOptions.headers === undefined || !hasHeader(newOptions.headers, 'content-length')) {
+          if (!hookSet('content-length')) {
             delete merged.headers['content-length'];
           }
         }

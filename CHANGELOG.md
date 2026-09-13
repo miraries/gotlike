@@ -4,7 +4,7 @@ All notable changes to this project are documented here. This project adheres to
 [semantic versioning](https://semver.org/spec/v2.0.0.html); while the major version is `0`, a
 minor bump is where breaking changes land.
 
-## 0.3.0
+## 0.3.0 - 2026-09-13
 
 `0.2.0` was published in June 2024 and was ~470 lines. This release is effectively a rewrite: the
 client it replaces got most of got's *shape* right and most of its *behaviour* wrong. Read the
