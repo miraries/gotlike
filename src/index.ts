@@ -272,6 +272,10 @@ type AttemptState = DispatchState & {
   onRetry?: (error: Error | undefined, statusCode: number | undefined, retryCount: number) => void;
   /** Starts the request deadline over for a new attempt. See `requestSignal`. */
   restartDeadline?: () => void;
+  /** Stops the attempt deadline while the retry interceptor is waiting to redispatch. */
+  pauseDeadline?: () => void;
+  /** Whether a response will be retried rather than exposed to the caller. */
+  willRetryStatus?: (statusCode: number) => boolean;
 };
 
 /**
@@ -329,6 +333,12 @@ class OutcomeHandler extends BaseDecoratorHandler {
     this.#state.lastHeaders = headers;
     this.#state.lastError = undefined;
 
+    const attempts = this.#state as AttemptState;
+
+    if (attempts.willRetryStatus?.(statusCode)) {
+      attempts.pauseDeadline?.();
+    }
+
     return super.onResponseStart(controller, statusCode, headers, statusMessage);
   }
 
@@ -340,6 +350,12 @@ class OutcomeHandler extends BaseDecoratorHandler {
     // branch on, from a response it was never sent.
     this.#state.lastStatusCode = undefined;
     this.#state.lastHeaders = undefined;
+
+    // There is no response body left to bound after a transport error. If undici retries it,
+    // `countAttempts` starts a fresh deadline; if it does not, the request settles and releases
+    // the timer anyway. Leaving it armed while the retry policy sleeps turns the backoff into
+    // part of `timeout.request`, unlike got's per-attempt timeout.
+    (this.#state as AttemptState).pauseDeadline?.();
 
     return super.onResponseError(controller, error);
   }
@@ -592,6 +608,18 @@ export type QueryValue = string | number | boolean | null | undefined;
 
 /** got's default. undici's is 5, which is a lot more load on an upstream that is already failing. */
 const defaultRetryLimit = 2;
+
+/** undici's defaults, named here too so deadline bookkeeping follows its retry decision. */
+const defaultRetryMethods: readonly Dispatcher.HttpMethod[] = [
+  'GET',
+  'HEAD',
+  'OPTIONS',
+  'PUT',
+  'DELETE',
+  'TRACE',
+  'QUERY',
+];
+const defaultRetryStatusCodes: readonly number[] = [500, 502, 503, 504, 429];
 
 /** Hops followed before undici gives up and hands back the redirect itself. got's default too. */
 const maxRedirections = 10;
@@ -1256,11 +1284,16 @@ function concatHooks<T>(base?: T[], added?: T[]): T[] | undefined {
  * It also sidesteps undici's coarse timer wheel (`lib/util/timers.js`, `RESOLUTION_MS = 1000`),
  * which used to round every sub-second timeout up to roughly a second.
  */
-function requestSignal(options: FormedOptions): {signal?: AbortSignal; release: () => void; restart: () => void} {
+function requestSignal(options: FormedOptions): {
+  signal?: AbortSignal;
+  release: () => void;
+  pause: () => void;
+  restart: () => void;
+} {
   const timeout = options.timeout?.request;
 
   if (timeout === undefined) {
-    return {signal: options.signal, release: noRelease, restart: noRelease};
+    return {signal: options.signal, release: noRelease, pause: noRelease, restart: noRelease};
   }
 
   // Built from an `AbortController` rather than `AbortSignal.timeout`, which cannot be
@@ -1283,6 +1316,7 @@ function requestSignal(options: FormedOptions): {signal?: AbortSignal; release: 
   return {
     signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
     release: () => clearTimeout(timer),
+    pause: () => clearTimeout(timer),
     /*
      * `timeout.request` bounds an *attempt*, as got's does and as undici's own
      * `headersTimeout`/`bodyTimeout` do - so a retry starts the clock again. One signal spans
@@ -1291,7 +1325,8 @@ function requestSignal(options: FormedOptions): {signal?: AbortSignal; release: 
      * `retry: {limit: 4}` against an upstream answering in 150ms ran all five attempts there
      * (1045ms) and gave up after three here (404ms). A request configured to retry was being
      * denied most of its retries, which is the opposite of what either option asks for. The
-     * backoff wait is not counted, because this fires when the new attempt is dispatched.
+     * `OutcomeHandler` pauses the old attempt's timer before undici starts its backoff, and
+     * this starts it again only when the new attempt is actually dispatched.
      */
     restart: () => {
       clearTimeout(timer);
@@ -2189,8 +2224,20 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
     invalid('`form` must be a URLSearchParams or a plain object');
   }
 
-  if (retry !== undefined && (typeof retry !== 'object' || retry === null)) {
-    invalid('`retry` must be an object like `{limit: 2}`');
+  if (retry !== undefined) {
+    if (typeof retry !== 'object' || retry === null) {
+      invalid('`retry` must be an object like `{limit: 2}`');
+    }
+
+    if (
+      retry.limit !== undefined &&
+      (typeof retry.limit !== 'number' ||
+        !Number.isFinite(retry.limit) ||
+        !Number.isInteger(retry.limit) ||
+        retry.limit < 0)
+    ) {
+      invalid('`retry.limit` must be a finite non-negative integer');
+    }
   }
 
   if (hooks !== undefined) {
@@ -2385,14 +2432,20 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * dispatch - the stream paths used to get none, which left `beforeRetry` silently unfired
    * and `retryCount` pinned at 0 on a stream that undici had in fact retried.
    */
-  attemptState(): AttemptState | undefined {
+  attemptState(options: FormedOptions): AttemptState | undefined {
     if (!this.retryOptions) {
       return undefined;
     }
 
     const hooks = this.beforeRetryHooks;
-
-    return {
+    const methods = this.retryOptions.methods ?? defaultRetryMethods;
+    const statusCodes = this.retryOptions.statusCodes ?? defaultRetryStatusCodes;
+    const maxRetries = this.retryOptions.maxRetries ?? defaultRetryLimit;
+    // A Node stream is consumed while it is sent and cannot normally be replayed. The upload
+    // duplex path has the same property even when no body was supplied in the options: its
+    // writable side belongs to the caller, not to undici's retry handler.
+    const replayableBody = !(options.body instanceof Readable) && !(options.isStream && isBodyMethod(options.method));
+    const state: AttemptState = {
       count: 0,
       onRetry:
         hooks &&
@@ -2402,6 +2455,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
           }
         }),
     };
+
+    state.willRetryStatus = (statusCode) =>
+      statusCode >= 200 &&
+      replayableBody &&
+      state.count <= maxRetries &&
+      methods.includes(options.method) &&
+      statusCodes.includes(statusCode);
+
+    return state;
   }
 
   /**
@@ -2662,12 +2724,13 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     const deadline = requestSignal(options);
-    const attempts = this.attemptState();
+    const attempts = this.attemptState(options);
 
     if (attempts) {
       // Only a client that retries has anything to restart, and `attemptState` only allocates
       // for one - so the assignment costs nothing on a client without `retry`.
       attempts.restartDeadline = deadline.restart;
+      attempts.pauseDeadline = deadline.pause;
     }
 
     return {
@@ -3565,13 +3628,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      * the *new* url is not touched: those are credentials for the new origin, and got uses them
      * too.
      *
-     * Only an absolute url can be judged here. A relative one resolves under the client's own
-     * `prefixUrl`, which is the origin the request is already on.
+     * Resolve relative urls before judging them. A retry may replace `prefixUrl`, or an
+     * absolute first request may have bypassed the client's prefix entirely; in both cases a
+     * relative retry can cross an origin even though the path itself contains no authority.
      */
-    if (newOptions.url !== undefined) {
-      const next = String(newOptions.url);
+    const retryPrefixUrl =
+      newOptions.url === undefined
+        ? undefined
+        : (newOptions.prefixUrl ?? options.prefixUrl ?? this.baseOptions.prefixUrl);
 
-      if (absoluteUrl.test(next) && !sameOrigin(String(options.url), next)) {
+    if (newOptions.url !== undefined) {
+      const next = this.resolveUrl({...merged, url: newOptions.url, prefixUrl: retryPrefixUrl});
+
+      if (!sameOrigin(String(options.url), next)) {
         for (const name of crossOriginHeaders) {
           if (!hookSet(name)) {
             delete merged.headers[name];
@@ -3614,7 +3683,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // A url the hook supplied has not been resolved yet, so the prefix has to come back or a
       // relative path is dispatched as-is and fails as an invalid url. An absolute one ignores
       // the prefix anyway, so this is safe either way.
-      merged.prefixUrl = newOptions.prefixUrl ?? options.prefixUrl ?? this.baseOptions.prefixUrl;
+      merged.prefixUrl = retryPrefixUrl;
     }
     (merged as RetryDepth)[retryDepth] = depth;
 

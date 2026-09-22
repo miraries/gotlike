@@ -33,13 +33,67 @@ type Origin = string | RegExp;
  * interceptor falls through to the real network. Real nock matches both; measured against
  * nock 14.
  */
-const pools = new Map<string, {pool: Interceptable; origin: Origin}>();
+const pools = new Map<string, {pool: Interceptable; origin: Origin; active: boolean}>();
 
 function poolKey(origin: Origin): string {
   // The pattern, not the object: `\u0000` can appear in neither half, so no two distinct
   // patterns collide.
   return typeof origin === 'string' ? origin : `re\u0000${origin.source}\u0000${origin.flags}`;
 }
+
+/**
+ * Whether an origin with registered mocks owns this request origin.
+ *
+ * MockAgent normally falls through to the real dispatcher when nothing matches. Real nock
+ * instead owns an origin once it has a scope, so a typo in a path, body or query fails closed
+ * rather than becoming a live request. Hosts without a scope still retain MockAgent's default
+ * pass-through behaviour.
+ */
+function hasMockedOrigin(requestOrigin: string): boolean {
+  for (const {origin, active} of pools.values()) {
+    if (!active) {
+      continue;
+    }
+
+    if (typeof origin === 'string') {
+      if (new URL(origin).origin === requestOrigin) {
+        return true;
+      }
+
+      continue;
+    }
+
+    origin.lastIndex = 0;
+
+    if (origin.test(requestOrigin)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/*
+ * MockAgent's public network matcher receives only `host`, which loses the scheme and cannot
+ * distinguish `http://example.test` from `https://example.test`. Choose its fallback policy
+ * synchronously at dispatch time instead, while the complete origin is still available. The
+ * mock match (or miss) is decided before `dispatch()` returns, so another request cannot
+ * observe the temporary setting between these two calls.
+ */
+let usesDefaultNetConnect = true;
+const mockDispatch = mockAgent.dispatch.bind(mockAgent);
+
+mockAgent.dispatch = (options, handler) => {
+  if (usesDefaultNetConnect) {
+    if (hasMockedOrigin(String(options.origin))) {
+      mockAgent.disableNetConnect();
+    } else {
+      mockAgent.enableNetConnect();
+    }
+  }
+
+  return mockDispatch(options, handler);
+};
 
 /**
  * undici's per-pool dispatch list, if this version still keeps it where we expect.
@@ -718,6 +772,7 @@ class Scope {
   #pool: Interceptable;
   #basePath: string;
   #origin: Origin;
+  #poolKey: string;
 
   /** Set by `persist()`, and inherited by every interceptor registered after it. */
   #persist = false;
@@ -726,12 +781,15 @@ class Scope {
     const key = poolKey(origin);
     let entry = pools.get(key);
 
-    if (!entry) {
-      entry = {pool: mockAgent.get(origin as string), origin};
+    if (entry) {
+      entry.active = true;
+    } else {
+      entry = {pool: mockAgent.get(origin as string), origin, active: true};
       pools.set(key, entry);
     }
 
     this.#pool = entry.pool;
+    this.#poolKey = key;
     this.#basePath = basePath;
     // The origin the pool was *registered* under, which for a regex is the first RegExp object
     // written with this pattern. `isDone()` compares it by identity, as undici does.
@@ -739,6 +797,14 @@ class Scope {
   }
 
   #verb(method: string, path: PathMatcher, body?: BodyMatcher, options?: Options): Interceptor {
+    // A regex pool is retained across `cleanAll()` to keep undici's derived concrete pools
+    // attached to the same dispatch array. Reusing an old Scope must make it active again.
+    const entry = pools.get(this.#poolKey);
+
+    if (entry) {
+      entry.active = true;
+    }
+
     const interceptor = new Interceptor(this, this.#pool, this.#basePath, method, path, body, options);
 
     return this.#persist ? interceptor.persist() : interceptor;
@@ -862,9 +928,11 @@ Object.assign(nock, {
     return this.active;
   },
   disableNetConnect() {
+    usesDefaultNetConnect = false;
     mockAgent.disableNetConnect();
   },
   enableNetConnect(host?: string | RegExp | ((host: string) => boolean)) {
+    usesDefaultNetConnect = false;
     // undici's overloads don't accept `undefined` for the "allow everything" form.
     return host === undefined ? mockAgent.enableNetConnect() : mockAgent.enableNetConnect(host as string);
   },
@@ -873,7 +941,8 @@ Object.assign(nock, {
   },
   /** Drop every interceptor registered so far, on every origin. */
   cleanAll() {
-    for (const [key, {pool, origin}] of pools) {
+    for (const [key, entry] of pools) {
+      const {pool, origin} = entry;
       const dispatches = dispatchesOf(pool);
 
       if (dispatches) {
@@ -890,6 +959,8 @@ Object.assign(nock, {
       // derived pools go on reading the array this entry owns.
       if (typeof origin === 'string') {
         pools.delete(key);
+      } else {
+        entry.active = false;
       }
     }
   },

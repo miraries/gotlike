@@ -2797,6 +2797,24 @@ test('timeout.request bounds each attempt rather than the whole retry sequence',
 });
 
 /*
+ * Backoff belongs between attempts, not inside either attempt's request deadline. With the
+ * timer left armed after the 503, this failed at 100ms while undici was still waiting out the
+ * configured 200ms delay and the second attempt never reached the server.
+ */
+test('timeout.request does not expire during retry backoff', async () => {
+  const extClient = client.extend({
+    retry: {limit: 1, backoffLimit: 200, statusCodes: [503]},
+  });
+  const response = await extClient.get('http://localhost:3000/flaky-target', {
+    timeout: {request: 100},
+    headers: {'test-id': randomUUID()},
+  });
+
+  assert.strictEqual(response.body, 'flaky ok');
+  assert.strictEqual(response.retryCount, 1);
+});
+
+/*
  * The other half of the same change: restarting the clock per attempt must not stop it
  * bounding one. A single attempt that outruns the deadline still fails.
  */
@@ -3292,6 +3310,11 @@ test('nock mocks request once', async () => {
 
   assert.strictEqual(response.statusCode, 201);
   assert.strictEqual(response.body.test, 'newvalue');
+
+  // An origin remains owned by nock after its one interceptor is consumed. Clear the scope
+  // before deliberately returning to the live server; otherwise a second request must fail
+  // closed rather than silently escaping the mock.
+  nock.cleanAll();
 
   const response2 = await client.get<{test: string}>('http://localhost:3000/json', {
     responseType: 'json',
@@ -4641,6 +4664,32 @@ test('a retry to a relative url keeps the credentials', async () => {
   assert.strictEqual(response.body.headers['authorization'], 'Bearer secret');
 });
 
+// An absolute first request can bypass the client's prefix. A later relative retry resolves
+// under that prefix, so it crosses an origin even though the retry's own url has no authority.
+test('a relative retry using an inherited prefix drops cross-origin credentials and body', async () => {
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) =>
+          response.statusCode === 401 ? retryWithMergedOptions({url: 'echo/moved'}) : response,
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://127.0.0.1:3000/status?code=401', {
+    body: 'PAYLOAD',
+    headers: {authorization: 'Bearer secret', cookie: 'sid=1'},
+  });
+
+  assert.strictEqual(response.body.url, '/echo/moved');
+  assert.strictEqual(response.body.headers['authorization'], undefined);
+  assert.strictEqual(response.body.headers['cookie'], undefined);
+  assert.strictEqual(response.body.body, '');
+});
+
 /*
  * `FormData` is got 15's documented multipart path. undici's `request()` does not accept one -
  * it does not reject it either, it simply never sends the request - so this used to hang until
@@ -4836,6 +4885,7 @@ test('an afterResponse retry can supply a new prefixUrl', async () => {
   const extClient = client.extend({
     prefixUrl: 'http://127.0.0.1:3000',
     responseType: 'json',
+    throwHttpErrors: false,
     hooks: {
       afterResponse: [
         (response, retryWithMergedOptions) => {
@@ -4851,9 +4901,14 @@ test('an afterResponse retry can supply a new prefixUrl', async () => {
     },
   });
 
-  const response = await extClient.get<Echo>('json');
+  const response = await extClient.post<Echo>('status?code=401', {
+    body: 'PAYLOAD',
+    headers: {authorization: 'Bearer secret'},
+  });
 
   assert.strictEqual(response.body.url, '/echo/new-prefix');
+  assert.strictEqual(response.body.headers['authorization'], undefined);
+  assert.strictEqual(response.body.body, '');
 });
 
 /*
@@ -5475,6 +5530,16 @@ test('a ValidationError carries a code', () => {
 
 test('retry must be an object', () => {
   assert.throws(() => client.extend({retry: 5 as never}), /`retry` must be an object/);
+});
+
+test('retry.limit must be a finite non-negative integer', () => {
+  for (const limit of [-1, 1.5, Number.POSITIVE_INFINITY, Number.NaN]) {
+    assert.throws(
+      () => client.extend({retry: {limit}}),
+      /`retry.limit` must be a finite non-negative integer/,
+      String(limit),
+    );
+  }
 });
 
 /*
