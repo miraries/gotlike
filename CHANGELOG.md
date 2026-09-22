@@ -4,6 +4,222 @@ All notable changes to this project are documented here. This project adheres to
 [semantic versioning](https://semver.org/spec/v2.0.0.html); while the major version is `0`, a
 minor bump is where breaking changes land.
 
+## Unreleased
+
+### Security
+
+- **A url is sent to the host its own parser names.** For the special schemes this client sends,
+  WHATWG URL treats `\` as a path separator - so `http://allowed.host\@attacker.host/p` is host
+  `allowed.host` with the path `/@attacker.host/p` to `new URL`, to undici and to got. The scan
+  that pulls `user:pass@` out of a url stopped only at `/`, `?` and `#`, so it ran the authority
+  past the backslash, found the `@` inside it, and **rewrote the url to `http://attacker.host/p`** -
+  sending the request, and an `Authorization` header minted out of the fake userinfo, to a host no
+  parser had ever named. An application that allowlists `new URL(input).hostname` and then passes
+  the string to the client - which is how an SSRF filter is written - saw the allowed host and
+  reached the other one. Only reachable with `parseUserinfo` on, which is the default. ASCII tab,
+  LF and CR are now stripped out of the extracted credentials too, as the URL parser strips them
+  out of a url before parsing it. Pinned against `new URL` in the spec and against got 16 in the
+  parity suite.
+
+### Fixed
+
+- **A `timeout.request` no longer grows the heap for every request made with a shared `signal`.**
+  A caller's own `signal` was combined with the request deadline's through
+  `AbortSignal.any([options.signal, controller.signal])`, which registers the composite in the
+  **source** signal's internal dependant-signal set - with no API to take it back out. So every
+  request made with both a `signal` and a `timeout.request` left one unreclaimable entry behind
+  on the caller's signal, for as long as that signal lived: measured at **485 bytes a request**,
+  uncollectable after a forced GC, and 1971 entries still attached after 2000 requests. The
+  pattern it punishes is the ordinary one - a process-lifetime "abort everything on shutdown"
+  controller passed to every call - where it grows without bound. The deadline now forwards the
+  caller's signal through an `abort` listener that `release` removes when the request settles,
+  which is what undici does with a signal it is handed. Behaviour is unchanged: the abort reason
+  travels as it did, and an already-aborted signal still fails the request immediately.
+
+- **Destroying a stream yourself is no longer reported as a failed request.** Stream failures are
+  normalised by wrapping `_destroy`, which Node calls for *every* destroy - so a consumer tearing
+  the stream down ran the client's `beforeError` hooks with a `RequestError` describing something
+  that never happened, and rewrote `stream.errored` to match. Measured:
+  `pipeline(stream, destinationThatThrows)` reported `ERR_REQUEST_ERROR: disk full`, and a plain
+  `stream.destroy()` reported `ERR_ABORTED`. For anything proxying a download that is a spurious
+  error on every client disconnect, and the hooks were awaited inside the destroy callback, so a
+  slow one delayed the teardown of a stream the caller had already abandoned. Only the request's
+  own failures are normalised now - a destroy with no error, and any error reaching a stream that
+  has already delivered its head and did not come from undici or the signal, is passed through
+  untouched. Truncated bodies, socket resets, timeouts, aborts and pre-response failures are
+  unchanged.
+
+- **A hook or a retry status pushed through `response.request.options` no longer reconfigures the
+  client.** `usedHooks` handed back the very array on `baseOptions`, so
+  `client.baseOptions.hooks.beforeRequest` *was* `client.beforeRequestHooks` - and since `hooks`
+  and `retry` are aliased onto the formed options by design, the live chain was reachable from
+  `response.request.options.hooks` and `error.options.hooks`. A `push` through either added a hook
+  to the client permanently, and one made during the hook loop ran in the request that made it.
+  `retry.statusCodes`/`retry.methods` had the same hole by the same route, shared with every
+  client `extend()`ed from the same parent, so a push there widened what an already-built client
+  retried. Both are snapshotted at construction now, as `retry.errorCodes` already was.
+
+- **A timed-out request is retried, as got retries one.** With `timeout.request` set, a client
+  configured `{retry: {limit: n}, timeout: {request: ms}}` - the ordinary shape for a flaky
+  upstream - made exactly **one attempt** for a hung or unresponsive server, whatever
+  `retry.errorCodes` said. Two things caused it, and both are fixed. undici's default
+  `errorCodes` do not cover a timeout at all (got's do), so the code is now in the default list,
+  and got's own spelling `ETIMEDOUT` is translated to the two codes undici actually raises rather
+  than silently matching nothing. And aborting through a signal is the one failure undici will
+  never retry - its `RetryHandler` propagates outright when the connection was aborted - while
+  the deadline signal, armed before the dispatch, always beat undici's own `headersTimeout`,
+  armed once the request has been sent; the deadline now defers its abort once, by 700ms, for an
+  attempt undici could still retry. Measured against got 16: an upstream that never answers ran
+  four attempts there and one here. Socket resets and retryable statuses were retried throughout,
+  which is why this went unnoticed. Nothing about a request that *succeeds* changes, a trickling
+  body keeps its exact deadline (undici does not retry after a response head, so there is nothing
+  to wait for), and a `timeout.request` under 1s keeps its exact deadline and is still not
+  retried, because undici cannot report a timeout of its own any sooner - which is now in the
+  README rather than left to be discovered.
+
+### Documented
+
+- **An array `form` or `searchParams` value is recorded as a divergence from got.** `form:
+  {a: [1, 2]}` goes out as `a=1&a=2` here and as `a=1%2C2` in got - the same
+  `new URLSearchParams(form)` artefact as the `null`/`undefined` rule already recorded - which is
+  a silent wire difference for an identical call, so a `form` being ported that passes an array
+  is worth checking. `searchParams: {a: [1, 2]}` diverges the other way: got rejects an array
+  value outright, so this is more permissive rather than different on the wire. Both are now in
+  the README's table and pinned as `divergence` scenarios in the parity suite, and the property
+  generators reach `number` and `boolean` values (they built strings only), which is the shape
+  blind spot that hid this.
+
+- **The options a response reports being sent with no longer alias the client's own.**
+  `response.request.options` and `error.options` hand every caller the options the request was
+  formed with, and on a client with no hooks and no handlers those still shared the client's
+  `timeout` and `searchParams` objects - so `response.request.options.timeout.request = 1`, or any
+  logging or retry wrapper that normalises what it is shown, moved that client's deadline for
+  every later request it made. The copies were gated on the client having something that could
+  write (a handler, a `beforeRequest`/`afterResponse`/`beforeError` hook); they are unconditional
+  now, guarded only by the option being set at all. The invariant test drives every option through
+  both routes - a hook's write and a write through the response - because a row driven only
+  through a hook passes vacuously on the shape that was broken.
+- **An agent-level option named beside an `agent` is refused rather than ignored.**
+  `{agent: new ProxyAgent(...), connections: 128}` accepted `connections` and did nothing with it:
+  the dispatcher is used exactly as it stands, and there is no way to ask a `ProxyAgent` for a copy
+  of itself with one option changed. The mirror image - an agent option on a client that was
+  already handed a dispatcher - was already a `ValidationError`, so one rule had two halves and the
+  quiet half is the one written by accident. Now a `ValidationError` on every construction path
+  (`new Gotlike`, `createClient`, `extend`). Inheriting a dispatcher, retuning an auto-built one,
+  and replacing one outright are unaffected.
+- **Empty credentials send no `authorization` header.** `{username: ''}`, `{username: '',
+  password: ''}` and `http://@host/` each sent `Authorization: Basic Og==` - an anonymous
+  credential an upstream is free to reject or log - where got sends nothing at all, because node's
+  `urlToHttpOptions` derives `auth` only from a non-empty username or password. A
+  `{username: config.user ?? ''}` that meant "no credentials" now means it. The userinfo still
+  comes off the url either way, and a password with no username still authenticates.
+- **Clients no longer share one `headers` object.** Every client built without headers of its own
+  took `defaultOptions.headers` by reference - one module-level `{}` for the whole process - so a
+  write through `client.baseOptions.headers` would have shown up on every client created
+  afterwards. A caller's own object is copied too, as `context`/`timeout`/`retry` already were,
+  since `extend()` reads it back.
+- **An empty response body is no longer a parse failure under `responseType: 'json'`.** Parsing was
+  short-circuited only for the statuses that *cannot* carry a body - 204, 205, 304 and HEAD - so
+  every other zero-length body fell into `JSON.parse('')` and came back out as a `ParseError`. All
+  of these are ordinary responses, and a json-typed client rejected all of them: a `201 Created`
+  with nothing in it, a `200` with `content-length: 0`, a `3xx` read with `followRedirect` off.
+  Measured against got 16, which resolves each with `body: ''` - its `parseBody` tests
+  `rawBody.length === 0` before it ever reaches the JSON codec. The bodyless statuses keep their
+  `undefined`, which remains a recorded divergence. A body that is non-empty and unparseable is
+  still a `ParseError`, and on an error status the status still wins.
+- **`extend()` no longer discards a dispatcher you passed it.** An extension naming any agent-level
+  option (`connections`, `keepAliveTimeout`, `http2`, `pipelining`, `dnsLookup`, `connectTimeout`)
+  replaced the parent's `agent` with a freshly built `undici.Agent` - so
+  `extend({agent: new EnvHttpProxyAgent()}).extend({connections: 128})` sent every request
+  **direct, bypassing the proxy**, with no error and nothing on the wire to say so. Both halves of
+  that composition are documented in the README. A caller-supplied dispatcher cannot be rebuilt
+  from those options (there is no way to ask a `ProxyAgent` or an `H2CClient` for a copy of itself
+  with one option changed), so the combination is now a `ValidationError` telling you to pass a new
+  `agent` instead. Inheriting, retuning an auto-built dispatcher, and replacing one outright all
+  behave as before.
+- **`searchParams: {a: null}` is sent as `?a=` rather than dropped.** `null` and `undefined` were
+  treated as one value and both discarded, which lost a parameter off the wire: got sends
+  `?a=&b=1` for `{a: null, b: 1}` where this sent `?b=1`. Silent, and a real semantic change for
+  an upstream that tells "absent" from "present and empty" - a filter being cleared, a tri-state
+  flag, anything signing over the canonical query. got's rule is now implemented: `null` appends an
+  empty value, `undefined` is skipped, per item inside an array too. `form` gets the same rule,
+  which is a deliberate divergence from got there (it serialises a form with
+  `new URLSearchParams(form)`, sending the literal text `a=null` and `b=undefined`) and is recorded
+  in the README's divergence table and pinned in the parity suite.
+- **An empty `url` under a `prefixUrl` keeps the prefix's trailing slash.** got normalises
+  `prefixUrl` to end in `/` and resolves `''` against it, so `client.get('')` requests `/api/`;
+  this handed back the prefix verbatim and requested `/api`, which a server is free to answer with
+  a 301 - not followed by default here, so it surfaces as the redirect itself - or a 404. Only
+  differed for a `prefixUrl` written without a trailing slash, which is the form the README's own
+  examples use.
+- **A hook or handler writing through `options.searchParams`, `options.timeout` or
+  `options.handlers` no longer reaches the client, or the caller's own options object.**
+  `formOptions` allocates `headers` and `context` per request for exactly this reason; these three
+  were handed over by reference whenever a single side carried them, so the write landed on the
+  object the client keeps. Measured: a `beforeRequest` hook adding one query parameter put it on
+  **every later request the client made**, and `options.timeout.request = 5` for one request moved
+  the client's deadline permanently, so everything it sent afterwards timed out. When the option
+  came from the call rather than the client, the same write mutated the caller's own literal, which
+  accumulates across calls that reuse it. Guarded by one boolean, so a client with neither handlers
+  nor hooks - which has nothing that could write - allocates nothing extra.
+- **A stream emits `response` before any of the body reaches the caller**, which is got's ordering
+  and what the got-shaped proxy depends on: `stream.on('response', copyHead); stream.pipe(res)`.
+  The emit was deferred to a `setImmediate` so that a caller could attach a listener after
+  `await stream(...)` at all, but attaching a `data` listener - which `pipe()`, `on('data')` and
+  `for await` all do, in the same synchronous block - starts the body flowing on a
+  `process.nextTick`, which runs first. Measured against got 16 on the same server: `data` then
+  `response` here against `response` then `data` there, so a status and headers copied onto an
+  outgoing response landed *after* body bytes had already been written to it. The head is now
+  announced from a `newListener` hook, which fires before the listener is registered and before the
+  flow starts. Only the bodyless path was affected; the upload path already emitted in order.
+- **An `afterResponse` retry ignores an option the hook names as `undefined`**, as every other
+  route into a request already did. The retry merged with a plain spread, and a key that is
+  *present* with the value `undefined` wins a spread - which is the shape a refresh hook writes
+  constantly, forwarding `{headers, method: req.method, throwHttpErrors: cfg.throwHttpErrors}` from
+  somewhere any of those can be absent. `retryWithMergedOptions({method: undefined})` replayed a
+  POST as a **GET**, `{throwHttpErrors: undefined}` resolved the 401 that triggered the retry as a
+  success, `{responseType: undefined}` handed back a `Buffer` instead of parsed json, and
+  `{url: undefined}` failed the dispatch outright. got skips `undefined` when it merges, and so did
+  `formOptions` here; the retry path is the one route that bypasses it and had not been given the
+  same rule.
+- **A stream failure carries `error.response` when a response had arrived.** Both stream paths
+  reported `error.response` as `undefined` for a failure that happened *after* the head - a
+  truncated download, a socket reset mid-body - where the identical failure on the promise API
+  carried the status, headers and `request.options`. The documented contract is that `response` is
+  absent only when the request failed before a response arrived, and the promise API always
+  honoured it.
+- **`retryWithMergedOptions({followRedirect: true})` is a `ValidationError`**, as the same option
+  on an ordinary call has always been. The retry path carried its own copy of the per-request
+  checks and this one was missing from it, so a hook asking for redirects was silently ignored.
+  Both routes now share one `validateRequest`.
+- **A throwing `beforeRequest` hook leaves the options uninstrumented.** The write-tracking `Proxy`
+  on `options.headers` and the accessor on `options.body` were only taken back off when the hook
+  loop *finished*, so a hook that threw left both in place on the options handed to the
+  `beforeError` hooks and out on `error.options`.
+- **`extend()` shares the parent's dispatcher** unless the extension names `agent` or an
+  agent-level option. A client built with any of `connections`, `keepAliveTimeout`,
+  `keepAliveMaxTimeout`, `connectTimeout`, `pipelining`, `http2` or `dnsLookup` handed every client
+  extended from it a brand new `undici.Agent` - for a change of headers, of `prefixUrl`, of
+  anything. Parent and child shared no sockets, each held a pool of its own up to `connections`,
+  and the Agents left behind were never closed, so deriving a client per upstream multiplied the
+  process's connections silently. An explicitly passed `agent` was inherited all along, so the two
+  ways of configuring the transport disagreed with each other.
+- **`delete options.body` in a `beforeRequest` hook removes the body.** The write-tracking accessor
+  went with the deleted property, so nothing recorded the hook's intent and the body it had just
+  removed was put back and sent. Only on a client that *has* `beforeRequest` hooks - one without
+  them never installs the accessor - so the identical hook sent a body on one client and not on
+  another. `options.body = undefined` was always correct and is unchanged.
+- **A `searchParams` or `form` value that cannot be serialised is a `ValidationError`**, not a
+  `RequestError`. Option *values* are checked when the query is built, inside the pre-request work,
+  and the wrapper there flattened the class - so `searchParams: {a: {}}` reported itself as a
+  transport failure and ran the `beforeError` hooks, where the identical mistake one option along
+  threw. Such a value is now also rejected at create/extend, rather than constructing a client
+  whose every request fails.
+- **`context`, `timeout` and `retry` passed to a client are copied**, like `hooks`, `handlers` and
+  `searchParams` already were. Mutating the object you passed to `createClient()` afterwards
+  reached every later request the client made - for `timeout` that meant a deadline could be moved
+  out from under a client that was already built.
+
 ## 0.3.0 - 2026-09-13
 
 `0.2.0` was published in June 2024 and was ~470 lines. This release is effectively a rewrite: the

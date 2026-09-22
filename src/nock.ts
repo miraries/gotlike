@@ -407,7 +407,10 @@ function isJsonReplyBody(body: unknown): boolean {
 
 function hasContentType(headers: ReplyHeaders): boolean {
   for (const key in headers) {
-    if (key.toLowerCase() === 'content-type') {
+    // Own properties only, as everywhere else something a caller handed us is walked: an
+    // enumerable `Object.prototype` property named like a content-type would otherwise read as
+    // one the reply already sets, and suppress the `application/json` an object body needs.
+    if (Object.hasOwn(headers, key) && key.toLowerCase() === 'content-type') {
       return true;
     }
   }

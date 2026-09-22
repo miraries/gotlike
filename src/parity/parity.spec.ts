@@ -62,6 +62,58 @@ parityTest('credentials in the url become Basic auth', {
   },
 });
 
+/*
+ * Empty is not the same as absent. got keeps credentials on a `URL`, and node's
+ * `urlToHttpOptions` derives `auth` only when `url.username || url.password` - so every row here
+ * goes out anonymous there. Testing `!== undefined` instead sent `Authorization: Basic Og==` for
+ * all of them, an anonymous credential an upstream is free to reject or log, off the back of a
+ * `{username: config.user ?? ''}` that meant "no credentials at all".
+ */
+parityTest('empty credentials send no authorization header', {
+  claim: 'CLAUDE.md: explicit `username`/`password` options win, and derive a header the way got derives one.',
+  run: async (client, base) => {
+    const sent: (string | undefined)[] = [];
+
+    for (const options of [{username: ''}, {username: '', password: ''}, {password: ''}]) {
+      const response = await client.get(`${base}/echo`, {...options, responseType: 'json'});
+
+      sent.push((response.body as {headers: Record<string, string>}).headers['authorization']);
+    }
+
+    // A password on its own is still a credential, so the rule must not swallow that too.
+    const withPassword = await client.get(`${base}/echo`, {password: 'secret', responseType: 'json'});
+
+    sent.push((withPassword.body as {headers: Record<string, string>}).headers['authorization']);
+
+    return sent;
+  },
+});
+
+/*
+ * `\` is a path separator for the special schemes, so `http://host\@other/p` is host `host` with
+ * the path `/@other/p` - to `new URL`, to got and to undici alike. gotlike's own authority scan
+ * stopped only at `/?#`, read `host\` as userinfo, and rewrote the url to `http://other/p`: the
+ * request, and an `Authorization` minted out of the fake userinfo, went to a host no parser had
+ * ever named. An application that allowlists `new URL(input).hostname` and passes the string on -
+ * which is how an SSRF filter is written - saw the allowed host and reached the other one.
+ *
+ * What carries the weight here is the wire log the harness compares on every scenario: it says
+ * which server was addressed and with what path, which is the whole question. `response.url` is
+ * only re-parsed for the host, because gotlike leaves it the string it was given where got hands
+ * back a normalised `URL` - a divergence of its own, already recorded in the README.
+ */
+parityTest('a backslash in a url is a path separator, not the end of an authority', {
+  claim: 'CLAUDE.md: the authority is located by index, and has to stop where WHATWG URL stops.',
+  run: async (client, base) => {
+    const response = await client.get(`${base}\\@evil.test/echo`, {responseType: 'text', throwHttpErrors: false});
+
+    return {
+      statusCode: response.statusCode,
+      host: new URL(String(response.url)).host.replace(new URL(base).host, '<base>'),
+    };
+  },
+});
+
 /* -------------------------------------------------------------------------- error codes */
 
 parityTest('a refused connection reports ECONNREFUSED with the underlying message', {
@@ -338,6 +390,129 @@ parityTest('a form body is urlencoded and labelled', {
   },
 });
 
+/*
+ * `null` and `undefined` are not the same value here, and treating them as one lost a parameter
+ * off the wire: `{a: null}` went out as no `a` at all where got sends `a=`. Silent, and a
+ * genuine semantic change for an upstream that tells "absent" from "present and empty" - a
+ * filter being cleared, a tri-state flag, anything signing over the canonical query.
+ *
+ * Pinned against got rather than described, because the prose had it wrong in exactly the way
+ * prose does: CLAUDE.md said "null or undefined are dropped - got does the same", which is true
+ * of `undefined` and false of `null`, and nothing ran to contradict it.
+ */
+parityTest('a null searchParams value is sent as an empty one and undefined is dropped', {
+  claim: 'README: a `null` entry is sent with an empty value and an `undefined` one is dropped, as got does.',
+  run: async (client, base) => {
+    const response = await client.get(`${base}/echo`, {
+      responseType: 'json',
+      searchParams: {keep: 'yes', blank: null, drop: undefined, zero: 0, empty: ''},
+    });
+
+    return (response.body as {path: string}).path;
+  },
+});
+
+/*
+ * `form` shares the serialiser, so it gets the same rule - and here that is a deliberate
+ * divergence rather than parity. got builds the body with `new URLSearchParams(form)`, which
+ * stringifies both into the literal text `blank=null` and `drop=undefined`. That is a
+ * serialisation artefact rather than an intent: got's own `searchParams` does neither of those
+ * things with the same two values, and no server wants the four characters `null` in a form
+ * field. Keeping the key with an empty value preserves what the old behaviour actually lost,
+ * which was the key.
+ *
+ * Recorded rather than skipped, so a got release that tidies this up fails the suite too.
+ */
+parityTest('a null form value', {
+  claim: 'CLAUDE.md: `form` is serialised like `searchParams`.',
+  run: async (client, base) => {
+    const response = await client.post(`${base}/echo`, {
+      responseType: 'json',
+      form: {keep: 'yes', blank: null, drop: undefined},
+    });
+
+    return (response.body as {body: string}).body;
+  },
+  divergence: {
+    reason:
+      'got stringifies both into the body (`blank=null&drop=undefined`), because it serialises `form` ' +
+      'with `new URLSearchParams(form)` - which is not what got itself does with the same values in ' +
+      '`searchParams`. gotlike applies one rule to both: `null` is an empty value, `undefined` is absent. ' +
+      'The key survives either way, which is what the old drop-everything behaviour lost.',
+    got: 'keep=yes&blank=null&drop=undefined',
+    gotlike: 'keep=yes&blank=',
+  },
+});
+
+/*
+ * The other shape of value the shared serialiser takes, and the other place the two disagree.
+ *
+ * An array repeats the key here (`a=1&a=2`), which is how a query or a form carries a repeated
+ * field and what `URLSearchParams.append` is for. got's `searchParams` refuses an array outright
+ * - its `searchParams` is typed `Record<string, string | number | boolean | null | undefined>`
+ * and the value is validated - while its `form` accepts one and lets
+ * `new URLSearchParams(form)` stringify it to the single value `1,2`. So got is stricter than
+ * this on one option and looser on the other, for the same input.
+ *
+ * Both halves are pinned rather than explored by `property.spec.ts`, whose generators build one
+ * value per key on purpose: got *rejects* the array form of `searchParams`, so a generated case
+ * carrying one could only ever be a divergence, and a suite that generates divergences stops
+ * being able to find them.
+ */
+parityTest('an array searchParams value', {
+  claim: 'README: an array value repeats the key (`{a: [1, 2]}` becomes `?a=1&a=2`).',
+  run: async (client, base) =>
+    capture(async () => {
+      const response = await client.get(`${base}/echo`, {
+        responseType: 'json',
+        searchParams: {tags: ['news', 'sport'], page: 2},
+      });
+
+      return (response.body as {path: string}).path;
+    }, base),
+  divergence: {
+    reason:
+      'got rejects an array `searchParams` value outright - its own type allows a single string, ' +
+      'number, boolean or null per key, and the value is validated. gotlike repeats the key, which ' +
+      'is the only way to express a repeated query parameter and is what `URLSearchParams` is for. ' +
+      'More permissive than got rather than different on the wire, so code moving *to* gotlike is ' +
+      'unaffected; code moving back is not.',
+    got: {
+      outcome: 'rejected',
+      name: 'RequestError',
+      code: 'ERR_GOT_REQUEST_ERROR',
+      message:
+        "Option 'searchParams.tags': Expected values which are `string`, `number`, `boolean`, `null`, " +
+        'or `undefined`. Received values of type `Array`.',
+      responseStatus: undefined,
+      responseBody: undefined,
+    },
+    gotlike: {outcome: 'resolved', value: '/echo?tags=news&tags=sport&page=2'},
+  },
+});
+
+parityTest('an array form value', {
+  claim: 'CLAUDE.md: `form` is serialised like `searchParams`, so an array value repeats the key.',
+  run: async (client, base) => {
+    const response = await client.post(`${base}/echo`, {
+      responseType: 'json',
+      form: {tags: ['news', 'sport'], page: 2},
+    });
+
+    return (response.body as {body: string}).body;
+  },
+  divergence: {
+    reason:
+      'got serialises `form` with `new URLSearchParams(form)`, which stringifies the array into the ' +
+      'single value `news,sport` - the same artefact as the null/undefined row above, and not what ' +
+      'got does with an array in `searchParams` (it refuses one). gotlike repeats the key, which is ' +
+      'what a server decoding a multi-valued form field expects. A silent wire difference for an ' +
+      'identical call, so it is recorded here and in the README rather than left to be discovered.',
+    got: 'tags=news%2Csport&page=2',
+    gotlike: 'tags=news&tags=sport&page=2',
+  },
+});
+
 /* --------------------------------------------------------------------------------- retry */
 
 parityTest('a retried status is retried the configured number of times', {
@@ -374,6 +549,36 @@ parityTest('a 204 read as json resolves rather than failing to parse', {
   },
 });
 
+/*
+ * The other half of that, and the half that was a bug rather than a divergence: a status that
+ * *can* carry a body and did not. `hasNoBody` covers 204/205/304 and HEAD, so every other empty
+ * body fell into `JSON.parse('')` and came back out as a `ParseError` - a `201 Created` with
+ * nothing in it, a `200` with `content-length: 0`, a `3xx` read with `followRedirect` off. got
+ * resolves all of them with `""`, because its `parseBody` tests `rawBody.length === 0` before it
+ * reaches the JSON codec.
+ *
+ * A table rather than one status, because what was wrong was a *range*: the bodyless statuses
+ * were handled and every other one was not, so a scenario naming a single code could pass while
+ * the neighbouring ones failed.
+ */
+parityTest('an empty body on a status that can carry one resolves rather than failing to parse', {
+  claim: 'README: a parse failure is a `ParseError` - an empty body is not a parse failure.',
+  run: async (client, base) => {
+    const scoped = client.extend({responseType: 'json', throwHttpErrors: false, followRedirect: false});
+    const outcomes: Record<string, unknown> = {};
+
+    for (const code of [200, 201, 202, 302, 404, 500]) {
+      outcomes[code] = await capture(async () => {
+        const response = await scoped.get(`${base}/status?code=${code}`);
+
+        return {statusCode: response.statusCode, body: response.body, type: typeof response.body};
+      }, base);
+    }
+
+    return outcomes;
+  },
+});
+
 parityTest('a HEAD request has no body to parse', {
   claim: 'CLAUDE.md: HEAD is bodyless - the body is undefined for json, empty for text.',
   run: async (client, base) => {
@@ -399,6 +604,35 @@ parityTest('prefixUrl joins without doubling the slash', {
     const response = await scoped.get('echo');
 
     return (response.body as {path: string}).path;
+  },
+});
+
+/*
+ * An empty `url` under a `prefixUrl` - `client.get('')`, the collection root. got normalises the
+ * prefix to end in `/` and resolves `''` against it, so it always requests the directory form.
+ * Handing the prefix back verbatim put a different path on the wire (`/echo` against got's
+ * `/echo/`), which a server is free to answer with a 301 - not followed by default here, so it
+ * surfaces as the redirect itself - or a 404.
+ *
+ * Both spellings of the prefix, because the difference only ever showed for the one *without* a
+ * trailing slash: with one, the two agreed, so a scenario written that way would have passed
+ * throughout.
+ */
+parityTest('an empty url under a prefixUrl resolves to the prefix with its slash', {
+  claim: 'CLAUDE.md: `resolveUrl` joins `prefixUrl` and `url`; an empty `url` is the prefix itself.',
+  run: async (client, base) => {
+    const paths: Record<string, unknown> = {};
+
+    for (const [label, prefixUrl] of [
+      ['no trailing slash', `${base}/echo`],
+      ['trailing slash', `${base}/echo/`],
+    ] as const) {
+      const scoped = client.extend({prefixUrl, responseType: 'json'});
+
+      paths[label] = (((await scoped.get('')) as {body: unknown}).body as {path: string}).path;
+    }
+
+    return paths;
   },
 });
 

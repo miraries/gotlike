@@ -40,11 +40,65 @@ function path(rng: Rng): string {
   return Array.from({length: 1 + rng.int(3)}, () => segment(rng)).join('/');
 }
 
-function query(rng: Rng, size: number): Record<string, string> {
-  const entries: Record<string, string> = {};
+/**
+ * A single query value, in every *scalar* shape the option accepts.
+ *
+ * A string was the only one reachable for a long time, and a value's shape is the blind spot
+ * that has caught this suite out twice already (see `nullableQuery`). `number` and `boolean` are
+ * declared on `QueryValue` and are serialised by `queryValue`'s `String(value)` rather than by
+ * anything string-specific, so they are exactly the kind of thing that can diverge quietly.
+ *
+ * An **array** is deliberately not here, and is pinned as its own scenario in `parity.spec.ts`
+ * instead: got rejects an array `searchParams` value outright and stringifies an array `form`
+ * value to `a=1%2C2`, so a generated case carrying one could only ever be a divergence - and a
+ * generator that produces divergences stops being able to find them.
+ */
+function scalar(rng: Rng): string | number | boolean {
+  const roll = rng.int(6);
+
+  if (roll === 0) {
+    return rng.int(1000);
+  }
+
+  if (roll === 1) {
+    return rng.bool();
+  }
+
+  return rng.string(queryValueChars, rng.int(7));
+}
+
+function query(rng: Rng, size: number): Record<string, string | number | boolean> {
+  const entries: Record<string, string | number | boolean> = {};
 
   for (let i = 0; i < size; i++) {
-    entries[rng.string(queryKeyChars, 1 + rng.int(5))] = rng.string(queryValueChars, rng.int(7));
+    entries[rng.string(queryKeyChars, 1 + rng.int(5))] = scalar(rng);
+  }
+
+  return entries;
+}
+
+/**
+ * The same, but values may also be `null` or `undefined`.
+ *
+ * Those two are not one value, and treating them as one dropped a parameter off the wire:
+ * `{a: null}` went out as no `a` at all where got sends `a=`. The generator above could not
+ * reach it - it only ever built a `Record<string, string>` - which is the blind spot CLAUDE.md
+ * already describes for the *shape* of `searchParams`, arriving here as the shape of a value.
+ * When a bug turns out to be "nobody passed it that way", widen the generator.
+ *
+ * `searchParams` only. `form` shares the serialiser but diverges from got on exactly these two
+ * values by design, and that is pinned as its own scenario rather than explored here.
+ */
+function nullableQuery(rng: Rng, size: number): Record<string, string | number | boolean | null | undefined> {
+  const entries: Record<string, string | number | boolean | null | undefined> = {};
+
+  for (let i = 0; i < size; i++) {
+    const key = rng.string(queryKeyChars, 1 + rng.int(5));
+    const roll = rng.int(5);
+
+    // Weighted towards ordinary values, so the nullish ones are the exception they are in real
+    // call sites rather than most of the sample.
+    entries[key] = roll === 0 ? null : roll === 1 ? undefined : scalar(rng);
   }
 
   return entries;
@@ -88,9 +142,11 @@ propertyTest('a client searchParams and a per-call one merge the way got merges 
   claim: 'CLAUDE.md: measured against got 16, including the ordering - a replaced key moves to the end.',
   cases: 60,
   generate: (rng) => {
-    const base = query(rng, 1 + rng.int(3));
+    // Nullable on both sides: a `null` has to survive the merge as an empty value and an
+    // `undefined` has to drop the base's key rather than replace it with the text "undefined".
+    const base = nullableQuery(rng, 1 + rng.int(3));
     const keys = Object.keys(base);
-    const override = query(rng, rng.int(3));
+    const override = nullableQuery(rng, rng.int(3));
 
     // Roughly half the cases reuse one of the client's own keys, so the replace-and-move rule is
     // exercised rather than only the append one.

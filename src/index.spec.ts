@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import {clearInterval} from 'node:timers';
+import {getEventListeners} from 'node:events';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {Readable, Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
@@ -16,6 +17,7 @@ import client, {
   createClient,
   type GotlikeStream,
   type GotlikeUploadStream,
+  type FormedOptions,
   type HandlerFunction,
   Gotlike,
   HTTPError,
@@ -472,6 +474,20 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  /*
+   * Accepts the request, counts it and never answers. The client's own deadline or undici's
+   * `headersTimeout` is the only thing that ends it, which is what makes it the route for the
+   * retry-on-timeout tests: the count says which of the two fired, since only undici's is one
+   * undici will retry.
+   */
+  if (req.url === '/hang') {
+    const testId = req.headers['test-id']?.toString() ?? 'default';
+
+    serverState.retryCounts[testId] = (serverState.retryCounts[testId] ?? 0) + 1;
+
+    return;
+  }
+
   if (req.url === '/retry') {
     const testId = req.headers['test-id']?.toString() ?? 'default';
 
@@ -610,6 +626,122 @@ test('a status listed in retry.statusCodes that undici will not retry keeps its 
 
   assert.strictEqual(error.code, 'ETIMEDOUT');
   assert.ok(elapsedMs < 1500, `expected the deadline to survive the paused retry, ran for ${elapsedMs}ms`);
+});
+
+/**
+ * How many times `/hang` was asked, which is how these tests tell the two timeouts apart:
+ * undici's own is retryable, the deadline signal's abort never is.
+ */
+function hangAttempts(testId: string): number {
+  return serverState.retryCounts[testId] ?? 0;
+}
+
+/**
+ * A timed-out request is retried, which for a long time it was not - and could not be.
+ *
+ * The deadline is armed before the dispatch and undici arms its own `headersTimeout` only once
+ * the request has been sent, so the deadline always won that race. Aborting through a signal is
+ * the one failure undici will never retry (`RetryHandler.onResponseError` propagates outright
+ * when the connection's controller was aborted, and the signal stays aborted for every later
+ * attempt anyway) - so a client configured `{retry: {limit: n}, timeout: {request: ms}}`, which
+ * is the ordinary shape for a flaky upstream, got no retries at all for the one failure it was
+ * most likely configured for, whatever `retry.errorCodes` said. Measured against got 16: an
+ * upstream that never answers ran four attempts there and one here.
+ *
+ * Two things fix it, and the attempt count is what proves both: `requestSignal` defers the abort
+ * once so undici's own timeout fires, and the default `errorCodes` carry the two codes undici
+ * raises for it.
+ */
+test('a request that times out is retried the way got retries it', async () => {
+  const testId = randomUUID();
+  const retrying = client.extend({timeout: {request: 1000}, retry: {limit: 1, backoffLimit: 10}});
+
+  const error = await failure(retrying.get('http://localhost:3000/hang', {headers: {'test-id': testId}}));
+
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+  assert.strictEqual(hangAttempts(testId), 2, 'the timeout should have been retried');
+});
+
+/**
+ * got spells a timeout `ETIMEDOUT`; undici raises `UND_ERR_HEADERS_TIMEOUT` /
+ * `UND_ERR_BODY_TIMEOUT`. A caller migrating a got call site writes got's name, which undici
+ * never raises - so the option was accepted, validated, and then matched nothing at all.
+ */
+test('retry.errorCodes written in got’s spelling still retries a timeout', async () => {
+  const testId = randomUUID();
+  const retrying = client.extend({
+    timeout: {request: 1000},
+    retry: {limit: 1, backoffLimit: 10, errorCodes: ['ETIMEDOUT']},
+  });
+
+  const error = await failure(retrying.get('http://localhost:3000/hang', {headers: {'test-id': testId}}));
+
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+  assert.strictEqual(hangAttempts(testId), 2, 'got’s own code for a timeout should retry one');
+});
+
+/**
+ * The other half of that: a caller who narrowed `errorCodes` away from timeouts gets the exact
+ * deadline back, rather than paying the grace for a retry undici would refuse anyway.
+ */
+test('retry.errorCodes that exclude a timeout keep the exact deadline', async () => {
+  const testId = randomUUID();
+  const retrying = client.extend({
+    timeout: {request: 700},
+    retry: {limit: 2, backoffLimit: 10, errorCodes: ['ECONNRESET']},
+  });
+
+  const start = process.hrtime.bigint();
+
+  const error = await failure(retrying.get('http://localhost:3000/hang', {headers: {'test-id': testId}}));
+
+  const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+  assert.strictEqual(hangAttempts(testId), 1, 'a timeout outside errorCodes must not be retried');
+  assert.ok(elapsedMs < 1200, `expected the exact deadline, fired after ${elapsedMs}ms`);
+});
+
+/**
+ * And the floor. undici cannot report a timeout of its own before ~1s however small its
+ * `headersTimeout` is (measured against undici 8.10.2: 100, 300 and 900 all fired at ~1000ms),
+ * so waiting for one under a sub-second `timeout.request` would multiply a bound the caller set
+ * deliberately - failing at 1700ms where they asked for 100. The deadline stays exact there and
+ * the attempt is not retried, which is a recorded divergence from got rather than an oversight.
+ */
+test('a timeout under undici’s timer floor keeps its exact deadline and is not retried', async () => {
+  const testId = randomUUID();
+  const retrying = client.extend({timeout: {request: 150}, retry: {limit: 2, backoffLimit: 10}});
+
+  const start = process.hrtime.bigint();
+
+  const error = await failure(retrying.get('http://localhost:3000/hang', {headers: {'test-id': testId}}));
+
+  const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+  assert.strictEqual(hangAttempts(testId), 1);
+  assert.ok(elapsedMs < 800, `expected the 150ms deadline to fire promptly, fired after ${elapsedMs}ms`);
+});
+
+/**
+ * The trickling body - the case the deadline exists for - keeps its exact bound even on a client
+ * that does retry timeouts. undici propagates rather than retries once a response head has been
+ * delivered (`RetryHandler.onResponseError`), so there is nothing to wait for, and waiting would
+ * cost the one request that has no other bound. `canRetryError` reads the attempt's own
+ * `lastStatusCode` to know the head has arrived.
+ */
+test('a trickling body keeps its exact deadline on a client that retries timeouts', async () => {
+  const retrying = client.extend({timeout: {request: 1100}, retry: {limit: 2, backoffLimit: 10}});
+
+  const start = process.hrtime.bigint();
+
+  const error = await failure(retrying.get('http://localhost:3000/trickle'));
+
+  const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+  assert.ok(elapsedMs < 1600, `expected the deadline not to be deferred past the head, ran for ${elapsedMs}ms`);
 });
 
 /**
@@ -875,6 +1007,66 @@ test('a directly built client does not keep the caller’s own hooks live', asyn
   await built.get('http://localhost:3000/json');
 
   assert.deepStrictEqual(calls, ['first']);
+});
+
+/**
+ * The same guarantee for the three the constructor's spread still aliased.
+ *
+ * `hooks`, `handlers` and `searchParams` were copied; `context`, `timeout` and `retry` were the
+ * caller's own objects on `baseOptions`. That is not inert: `formOptions` copies `context` per
+ * request, but it copies it *from* here, so a key added to the caller's object afterwards reached
+ * every later request; `timeout` is handed over by reference outright, so a deadline could be
+ * moved out from under a client that was already built - measured, a `{request: 5000}` mutated to
+ * `{request: 1}` afterwards started timing requests out.
+ */
+test('a directly built client does not keep the caller’s own context, timeout or retry live', async () => {
+  const context: Record<string, unknown> = {tenant: 'original'};
+  const timeout = {request: 5000};
+  const retry = {limit: 1};
+
+  const built = new Gotlike({responseType: 'json', context, timeout, retry});
+
+  assert.notStrictEqual(built.baseOptions.context, context);
+  assert.notStrictEqual(built.baseOptions.timeout, timeout);
+  assert.notStrictEqual(built.baseOptions.retry, retry);
+
+  context['injected'] = 'afterwards';
+  context['tenant'] = 'mutated';
+  // Short enough that a request answered in milliseconds would fail if this reached the client.
+  timeout.request = 1;
+  retry.limit = 5;
+
+  const response = await built.get<Echo>('http://localhost:3000/echo');
+
+  assert.deepStrictEqual(response.request.options.context, {tenant: 'original'});
+  assert.deepStrictEqual(response.request.options.timeout, {request: 5000});
+  assert.deepStrictEqual(built.baseOptions.retry, {limit: 1});
+});
+
+/**
+ * And `headers`, which was the last one and the worst of them, because the object it aliased
+ * belonged to nobody: `defaultOptions.headers` is one module-level `{}`, and the constructor's
+ * spread handed *the same object* to every client built without headers of its own. A single
+ * write through that public field would have shown up on every client created in the process
+ * afterwards - the one alias here with a blast radius wider than the client that caused it.
+ *
+ * A caller's own object needs the copy for the ordinary reason: `extend()` reads `base.headers`,
+ * so mutating what was passed to `createClient({headers})` reached clients derived from it later.
+ */
+test('clients do not share one headers object, with each other or with the caller', async () => {
+  assert.notStrictEqual(new Gotlike().baseOptions.headers, new Gotlike().baseOptions.headers);
+
+  const headers = {'x-tenant': 'original'};
+  const built = new Gotlike({responseType: 'json', headers});
+
+  assert.notStrictEqual(built.baseOptions.headers, headers);
+
+  headers['x-tenant'] = 'mutated';
+
+  const response = await built.get<Echo>('http://localhost:3000/echo');
+
+  assert.strictEqual(response.body.headers['x-tenant'], 'original');
+  assert.strictEqual(built.extend({}).baseOptions.headers?.['x-tenant'], 'original');
 });
 
 test('extend client with hook', async () => {
@@ -1240,10 +1432,19 @@ test('an afterResponse retry normalises and validates the options it is given', 
     {label: 'a prefixUrl carrying a query', options: {prefixUrl: 'http://localhost:3000?q=1'}},
     {label: 'a prefixUrl carrying a fragment', options: {prefixUrl: 'http://localhost:3000#f'}},
     {label: 'searchParams that are not a query', options: {searchParams: 5}},
+    // Raised by `queryValue` when the query is serialised rather than by `validateOptions`, so
+    // it reaches the caller from inside `call()` on both routes - and has to be the same class
+    // on both, which is what the pre-request catch's `ValidationError` passthrough is for.
+    {label: 'a searchParams value that is an object', options: {searchParams: {a: {b: 1}}}},
     {label: 'a form that is not an object', options: {form: 'a=1'}},
     {label: 'an unknown option', options: {nonsense: 1}},
     {label: 'a client-only option per request', options: {hooks: {beforeRequest: []}}},
     {label: 'retry per request', options: {retry: {limit: 1}}},
+    // Composing the redirect interceptor is a create/extend-time decision, so a per-request
+    // `true` can never work. `formOptions` refused it from the start; the retry's own copy of the
+    // check simply did not exist, so a hook asking for it was ignored rather than told. Both
+    // routes go through `validateRequest` now, which is what keeps this row honest.
+    {label: 'followRedirect: true per request', options: {followRedirect: true}},
   ];
 
   const disagreed: string[] = [];
@@ -1279,6 +1480,112 @@ test('an afterResponse retry normalises and validates the options it is given', 
     [],
     `the retry merge and formOptions disagree about these options:\n  ${disagreed.join('\n  ')}`,
   );
+});
+
+/**
+ * An option the hook names as `undefined` leaves the first attempt's value standing.
+ *
+ * The third thing `formOptions` does that the retry merge has to do for itself, alongside the
+ * validation and the method folding the test above pins. A key that is *present* with the value
+ * `undefined` wins a plain spread, and that is the shape a refresh hook writes constantly -
+ * `retry({headers, method: req.method, throwHttpErrors: cfg.throwHttpErrors})` forwarded from
+ * somewhere any of those can be absent. Measured before the fix: `{method: undefined}` replayed a
+ * POST as a **GET**, `{responseType: undefined}` handed back a `Buffer` instead of parsed json,
+ * and `{url: undefined}` failed the dispatch outright with `UND_ERR_INVALID_ARG`.
+ *
+ * got skips `undefined` when it merges (`Options.merge`, which is what its own
+ * `retryWithMergedOptions` goes through), and so does every other route into `call()` here. The
+ * table is written as "absent against present-undefined must be indistinguishable", so an option
+ * that starts differing between the two reads as its own row rather than as one example failing.
+ */
+test('an afterResponse retry ignores an option the hook names as undefined', async () => {
+  const retried = (newOptions: RequestOptions) =>
+    client.extend({
+      responseType: 'json',
+      hooks: {
+        afterResponse: [
+          (response, retry) =>
+            response.request.options.context['retried'] === undefined
+              ? retry({...newOptions, context: {retried: true}})
+              : response,
+        ],
+      },
+    });
+
+  /** What the retried request became, as far as the server and the caller can both see it. */
+  const describe = async (newOptions: RequestOptions): Promise<string> => {
+    try {
+      const response = await retried(newOptions).post<Echo>('http://localhost:3000/echo', {
+        json: {a: 1},
+        searchParams: {q: 'x'},
+        timeout: {request: 5000},
+      });
+
+      const echo = response.body;
+
+      return `${echo.method} ${echo.url} ct=${echo.headers['content-type']} body=${echo.body} parsed=${typeof echo}`;
+    } catch (error) {
+      return `${(error as Error).constructor.name}: ${(error as Error).message}`;
+    }
+  };
+
+  const absent = await describe({});
+
+  // Sanity: the baseline really is the request the options describe, so a row agreeing with it
+  // means something. A table whose baseline had quietly become a failure would otherwise pass.
+  assert.match(absent, /^POST \/echo\?q=x ct=application\/json body=\{"a":1\} parsed=object$/);
+
+  const keys: (keyof RequestOptions)[] = [
+    'method',
+    'url',
+    'responseType',
+    'searchParams',
+    'timeout',
+    'prefixUrl',
+    'headers',
+    'json',
+    'body',
+    'form',
+    'context',
+    'resolveBodyOnly',
+  ];
+
+  const disagreed: string[] = [];
+
+  for (const key of keys) {
+    const present = await describe({[key]: undefined});
+
+    if (present !== absent) {
+      disagreed.push(`${key}\n    absent:           ${absent}\n    present-undefined: ${present}`);
+    }
+  }
+
+  assert.deepStrictEqual(
+    disagreed,
+    [],
+    `a retry option named as undefined changed the request:\n  ${disagreed.join('\n  ')}`,
+  );
+});
+
+test('an afterResponse retry with throwHttpErrors undefined still throws on an error status', async () => {
+  // The same rule as the table above, on the one option whose effect only shows on a failing
+  // status: `undefined` used to read as "off", so the 401 the hook was retrying resolved as a
+  // success the second time round.
+  const client401 = client.extend({
+    hooks: {
+      afterResponse: [
+        (response, retry) =>
+          response.request.options.context['retried'] === undefined
+            ? retry({throwHttpErrors: undefined, context: {retried: true}})
+            : response,
+      ],
+    },
+  });
+
+  const error = await failure<RequestError>(client401.get('http://localhost:3000/status?code=401'));
+
+  assert.ok(error instanceof HTTPError, `expected an HTTPError, got ${error}`);
+  assert.strictEqual(error.response?.statusCode, 401);
 });
 
 /**
@@ -1743,6 +2050,53 @@ test('stream emits a response event', async () => {
   await text(duplex);
 });
 
+/*
+ * The got-shaped proxy: copy the head onto an outgoing response, then pipe the body into it.
+ * The emit is deferred so that a caller can attach a listener after `await stream(...)` at all -
+ * and on `setImmediate` alone the body won every time, because attaching a `data` listener (which
+ * `pipe()` does, in the same synchronous block) starts the flow on a `process.nextTick`. Measured
+ * against got 16 on the same server: `data, response` here against `response, data` there, so a
+ * status and headers copied in the handler landed after body bytes had already been written.
+ *
+ * Asserted per consumer rather than once, because each starts the flow by a different route and
+ * it is the route that used to decide the answer.
+ */
+for (const [consumer, read] of [
+  [
+    'pipe',
+    (stream: Readable, seen: string[]) =>
+      pipeline(stream, new Writable({write: (_c, _e, cb) => (seen.push('data'), cb())})),
+  ],
+  [
+    'on(data)',
+    (stream: Readable, seen: string[]) =>
+      new Promise<void>((resolve) => {
+        stream.on('data', () => seen.push('data'));
+        stream.on('end', () => resolve());
+      }),
+  ],
+  [
+    'for await',
+    async (stream: Readable, seen: string[]) => {
+      for await (const _chunk of stream) {
+        seen.push('data');
+      }
+    },
+  ],
+] as const) {
+  test(`stream emits response before any body reaches a ${consumer} consumer`, async () => {
+    const stream = await client.stream('http://localhost:3000/stream');
+    const seen: string[] = [];
+
+    stream.on('response', () => seen.push('response'));
+
+    await read(stream, seen);
+
+    assert.strictEqual(seen[0], 'response', `saw ${seen.join(', ')}`);
+    assert.ok(seen.includes('data'), 'the body should still have been delivered');
+  });
+}
+
 test('stream works with pipeline into a writable', async () => {
   const duplex = await client.stream('http://localhost:3000/stream');
 
@@ -1999,6 +2353,311 @@ test('does not mutate the options object it was given', async () => {
   assert.deepStrictEqual(options, {responseType: 'json'});
 });
 
+/*
+ * An invariant rather than a scenario, and the third of these in the file for the same reason:
+ * every one of these was one uncovered *option*, not a wrong answer on a covered one.
+ *
+ * `formOptions` allocates `headers` and `context` per request precisely so that the code handed
+ * the formed options - a handler, a `beforeRequest`/`afterResponse`/`beforeError` hook - cannot
+ * write through them into the client or back into the caller's own literal. Every option whose
+ * value is a mutable object shared with the client needs that, and `searchParams`, `timeout` and
+ * `handlers` did not have it: measured, a hook adding one query parameter put it on every later
+ * request the client made, and `options.timeout.request = 5` for one request moved the client's
+ * deadline permanently, so everything it sent afterwards timed out.
+ *
+ * Each row writes through the option the way a hook plausibly would, once per *setup* - which is
+ * the part that matters. The shallow spread only aliases when a single side carries the option;
+ * when both do, `mergeSearchParams` was already allocating and the row would pass vacuously. So
+ * each option is driven from the client alone, from the call alone, and from both, and each setup
+ * asks the two questions: did the client change, and did the caller's own object change.
+ * Reported per row rather than thrown, so a row that stops failing reads as a result instead of
+ * hiding every row after it.
+ *
+ * The values written are deliberately harmless (a spare query parameter, a longer deadline): what
+ * is under test is whether the write escapes the request, not what it would have done if it did.
+ *
+ * **Every row runs twice, once per route the formed options reach writable code by**, and the
+ * second is the one that was missed. The copies used to sit behind a `sharesOptions` flag, on the
+ * reasoning that "a client with neither handlers nor hooks has nothing that could write" - but
+ * the formed options are handed to *every* caller, as `response.request.options` and
+ * `error.options`, both of which the README documents. Measured on a hookless, handler-less
+ * client: `response.request.options.timeout === client.baseOptions.timeout`, so a caller - or any
+ * logging or retry wrapper that normalises what it is shown - moved the client's deadline for
+ * good. A row driven only through a hook passes vacuously on that shape, which is why the route
+ * is a dimension of the table rather than a separate scenario.
+ */
+test('a hook writing through the formed options cannot reach the client or the caller', async () => {
+  type Row = {
+    option: string;
+    /** Each side the option can arrive from, since only a one-sided one is aliased. */
+    setups: {onClient: RequestOptions; perCall: () => RequestOptions}[];
+    write: (options: FormedOptions) => void;
+    /** What the option should still read as after a request that wrote through it. */
+    read: (options: RequestOptions) => string;
+  };
+
+  const rows: Row[] = [
+    {
+      option: 'searchParams',
+      setups: [
+        {onClient: {searchParams: {k: 'v'}}, perCall: () => ({})},
+        {onClient: {}, perCall: () => ({searchParams: {q: '1'}})},
+        {onClient: {searchParams: {k: 'v'}}, perCall: () => ({searchParams: {q: '1'}})},
+      ],
+      write: (options) => {
+        (options.searchParams as Record<string, string>).injected = 'yes';
+      },
+      read: (options) => JSON.stringify(options.searchParams),
+    },
+    {
+      option: 'timeout',
+      setups: [
+        {onClient: {timeout: {request: 5000}}, perCall: () => ({})},
+        {onClient: {}, perCall: () => ({timeout: {request: 4000}})},
+        // `{}` is the shape that makes `formOptions` reach for the client's object by name
+        // rather than through the spread - the one place it was assigned outright.
+        {onClient: {timeout: {request: 5000}}, perCall: () => ({timeout: {}})},
+      ],
+      write: (options) => {
+        options.timeout!.request = 9000;
+      },
+      read: (options) => JSON.stringify(options.timeout),
+    },
+    {
+      // Client-only by definition, so there is no per-call side to alias.
+      option: 'handlers',
+      setups: [{onClient: {}, perCall: () => ({})}],
+      write: (options) => {
+        options.handlers!.push((o, next) => next(o));
+      },
+      read: (options) => String(options.handlers?.length),
+    },
+  ];
+
+  const failures: string[] = [];
+  const passThrough: HandlerFunction = (options, next) => next(options);
+
+  for (const route of ['hook', 'response'] as const) {
+    for (const row of rows) {
+      for (const [index, setup] of row.setups.entries()) {
+        const probe = client.extend({
+          ...setup.onClient,
+          /*
+           * The hook route gets a handler as well as the hook, since `handlers` is what one of
+           * the rows writes to and a client without one never forms the array at all. The
+           * response route is left as bare as the row allows: no hooks, no handlers, which is
+           * exactly the shape whose copies used to be skipped.
+           */
+          ...(route === 'hook' || row.option === 'handlers' ? {handlers: [passThrough]} : {}),
+          ...(route === 'hook' ? {hooks: {beforeRequest: [(options: FormedOptions) => row.write(options)]}} : {}),
+        });
+
+        const where = `${row.option} [setup ${index}, via ${route}]`;
+        const clientBefore = row.read(probe.baseOptions);
+        const callerOptions = setup.perCall();
+        const callerBefore = row.read({...callerOptions, handlers: probe.baseOptions.handlers});
+
+        const response = await probe.get('http://localhost:3000/echo', callerOptions);
+
+        // The other end of the same object: what the request was sent with is handed back on
+        // every response, and writing through it must not reach any further than a hook's write.
+        if (route === 'response') {
+          row.write(response.request.options);
+        }
+
+        await probe.get('http://localhost:3000/echo', setup.perCall());
+
+        const clientAfter = row.read(probe.baseOptions);
+
+        if (clientAfter !== clientBefore) {
+          failures.push(`${where}: the client's own value changed from ${clientBefore} to ${clientAfter}`);
+        }
+
+        const callerAfter = row.read({...callerOptions, handlers: probe.baseOptions.handlers});
+
+        if (callerAfter !== callerBefore) {
+          failures.push(`${where}: the caller's own options changed from ${callerBefore} to ${callerAfter}`);
+        }
+      }
+    }
+  }
+
+  assert.deepStrictEqual(failures, []);
+});
+
+/*
+ * The companion to the invariant above, for the two options `formOptions` deliberately does
+ * *not* copy. The justification for aliasing them is that both are consumed at construction, so
+ * a write through them cannot change the client - which was not true, because the arrays the
+ * client ran from were the very ones on `baseOptions`. Driven through `response.request.options`
+ * rather than `baseOptions` directly, since that is the reference every caller is handed.
+ */
+test('the hooks and retry a response reports cannot change what the client runs', async () => {
+  const ran: string[] = [];
+  const probe = client.extend({
+    hooks: {beforeRequest: [() => void ran.push('original')]},
+    retry: {limit: 1, statusCodes: [503], backoffLimit: 10},
+  });
+
+  const first = await probe.get('http://localhost:3000/json');
+
+  // A caller, or a logging wrapper, adding "one more hook for this request".
+  first.request.options.hooks!.beforeRequest!.push(() => void ran.push('injected'));
+  // And widening what gets retried, through the same reference.
+  first.request.options.retry!.statusCodes!.push(404);
+
+  ran.length = 0;
+
+  await probe.get('http://localhost:3000/json');
+
+  assert.deepStrictEqual(ran, ['original'], 'a hook pushed through response.request.options ran');
+
+  const testId = randomUUID();
+  const notRetried = await probe.get('http://localhost:3000/status?code=404', {
+    throwHttpErrors: false,
+    headers: {'test-id': testId},
+  });
+
+  assert.strictEqual(notRetried.retryCount, 0, 'a status pushed through response.request.options was retried');
+});
+
+test('a deadline does not accumulate on a caller’s own signal', async () => {
+  const controller = new AbortController();
+  const timed = client.extend({timeout: {request: 5000}});
+
+  /*
+   * `AbortSignal.any` registers the composite it builds in the *source* signal's internal
+   * dependant-signal set, and there is no API to take it back out again - so a signal a caller
+   * shares across requests collected one unreclaimable entry per request, for its whole life.
+   * Measured at 485 bytes a request, and 1971 entries after 2000 requests. Asserted by patching
+   * the function rather than by weighing the heap, so reverting to it fails loudly instead of
+   * flakily.
+   */
+  // Through the descriptor, so the original is put back exactly as it was - and so the lint
+  // rule against referencing an unbound method has nothing to object to.
+  const original = Object.getOwnPropertyDescriptor(AbortSignal, 'any')!;
+  let composed = 0;
+
+  Object.defineProperty(AbortSignal, 'any', {
+    ...original,
+    value: (signals: AbortSignal[]) => {
+      composed++;
+
+      return (original.value as typeof AbortSignal.any).call(AbortSignal, signals);
+    },
+  });
+
+  try {
+    for (let index = 0; index < 5; index++) {
+      await timed.get('http://localhost:3000/json', {signal: controller.signal});
+    }
+  } finally {
+    Object.defineProperty(AbortSignal, 'any', original);
+  }
+
+  assert.strictEqual(composed, 0, 'the deadline was composed with AbortSignal.any, which cannot be detached');
+  assert.deepStrictEqual(
+    getEventListeners(controller.signal, 'abort'),
+    [],
+    'the deadline left its abort listener on the caller’s signal',
+  );
+
+  // The other half: the forwarding has to be there while the request is actually in flight, so
+  // dropping the caller's signal altogether cannot pass this test.
+  const inFlight = failure(timed.get('http://localhost:3000/hang', {signal: controller.signal}));
+
+  await sleep(50);
+
+  assert.strictEqual(
+    getEventListeners(controller.signal, 'abort').length,
+    1,
+    'the caller’s signal is not wired to the request while it is in flight',
+  );
+
+  controller.abort();
+
+  assert.strictEqual((await inFlight).code, 'ERR_ABORTED');
+  assert.deepStrictEqual(getEventListeners(controller.signal, 'abort'), []);
+});
+
+/*
+ * `normaliseStreamErrors` works by wrapping `_destroy`, which Node calls for every destroy -
+ * so a consumer tearing the stream down was being reported as a failed request: the hooks ran,
+ * and `stream.errored` was rewritten to a `RequestError` that described nothing that happened.
+ * For anything proxying a download that is every client disconnect. The rows are the shapes a
+ * consumer actually produces; the request itself succeeds in all of them.
+ */
+test('a consumer destroying a stream is not a request failure', async () => {
+  const seen: string[] = [];
+  const probe = client.extend({
+    hooks: {
+      beforeError: [
+        (error) => {
+          seen.push(error.message);
+
+          return error;
+        },
+      ],
+    },
+  });
+
+  const rows: {label: string; run: (stream: GotlikeStream) => Promise<unknown>}[] = [
+    {
+      label: 'destroy() with no error',
+      run: async (stream) => {
+        stream.on('error', () => undefined);
+        stream.destroy();
+
+        await sleep(50);
+      },
+    },
+    {
+      label: 'destroy(error)',
+      run: async (stream) => {
+        stream.on('error', () => undefined);
+        stream.destroy(new Error('caller gave up'));
+
+        await sleep(50);
+      },
+    },
+    {
+      label: 'a destination that fails mid-pipe',
+      run: (stream) =>
+        failure(
+          pipeline(
+            stream,
+            new Writable({
+              write(_chunk, _encoding, callback) {
+                callback(new Error('disk full'));
+              },
+            }),
+          ),
+        ),
+    },
+  ];
+
+  for (const row of rows) {
+    seen.length = 0;
+
+    const stream = await probe.stream('http://localhost:3000/stream');
+
+    await row.run(stream);
+
+    assert.deepStrictEqual(seen, [], `${row.label}: the beforeError hooks ran for a consumer-side teardown`);
+  }
+
+  // And the request's own failures still are one, which is what keeps this from being a licence
+  // to stop normalising. `/truncate` cuts the socket after the head has arrived.
+  seen.length = 0;
+
+  const truncated = await probe.stream('http://localhost:3000/truncate');
+
+  await failure(text(truncated));
+
+  assert.strictEqual(seen.length, 1, 'a truncated body stopped being reported as a request failure');
+  assert.ok(truncated.errored instanceof RequestError);
+});
+
 test('prefixUrl joins without doubling slashes', async () => {
   const extClient = client.extend({
     prefixUrl: 'http://localhost:3000/api',
@@ -2237,13 +2896,41 @@ test('searchParams accepts objects, strings and URLSearchParams', async () => {
   }
 });
 
-test('searchParams drops null and undefined entries', async () => {
+/*
+ * `null` and `undefined` are not the same thing here, and treating them as one lost a parameter
+ * off the wire: `{a: null}` went out as no `a` at all where got sends `a=`. An upstream that
+ * tells "absent" from "present and empty" - a filter being cleared, a tri-state flag, anything
+ * signing over the canonical query - saw a different request, silently. got's own rule is the
+ * one below: `null` appends an empty value, `undefined` is skipped.
+ */
+test('searchParams sends null as an empty value and drops undefined', async () => {
   const response = await client.get<Echo>('http://localhost:3000/echo', {
     responseType: 'json',
-    searchParams: {keep: 'yes', drop: null, alsoDrop: undefined, zero: 0, empty: ''},
+    searchParams: {keep: 'yes', blank: null, drop: undefined, zero: 0, empty: ''},
   });
 
-  assert.strictEqual(response.body.url, '/echo?keep=yes&zero=0&empty=');
+  assert.strictEqual(response.body.url, '/echo?keep=yes&blank=&zero=0&empty=');
+});
+
+// The same rule inside an array, which is how a key is repeated: a `null` is still a value of
+// that key, an `undefined` is still nothing at all.
+test('an array searchParams value applies the null/undefined rule per item', async () => {
+  const response = await client.get<Echo>('http://localhost:3000/echo', {
+    responseType: 'json',
+    searchParams: {a: [1, null, undefined, 2]},
+  });
+
+  assert.strictEqual(response.body.url, '/echo?a=1&a=&a=2');
+});
+
+// Through the merge as well as the plain serialisation - `mergeSearchParams` walks the override's
+// own keys and then appends through `appendQuery`, so the two cannot disagree.
+test('a null override in a merged searchParams replaces the client’s value with an empty one', async () => {
+  const scoped = client.extend({responseType: 'json', searchParams: {a: '1', z: '9'}});
+
+  const response = await scoped.get<Echo>('http://localhost:3000/echo', {searchParams: {a: null}});
+
+  assert.strictEqual(response.body.url, '/echo?z=9&a=');
 });
 
 test('searchParams values are url-encoded', async () => {
@@ -2313,7 +3000,18 @@ test('form sends a urlencoded body with the right content-type', async () => {
   assert.strictEqual(response.body.method, 'POST');
 });
 
-test('form accepts URLSearchParams and drops nullish entries', async () => {
+/*
+ * `form` shares `appendQuery` with `searchParams`, so it gets the same rule: `null` is sent as
+ * an empty value and `undefined` is dropped.
+ *
+ * got's `form` diverges here, and deliberately is not copied: it builds the body with
+ * `new URLSearchParams(form)`, which stringifies both into the literal text `a=null` and
+ * `b=undefined`. That is a serialisation artefact rather than an intent - it is not what got's
+ * own `searchParams` does with the same two values - and no server wants the four characters
+ * `null` in a form field. Keeping the key with an empty value preserves what the old behaviour
+ * actually lost, which was the key. Recorded in the README's divergence table.
+ */
+test('form sends null as an empty value and drops undefined', async () => {
   const fromParams = await client.post<Echo>('http://localhost:3000/echo', {
     responseType: 'json',
     form: new URLSearchParams({a: '1'}),
@@ -2321,12 +3019,12 @@ test('form accepts URLSearchParams and drops nullish entries', async () => {
 
   assert.strictEqual(fromParams.body.body, 'a=1');
 
-  const dropped = await client.post<Echo>('http://localhost:3000/echo', {
+  const nullish = await client.post<Echo>('http://localhost:3000/echo', {
     responseType: 'json',
-    form: {keep: 'yes', drop: null},
+    form: {keep: 'yes', blank: null, drop: undefined},
   });
 
-  assert.strictEqual(dropped.body.body, 'keep=yes');
+  assert.strictEqual(nullish.body.body, 'keep=yes&blank=');
 });
 
 test('form does not override an explicit content-type, and json wins over form', async () => {
@@ -2467,6 +3165,163 @@ test('pool options build a dedicated agent', async () => {
   const response = await extClient.get<{test: string}>('http://localhost:3000/json');
 
   assert.strictEqual(response.body.test, 'value');
+});
+
+/**
+ * Extending a client does not open a second connection pool behind its back.
+ *
+ * The constructor re-evaluates the agent options against the *merged* options, so a client built
+ * with any one of them handed every client extended from it a brand new `undici.Agent` - for a
+ * change of headers, of `prefixUrl`, of anything. Parent and child then shared no sockets, each
+ * held a pool of its own up to `connections`, and the Agents left behind were never closed, so
+ * deriving a client per upstream multiplied the process's connections silently. An explicitly
+ * passed `agent` was inherited all along, so the two ways of configuring the transport disagreed.
+ *
+ * The other half is just as important: an extension that *does* name an agent option still has to
+ * get the dispatcher its options describe, rather than the inherited one winning because it is
+ * now sitting on `baseOptions`.
+ */
+test('extend reuses the parent’s dispatcher unless the extension names one', async () => {
+  const parent = new Gotlike({responseType: 'json', connections: 1, keepAliveTimeout: 1000});
+
+  assert.ok(parent.ownAgent, 'expected the parent to build a dedicated agent');
+
+  const child = parent.extend({headers: {'x-child': '1'}});
+  const grandchild = child.extend({prefixUrl: 'http://localhost:3000'});
+
+  assert.strictEqual(child.ownAgent, parent.ownAgent, 'a headers-only extend rebuilt the dispatcher');
+  assert.strictEqual(grandchild.ownAgent, parent.ownAgent, 'a prefixUrl-only extend rebuilt the dispatcher');
+
+  // ... and an extension that does describe the transport gets its own, rather than inheriting
+  // the one the spread would otherwise have carried down from `baseOptions`.
+  const retuned = grandchild.extend({connections: 4});
+
+  assert.ok(retuned.ownAgent, 'expected a dedicated agent for the retuned client');
+  assert.notStrictEqual(retuned.ownAgent, parent.ownAgent, 'connections: 4 reused the parent’s dispatcher');
+
+  const explicit = new Agent();
+  const adopted = grandchild.extend({agent: explicit});
+
+  assert.strictEqual(adopted.ownAgent, explicit);
+
+  // Every one of them still makes requests through whichever dispatcher it ended up with.
+  for (const each of [child, grandchild, retuned, adopted]) {
+    const response = await each.get<{test: string}>('http://localhost:3000/json');
+
+    assert.strictEqual(response.body.test, 'value');
+  }
+
+  await explicit.close();
+});
+
+/*
+ * "The extension names the transport, so it gets its own dispatcher" holds only for a dispatcher
+ * this package *built*. One the caller handed over cannot be rebuilt from `connections` and
+ * friends - there is no way to ask a `ProxyAgent` or an `H2CClient` for a copy of itself with one
+ * option changed - so replacing it with a plain `undici.Agent` was not a reconfiguration, it was
+ * throwing the transport away: `extend({agent: new EnvHttpProxyAgent()}).extend({connections:
+ * 128})` sent every request direct, bypassing the proxy, with no error and nothing on the wire to
+ * say so. Both halves of that composition are straight out of the README.
+ *
+ * Refused rather than ignored, as everywhere else here that an option would otherwise be quietly
+ * dropped - and the quiet outcome in this one is traffic leaving by a route the caller ruled out.
+ */
+test('an agent-level option cannot silently replace an explicitly passed dispatcher', async () => {
+  const explicit = new Agent();
+  const client_ = new Gotlike({agent: explicit});
+
+  assert.strictEqual(client_.explicitAgent, true);
+
+  for (const key of ['connections', 'keepAliveTimeout', 'http2', 'pipelining', 'connectTimeout'] as const) {
+    assert.throws(() => client_.extend({[key]: key === 'http2' ? true : 1}), {
+      name: 'ValidationError',
+      code: 'ERR_INVALID_OPTION',
+      message: new RegExp(`\`${key}\` cannot be set on a client built with an explicit \`agent\``),
+    });
+  }
+
+  // The dispatcher survives every extension that does not name the transport...
+  assert.strictEqual(client_.extend({prefixUrl: 'http://localhost:3000'}).ownAgent, explicit);
+  // ... and naming a replacement outright is how you actually change it.
+  const replacement = new Agent({connections: 4});
+
+  assert.strictEqual(client_.extend({agent: replacement}).ownAgent, replacement);
+
+  await Promise.all([explicit.close(), replacement.close()]);
+});
+
+/*
+ * ...and the same refusal from the other direction, which the one above did not cover. `agent`
+ * short-circuited the check, so naming both in *one* call - `{agent: new ProxyAgent(...),
+ * connections: 128}` - accepted the agent option and did nothing whatsoever with it: the
+ * dispatcher is used exactly as it stands, and there is no way to ask a `ProxyAgent` for a copy
+ * of itself with one option changed. The two halves of one rule disagreed, and the half that
+ * stayed quiet is the one a caller writes by accident.
+ */
+test('an agent-level option cannot be quietly swallowed by an agent named beside it', async () => {
+  const explicit = new Agent();
+
+  for (const build of [
+    (options: RequestOptions) => new Gotlike(options),
+    (options: RequestOptions) => createClient(options),
+    (options: RequestOptions) => client.extend(options),
+  ]) {
+    for (const key of ['connections', 'keepAliveTimeout', 'http2', 'pipelining', 'connectTimeout'] as const) {
+      assert.throws(() => build({agent: explicit, [key]: key === 'http2' ? true : 1}), {
+        name: 'ValidationError',
+        code: 'ERR_INVALID_OPTION',
+        message: new RegExp(`\`${key}\` cannot be combined with an explicit \`agent\``),
+      });
+    }
+  }
+
+  // An `agent` on its own is still the documented way to name the transport, and the inherited
+  // agent options `extend()` folds in alongside an inherited dispatcher are not this mistake -
+  // see `inheritedAgent`. Both are covered by the tests around this one; this asserts the
+  // narrower half, that the check does not fire on an agent by itself.
+  assert.strictEqual(new Gotlike({agent: explicit}).ownAgent, explicit);
+
+  await explicit.close();
+});
+
+/*
+ * The flag that decides the above has to survive a plain extend. The constructor sees an `agent`
+ * and concludes the caller handed one over, which is wrong for the inherit branch - it passes the
+ * parent's dispatcher back in whether the parent built it or was given it. Uncovered, one
+ * `extend({headers})` off a `connections`-tuned client made every client below it look
+ * explicitly-agented and the refusal above would have fired on a retune the README documents.
+ */
+test('an auto-built dispatcher stays retunable however many times it is extended', async () => {
+  const tuned = new Gotlike({connections: 128});
+
+  assert.strictEqual(tuned.explicitAgent, false);
+
+  let derived: Gotlike = tuned;
+
+  for (let depth = 0; depth < 3; depth++) {
+    derived = derived.extend({headers: {'x-depth': String(depth)}});
+
+    assert.strictEqual(derived.explicitAgent, false, `depth ${depth}`);
+    assert.strictEqual(derived.ownAgent, tuned.ownAgent, `depth ${depth} rebuilt the dispatcher`);
+  }
+
+  const retuned = derived.extend({connections: 4});
+
+  assert.notStrictEqual(retuned.ownAgent, tuned.ownAgent);
+
+  const response = await retuned.get<{test: string}>('http://localhost:3000/json', {responseType: 'json'});
+
+  assert.strictEqual(response.body.test, 'value');
+});
+
+/** A client with no dispatcher of its own still has nothing to hand down. */
+test('extending a client with no dedicated agent leaves the child on the global dispatcher', () => {
+  const parent = new Gotlike({followRedirect: false, decompress: false});
+  const child = parent.extend({headers: {'x-child': '1'}});
+
+  assert.strictEqual(parent.ownAgent, undefined);
+  assert.strictEqual(child.ownAgent, undefined);
+  assert.strictEqual(child.agent, getGlobalDispatcher());
 });
 
 test('followRedirect false explicitly still resolves with the redirect response', async () => {
@@ -2930,6 +3785,47 @@ test('validation runs on create and extend, throwing synchronously', () => {
  * Only reachable at create/extend time, since `retry`/`hooks` are client-only options and a
  * per-request `{retry: {...}}` is refused before ever reaching the nested check.
  */
+/**
+ * A bad `searchParams` / `form` *value* is a configuration mistake like any other.
+ *
+ * `validateOptions` checks the container's shape and stopped there, so a value it cannot
+ * serialise was only found by `queryValue` when the query was built - inside `call()`'s
+ * pre-request try, which wrapped it into a `RequestError`. The message and the code survived;
+ * the class did not, so the identical mistake one option along (`responseType: 'jsn'`) threw a
+ * `ValidationError` while this one reported itself as a transport failure and ran the
+ * `beforeError` hooks on the way out. The two classes are the whole error contract and the
+ * distinction is a pinned divergence from got, so it has to hold on every route.
+ *
+ * And on a *client* it was not rejected at all: the client constructed, and then every request
+ * it ever made failed, with nothing said at the call site that built it.
+ */
+test('a searchParams or form value that cannot be serialised is a ValidationError', async () => {
+  const bad: {label: string; options: RequestOptions}[] = [
+    {label: 'a searchParams object value', options: {searchParams: {a: {b: 1} as never}}},
+    {label: 'a searchParams object inside an array', options: {searchParams: {a: [{b: 1}] as never}}},
+    {label: 'a form object value', options: {form: {a: {b: 1} as never}}},
+  ];
+
+  for (const {label, options} of bad) {
+    const error = await failure<ValidationError>(client.get('http://localhost:3000/json', options));
+
+    assert.ok(error instanceof ValidationError, `${label} on a call: got ${error.constructor.name}`);
+    assert.strictEqual(error.code, 'ERR_INVALID_OPTION', label);
+    assert.match(error.message, /must be a string, number, boolean or an array of those/, label);
+
+    // Create and extend say so where the client is written, rather than once per request for
+    // the rest of its life.
+    assert.throws(() => new Gotlike(options), ValidationError, `${label} on create`);
+    assert.throws(() => client.extend(options), ValidationError, `${label} on extend`);
+  }
+
+  // The shapes that are legal stay legal, arrays and `null`/`undefined` entries included.
+  assert.doesNotThrow(
+    () => new Gotlike({searchParams: {a: 1, b: ['x', 'y'], c: null, d: undefined, e: true}, form: {f: 'g'}}),
+  );
+  assert.doesNotThrow(() => new Gotlike({searchParams: 'a=1', form: new URLSearchParams('b=2')}));
+});
+
 test('an unknown key inside retry is rejected rather than silently ignored', () => {
   assert.throws(() => new Gotlike({retry: {limt: 0} as never}), {
     name: 'ValidationError',
@@ -3613,21 +4509,45 @@ test('a HEAD response is not parsed as json', async () => {
   assert.strictEqual(response.body, undefined);
 });
 
-/**
- * V8 words JSON failures differently depending on the input - "Unexpected end of JSON input"
- * for an empty body against "... is not valid JSON" for garbage. Matching on the wording
- * misfiled empty bodies as `ERR_REQUEST_ERROR`.
+/*
+ * An empty body is never a parse failure, whatever the status.
+ *
+ * `hasNoBody` covers only the statuses that *cannot* carry a body - 204, 205, 304 and HEAD - so
+ * every other status with a zero-length one fell into `JSON.parse('')` and came back out as a
+ * `ParseError`. Those are ordinary responses: a `201 Created` with nothing in it, a `200` with
+ * `content-length: 0`, a `3xx` read with `followRedirect` off. Measured against got 16, which
+ * resolves all of them with `body: ''` - its `parseBody` tests `rawBody.length === 0` before it
+ * ever reaches the JSON codec.
+ *
+ * A table rather than one case, because the bug was a status range rather than a wrong answer:
+ * the bodyless statuses were handled and every other one was not.
  */
-test('an empty body is a parse error, not a generic request error', async () => {
-  const err = await failure(
-    client.get('http://localhost:3000/status?code=200', {
-      responseType: 'json',
-    }),
-  );
+test('an empty body resolves as an empty string on every status that can carry one', async () => {
+  const outcomes: Record<number, unknown> = {};
 
-  assert.ok(err instanceof ParseError, `expected a ParseError, got ${err.name}`);
-  assert.strictEqual(err.code, 'ERR_BODY_PARSE_FAILURE');
-  assert.strictEqual(err.response?.body, '');
+  for (const code of [200, 201, 202, 302, 404, 500]) {
+    const response = await client.get(`http://localhost:3000/status?code=${code}`, {
+      responseType: 'json',
+      // Off, so the status itself is not what ends the request - the question here is only
+      // whether the empty body parses.
+      throwHttpErrors: false,
+    });
+
+    outcomes[code] = response.body;
+  }
+
+  assert.deepStrictEqual(outcomes, {200: '', 201: '', 202: '', 302: '', 404: '', 500: ''});
+});
+
+/*
+ * And the bodyless statuses keep their `undefined`, which is a recorded divergence from got's
+ * `''` rather than the same bug - pinned here so closing the one above cannot quietly change it.
+ */
+test('a bodyless status still reads as undefined under responseType json', async () => {
+  const response = await client.get('http://localhost:3000/status?code=204', {responseType: 'json'});
+
+  assert.strictEqual(response.statusCode, 204);
+  assert.strictEqual(response.body, undefined);
 });
 
 test('aborting an in-flight request gives an AbortError', async () => {
@@ -3648,6 +4568,18 @@ test('an already-aborted signal fails immediately', async () => {
   const err = await failure(client.get('http://localhost:3000/json', {signal: AbortSignal.abort()}));
 
   assert.strictEqual(err.code, 'ERR_ABORTED');
+
+  /*
+   * And on the other route into the signal. With a `timeout.request` the caller's signal is not
+   * handed to undici as it stands - it is forwarded onto the deadline's own controller through a
+   * listener `release` can take back off (see `requestSignal`) - and a listener is no use for a
+   * signal that has already fired, so that case has to be carried over by hand.
+   */
+  const timed = await failure(
+    client.get('http://localhost:3000/json', {signal: AbortSignal.abort(), timeout: {request: 5000}}),
+  );
+
+  assert.strictEqual(timed.code, 'ERR_ABORTED');
 });
 
 /**
@@ -3918,7 +4850,7 @@ test('rawBody is the bytes that arrived, not a re-serialisation of the parsed js
 test('searchParams and form repeat a key for an array value', async () => {
   const response = await client.get<Echo>('http://localhost:3000/echo', {
     responseType: 'json',
-    searchParams: {a: [1, 2], b: 'z', dropped: null},
+    searchParams: {a: [1, 2], b: 'z', dropped: undefined},
   });
 
   assert.strictEqual(response.body.url, '/echo?a=1&a=2&b=z');
@@ -3931,10 +4863,22 @@ test('searchParams and form repeat a key for an array value', async () => {
   assert.strictEqual(posted.body.body, 'a=x&a=y');
 });
 
-test('an empty url resolves to the prefix itself, with no trailing slash added', async () => {
-  const prefixed = client.extend({prefixUrl: 'http://localhost:3000/echo', responseType: 'json'});
+/*
+ * got normalises `prefixUrl` to end in `/` and resolves `''` against it, so `client.get('')`
+ * requests the directory form. Handing back the prefix verbatim put a different path on the
+ * wire - `GET /echo` where got sends `GET /echo/` - which a server is free to answer with a 301
+ * (not followed by default here, so it surfaces as the redirect itself) or a 404. Only ever
+ * differed for a `prefixUrl` written *without* a trailing slash, which is the form the README's
+ * own examples use.
+ */
+test('an empty url resolves to the prefix with its trailing slash, as got does', async () => {
+  for (const prefixUrl of ['http://localhost:3000/echo', 'http://localhost:3000/echo/']) {
+    const prefixed = client.extend({prefixUrl, responseType: 'json'});
 
-  assert.strictEqual((await prefixed.get<Echo>('')).body.url, '/echo');
+    assert.strictEqual((await prefixed.get<Echo>('')).body.url, '/echo/', prefixUrl);
+    // And with a query on top, which is appended to the same joined url.
+    assert.strictEqual((await prefixed.get<Echo>('', {searchParams: {a: '1'}})).body.url, '/echo/?a=1', prefixUrl);
+  }
 });
 
 test("an afterResponse retry does not write back onto the first attempt's options", async () => {
@@ -4393,6 +5337,10 @@ test('a truncated body on a bodyless stream is a RequestError with beforeError a
   assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
   // undici describes this one itself, so its own code is what comes through.
   assert.deepStrictEqual(seen, ['UND_ERR_SOCKET']);
+  // The head arrived, so the error carries it - `error.response` is documented as undefined
+  // *only* for a failure that happened before a response. `call()` always honoured that; this
+  // path handed back undefined for a response it had already seen and reported the head of.
+  assert.strictEqual(error.response?.statusCode, 200);
 });
 
 test('a truncated body on an upload stream is a RequestError with beforeError applied', async () => {
@@ -4406,6 +5354,72 @@ test('a truncated body on an upload stream is a RequestError with beforeError ap
 
   assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
   assert.deepStrictEqual(seen, ['UND_ERR_SOCKET']);
+  assert.strictEqual(error.response?.statusCode, 200);
+});
+
+/**
+ * The whole of `error.response`'s contract, on every stream failure at once.
+ *
+ * Each row is a stream failure and whether a response had arrived when it happened; the
+ * assertion is the documented rule - `error.response` is populated exactly when one had.
+ * A table rather than a test per path, for the reason the error-contract table exists: the bug
+ * was one path reporting differently from the others, not a wrong answer on a covered one.
+ */
+test('a stream failure carries the response exactly when one had arrived', async () => {
+  // The upload path's writable half is the request body, so it has to be ended or the request is
+  // never dispatched at all - which is a 90-second server timeout rather than the failure under
+  // test.
+  const upload = async (url: string): Promise<Error> => {
+    const duplex = await client.stream(url, {method: 'POST'});
+
+    duplex.end('body');
+
+    return failure(text(duplex));
+  };
+
+  const rows: {label: string; failed: () => Promise<Error>; statusCode?: number}[] = [
+    {
+      label: 'bodyless, truncated mid-body',
+      failed: async () => failure(text(await client.stream('http://localhost:3000/truncate'))),
+      statusCode: 200,
+    },
+    {
+      label: 'upload, truncated mid-body',
+      failed: () => upload('http://localhost:3000/truncate'),
+      statusCode: 200,
+    },
+    {
+      label: 'bodyless, throwHttpErrors',
+      failed: async () => failure(text(await client.stream('http://localhost:3000/status?code=404'))),
+      statusCode: 404,
+    },
+    {
+      label: 'upload, throwHttpErrors',
+      failed: () => upload('http://localhost:3000/status?code=404'),
+      statusCode: 404,
+    },
+    {
+      // No response ever came, so there is none to carry - the one case the docs say is undefined.
+      label: 'bodyless, connection refused',
+      failed: async () => failure(text(await client.stream('http://127.0.0.1:1/nothing'))),
+    },
+    {
+      label: 'upload, connection refused',
+      failed: () => upload('http://127.0.0.1:1/nothing'),
+    },
+  ];
+
+  const actual: string[] = [];
+  const expected: string[] = [];
+
+  for (const {label, failed, statusCode} of rows) {
+    const error = (await failed()) as RequestError;
+
+    actual.push(`${label}: ${error.response === undefined ? 'no response' : `response ${error.response.statusCode}`}`);
+    expected.push(`${label}: ${statusCode === undefined ? 'no response' : `response ${statusCode}`}`);
+  }
+
+  assert.deepStrictEqual(actual, expected);
 });
 
 test('stream.errored reports the normalised error, not undici’s raw one', async () => {
@@ -4504,6 +5518,22 @@ test('a redirect chain that exceeds the limit is an HTTPError', async () => {
   assert.strictEqual(error.response?.statusCode, 302);
 });
 
+test('a streamed failure names the url that answered, not the one requested', async () => {
+  const redirecting = client.extend({followRedirect: true});
+
+  // A chain longer than `maxRedirections`, so undici gives up and the 302 itself reaches us -
+  // which `isHttpError` treats as an error precisely because redirects were being followed.
+  const stream = await redirecting.stream('http://localhost:3000/hop/0');
+  const error = await failure<RequestError>(text(stream));
+
+  assert.ok(error instanceof HTTPError, `expected an HTTPError, got ${error}`);
+  assert.strictEqual(error.response?.statusCode, 302);
+  // The last hop, not `/hop/0`. `response.url` follows the same rule on the promise API, and the
+  // error a stream raises is built from the same head - one place reading `redirects.lastUrl`
+  // rather than three, so a stream's error cannot start naming a url the response never came from.
+  assert.strictEqual(String(error.response?.url), 'http://localhost:3000/hop/10');
+});
+
 test('an exceeded redirect chain still resolves with throwHttpErrors off', async () => {
   const redirecting = client.extend({followRedirect: true, throwHttpErrors: false});
 
@@ -4576,6 +5606,95 @@ test('an `@` in the path is not mistaken for credentials', async () => {
 
   assert.strictEqual(response.body.url, '/echo/@me');
   assert.strictEqual(response.body.headers['authorization'], undefined);
+});
+
+/*
+ * The authority scan has to stop where WHATWG URL stops, and a backslash is one of the places it
+ * does: for the special schemes this client sends, `\` is a path separator. So
+ * `http://host\@other/p` is host `host` with the path `/@other/p` to `new URL`, to undici and to
+ * got - while a scan that only stopped at `/?#` read `host\` as userinfo and **rewrote the url to
+ * `http://other/p`**, sending the request, and an `Authorization` minted out of the fake userinfo,
+ * to a host no parser had ever named.
+ *
+ * That is an SSRF filter walking straight through: an application allowlists
+ * `new URL(input).hostname`, passes the string on, and the request lands somewhere else. Only
+ * reachable with `parseUserinfo` on, which is the default - so the default was the unsafe one.
+ *
+ * Driven against the parser rather than against a literal: what is being pinned is that the two
+ * agree about the host, for every character that ends an authority.
+ */
+test('a url is sent to the host its own parser names, whatever ends the authority', async () => {
+  const failures: string[] = [];
+
+  for (const url of [
+    'http://localhost:3000\\@evil.test/echo',
+    'http://localhost:3000\\evil.test/echo',
+    'http://localhost:3000/echo?x=@evil.test',
+    'http://localhost:3000/echo#@evil.test',
+    // The ordinary case still has to work: this one really is userinfo.
+    'http://alice:s3cret@localhost:3000/echo',
+  ]) {
+    // `text`, because what these urls resolve to is not the `/echo` route and the body is
+    // beside the point - the only question is which host the request was addressed to.
+    const response = await client.get(url, {responseType: 'text', throwHttpErrors: false});
+    const reached = new URL(String(response.request.options.url)).host;
+    const expected = new URL(url).host;
+
+    if (reached !== expected) {
+      failures.push(`${url}: new URL says ${expected}, the request went to ${reached}`);
+    }
+  }
+
+  assert.deepStrictEqual(failures, []);
+});
+
+/*
+ * ASCII tab, LF and CR are stripped out of a url before WHATWG parses it, so they can never
+ * reach `URL.username`/`URL.password` - and must not reach the credentials derived here either.
+ * Measured against got 16, which base64s `uv:pw` for this url.
+ */
+test('tabs and newlines are stripped out of url credentials, as the URL parser strips them', async () => {
+  const response = await client.get<Echo>('http://u\tv:p\nw@localhost:3000/echo', {responseType: 'json'});
+
+  assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from('uv:pw').toString('base64'));
+});
+
+/*
+ * Empty is not the same as absent. got keeps credentials on a `URL` and node's
+ * `urlToHttpOptions` derives `auth` only when `url.username || url.password`, so all three rows
+ * below go out anonymous there. Testing `!== undefined` sent `Authorization: Basic Og==` for
+ * every one of them - an anonymous credential an upstream is free to reject or log, produced by a
+ * `{username: config.user ?? ''}` that meant "no credentials at all".
+ */
+test('empty credentials send no authorization header, as they send none in got', async () => {
+  const rows: {where: string; options: RequestOptions; url: string}[] = [
+    {where: 'username: ""', options: {username: ''}, url: 'http://localhost:3000/echo'},
+    {where: 'username and password empty', options: {username: '', password: ''}, url: 'http://localhost:3000/echo'},
+    {where: 'empty userinfo in the url', options: {}, url: 'http://@localhost:3000/echo'},
+  ];
+
+  const failures: string[] = [];
+
+  for (const row of rows) {
+    const response = await client.get<Echo>(row.url, {...row.options, responseType: 'json'});
+
+    if (response.body.headers['authorization'] !== undefined) {
+      failures.push(`${row.where}: sent ${response.body.headers['authorization']}`);
+    }
+  }
+
+  // ...and the userinfo still comes off the url, which is what every parser does with it.
+  const stripped = await client.get<Echo>('http://@localhost:3000/echo', {responseType: 'json'});
+
+  assert.strictEqual(String(stripped.request.options.url), 'http://localhost:3000/echo');
+  assert.deepStrictEqual(failures, []);
+});
+
+// A password on its own is still a credential, so the "empty" rule above must not swallow it.
+test('a password with no username still authenticates', async () => {
+  const response = await client.get<Echo>('http://localhost:3000/echo', {responseType: 'json', password: 'secret'});
+
+  assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from(':secret').toString('base64'));
 });
 
 /*
@@ -5106,6 +6225,98 @@ test('the beforeRequest hook bookkeeping is off the options again by the time th
   // And the tracking still did its job while the hooks were running.
   assert.strictEqual(dispatched.headers['x-log-id'], 'abc');
   assert.strictEqual(response.body.body, 'PAYLOAD');
+});
+
+/**
+ * `delete options.body` in a hook means what it says, on a client with hooks as on one without.
+ *
+ * The accessor that write-tracking installs on `options.body` is configurable, so deleting the
+ * property took the accessor with it: the setter never fired, `writes.body` stayed false, and
+ * `restore()` re-defined `body` from the value it had held before the hooks ran - putting the
+ * body the hook had just removed back on the wire. Assignment (`options.body = undefined`) went
+ * through the setter and worked, so the two spellings of one intent disagreed, and so did two
+ * clients running the identical hook: without `beforeRequest` hooks there is no accessor to
+ * delete and the delete has always worked.
+ *
+ * Both spellings are driven here, against a client that has hooks and one that doesn't, because
+ * it is the disagreement between them that was the bug.
+ */
+test('a beforeRequest hook that deletes options.body sends no body', async () => {
+  const removals: [string, (options: RequestOptions) => void][] = [
+    ['delete', (options) => void delete options.body],
+    [
+      'assign undefined',
+      (options) => {
+        options.body = undefined;
+      },
+    ],
+  ];
+
+  const sent: string[] = [];
+
+  for (const [label, remove] of removals) {
+    const extClient = client.extend({responseType: 'json', hooks: {beforeRequest: [remove]}});
+    const response = await extClient.post<Echo>('http://localhost:3000/echo', {json: {a: 1}});
+
+    sent.push(`${label}: ${JSON.stringify(response.body.body)}`);
+  }
+
+  assert.deepStrictEqual(sent, ['delete: ""', 'assign undefined: ""']);
+});
+
+/**
+ * And the delete counts as the hook having spoken, so the cross-origin strip reads it the way it
+ * reads an assignment rather than putting its own interpretation back over the top - the same
+ * rule a deleted *header* already gets.
+ *
+ * Asserted as an agreement between the two spellings rather than against a fixed expectation:
+ * what the request carries here (no body, and the `content-type` the hook never touched) is the
+ * pre-existing behaviour of `options.body = undefined`, and the point is that `delete` no longer
+ * differs from it.
+ */
+test('a cross-origin hook that deletes the body strips it the way an assignment does', async () => {
+  const removals: [string, (options: RequestOptions) => void][] = [
+    ['delete', (options) => void delete options.body],
+    [
+      'assign undefined',
+      (options) => {
+        options.body = undefined;
+      },
+    ],
+  ];
+
+  const sent: string[] = [];
+
+  for (const [, remove] of removals) {
+    const extClient = client.extend({
+      responseType: 'json',
+      hooks: {
+        beforeRequest: [
+          (options) => {
+            remove(options);
+            options.url = 'http://localhost:3000/echo/moved';
+          },
+        ],
+      },
+    });
+
+    const response = await extClient.post<Echo>('http://127.0.0.1:3000/echo', {
+      json: {a: 1},
+      headers: {authorization: 'Bearer secret'},
+    });
+
+    sent.push(
+      JSON.stringify({
+        body: response.body.body,
+        contentType: response.body.headers['content-type'] ?? null,
+        authorization: response.body.headers['authorization'] ?? null,
+      }),
+    );
+  }
+
+  assert.strictEqual(sent[0], sent[1], 'delete and assignment disagree on a cross-origin move');
+  // The body is gone either way, and the credentials the hook never touched did not travel.
+  assert.deepStrictEqual(JSON.parse(sent[0]!), {body: '', contentType: 'application/json', authorization: null});
 });
 
 // A default port written out is the same origin, which is why the comparison falls back to
@@ -6752,6 +7963,12 @@ test('every failure path reports a RequestError or a ValidationError, never a ra
     ],
     // Configuration mistakes, on both routes into `call()`.
     ['a bad option on the call', () => client.get('http://localhost:3000/json', {responseType: 'jsn' as never})],
+    [
+      // Not caught by `validateOptions`, which checks the container and not the values - this
+      // one is raised by `queryValue` from inside `call()`'s pre-request work instead.
+      'a searchParams value that cannot be serialised',
+      () => client.get('http://localhost:3000/json', {searchParams: {a: {b: 1} as never}}),
+    ],
     [
       'a bad option on an afterResponse retry',
       () =>

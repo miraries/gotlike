@@ -112,13 +112,18 @@ Supports:
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
 | `retry.calculateDelay`, `retry.noise`, `hooks.init` | accepted | a **`ValidationError`** naming the option - "not implemented", not "unknown". Ignoring them would mean a backoff tuning that silently never applies and an `init` hook that silently never fires, which is the failure the unknown-key check exists to stop. Drop them, or cap the backoff with `retry.backoffLimit` and move `init` work into `beforeRequest` |
 | an unknown key in `retry` or `hooks` | accepted and ignored | a **`ValidationError`**. `retry: { limt: 0 }` used to leave the *default* two retries in place, and a misspelled hook name simply never fired |
+| an agent-level option alongside an explicit `agent`, or on a client built with one | n/a - got's `agent` is per-protocol | a **`ValidationError`** either way round. A `ProxyAgent` or `H2CClient` cannot be rebuilt from `connections`, so the option can only be silently ignored (named beside the agent) or silently replace your dispatcher with a plain `undici.Agent` (named on a client that already has one) - and for a proxy agent, that means every request going direct. Pass a new `agent` configured the way you want instead |
+| `form: { a: null }`, `form: { a: undefined }` | `a=null`, `a=undefined` - got serialises `form` with `new URLSearchParams(form)`, which stringifies both | `a=` and **dropped**, the same rule `searchParams` uses. got's is a serialisation artefact rather than an intent - it is not what got itself does with those values in `searchParams`, and no server wants the four characters `null` in a form field |
+| `form: { a: [1, 2] }` | `a=1%2C2` - the same `new URLSearchParams(form)` artefact | `a=1&a=2`, **repeating the key**, which is how a multi-valued form field is actually carried. A silent wire difference for an identical call, so check any `form` you are porting that passes an array |
+| `searchParams: { a: [1, 2] }` | **rejected** - got's `searchParams` takes one string, number, boolean or `null` per key and validates the value | `a=1&a=2`, repeating the key. More permissive rather than different on the wire, so nothing breaks moving *to* gotlike - but code moving back to got will |
 
 ### Forced by undici
 
 | | behaviour |
 | --- | --- |
-| `timeout.request` | a cap on a whole **attempt**, as got's is - it covers every phase, and it starts over for each retry rather than being a budget for the sequence. undici's own `headersTimeout`/`bodyTimeout` are per-phase and `bodyTimeout` restarts on every chunk, so a slowly trickling response would never trip them - a deadline signal enforces the total on top. That also sidesteps undici's coarse 1s timer wheel, so sub-second timeouts fire on time |
-| `retry` | maps onto undici's `retry` interceptor. `limit` defaults to got's 2, and `Retry-After` is honoured, but `calculateDelay`/`noise` are not implemented (and are *rejected* rather than ignored - see the table above) and `maxRetryAfter` degrades to "honour the header or don't". The retried **status codes and methods are undici's defaults**, not got's - set `statusCodes`/`methods` explicitly if that matters |
+| `timeout.request` | a cap on a whole **attempt**, as got's is - it covers every phase, and it starts over for each retry rather than being a budget for the sequence. undici's own `headersTimeout`/`bodyTimeout` are per-phase and `bodyTimeout` restarts on every chunk, so a slowly trickling response would never trip them - a deadline signal enforces the total on top. That also sidesteps undici's coarse 1s timer wheel, so sub-second timeouts fire on time. See the retry rows below for the one case where the deadline waits before it fires |
+| `retry` | maps onto undici's `retry` interceptor. `limit` defaults to got's 2, and `Retry-After` is honoured, but `calculateDelay`/`noise` are not implemented (and are *rejected* rather than ignored - see the table above) and `maxRetryAfter` degrades to "honour the header or don't". The retried **status codes and methods are undici's defaults**, not got's - set `statusCodes`/`methods` explicitly if that matters. `errorCodes` defaults to undici's list *plus* the two codes it raises for a timeout, since got retries a timeout by default; got's own spelling, `ETIMEDOUT`, is accepted in the list and translated |
+| a timed-out attempt | **retried**, as got retries one - but only for a `timeout.request` of **1s or more**. undici cannot report a timeout of its own any sooner than that (`RESOLUTION_MS` in its timer wheel), and a timeout the *deadline signal* reports is one undici will never retry - an aborted dispatch is the one failure its `RetryHandler` propagates outright. So above 1s the deadline waits up to 700ms past `timeout.request` for undici's own, retryable, timeout to fire, and below it the deadline stays exact and the attempt is not retried: failing at 1.7s for a caller who asked for 100ms is the worse of the two trades. Only the *failure* of an attempt is ever delayed, never a request that succeeds, and the waiting stops as soon as a response head has arrived - so a trickling body keeps its exact bound |
 | `beforeRedirect`, `beforeRetry` | **cannot delay or cancel** - undici decides both inside a synchronous dispatch interceptor, so a returned promise is not awaited |
 | `300 Multiple Choices` | **followed** when `followRedirect` is on, because undici's redirect interceptor counts 300 as redirectable. got 15 stopped following it (RFC 9110 makes it a SHOULD for user agents) and hands the 300 back instead. 304 is not followed by either |
 | streamed request bodies | **not replayed across a 307/308**, which must preserve method and body. 301/302/303 are fine (they rewrite to GET and drop the body); non-streamed bodies replay normally |
@@ -161,6 +166,33 @@ const client = gotlike.extend({
 
 Interceptors are only composed when the corresponding option is set, and the whole chain is
 built once per client rather than per request.
+
+**`extend()` shares the dispatcher**, so deriving clients does not multiply connection pools:
+
+```ts
+const tuned = gotlike.extend({ connections: 128 });
+
+tuned.extend({ prefixUrl: 'https://a.example' }); // same pool as `tuned`
+tuned.extend({ prefixUrl: 'https://b.example' }); // same pool again
+tuned.extend({ connections: 4 });                 // names the transport, so its own pool
+```
+
+An extension that names `agent` or any of the options above gets the dispatcher its own options
+describe; anything else inherits the parent's, sockets and keep-alive included.
+
+One exception, and it is a `ValidationError` rather than a surprise: the options above cannot be
+applied to a client you gave an explicit `agent`. There is no way to ask a `ProxyAgent` or an
+`H2CClient` for a copy of itself with `connections` changed, so honouring the option would mean
+replacing your dispatcher with a plain `undici.Agent` - which for a proxy agent means every
+request going out **direct**, with nothing on the wire to say so. Pass a new `agent` instead:
+
+```ts
+const proxied = gotlike.extend({ agent: new EnvHttpProxyAgent() });
+
+proxied.extend({ prefixUrl: 'https://a.example' });      // keeps the proxy
+proxied.extend({ connections: 128 });                    // ValidationError
+proxied.extend({ agent: new EnvHttpProxyAgent({ connections: 128 }) }); // this is how
+```
 
 ### Where the time actually goes
 
@@ -277,7 +309,8 @@ url written differently (`http://h:80/` against `http://h/`, a host in another c
 same origin.
 
 `beforeError` runs for streamed requests too - for *every* stream failure, not just an error status
-- and a stream's `HTTPError` carries the same `error.response` a non-streamed one does.
+- and a stream's `HTTPError` carries the same `error.response` a non-streamed one does. It does not run when
+*you* destroy the stream; see [Errors](#errors).
 
 `afterResponse` is the one hook that does **not** run for `stream()`: there is no parsed body to
 hand it, and a streamed request can't be replayed. got scopes it to its promise API for the same
@@ -292,7 +325,10 @@ response, `error` for one that failed before its headers arrived. Exactly one of
 
 `retryWithMergedOptions` re-runs the request with `newOptions` merged over the ones it was sent
 with (`headers`, `context`, `searchParams` and `timeout` merge one level deep, everything else is
-replaced). It goes straight
+replaced). A key you pass as `undefined` leaves the first attempt's value standing rather than
+clearing it, as it does everywhere else here and as it does in got - so forwarding
+`{method: req.method, throwHttpErrors: cfg.throwHttpErrors}` from somewhere those can be absent
+retries the request as it was rather than as a `GET` that no longer throws. It goes straight
 back to the request - handlers already ran and are not re-entered.
 
 The retried response is passed to the hooks *before* the one that retried, and no further - so a
@@ -352,6 +388,19 @@ console.log(head.statusCode, head.headers, head.timings.phases.total);
 
 await pipeline(stream, createWriteStream('file'));
 ```
+
+The `response` event is emitted **before any of the body reaches you**, as got's is, so the
+proxying shape works written either way round:
+
+```js
+const stream = await client.stream(url);
+
+stream.on('response', (head) => res.writeHead(head.statusCode, head.headers));
+stream.pipe(res);   // the head is already out by the time the first chunk is
+```
+
+The one ordering that is not guaranteed is a `data` listener attached *before* a `response` one -
+there, `response` still arrives, but after the first chunk.
 
 Unlike got's, `stream()` resolves to the duplex rather than returning it synchronously - the
 `beforeRequest` hooks are async and awaiting them is worth more than a synchronous return.
@@ -452,7 +501,7 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 | --- | --- | --- |
 | `HTTPError` | `ERR_NON_2XX_3XX_RESPONSE` | `throwHttpErrors` is on and the status is outside 2xx - plus a 3xx that reached you *while following redirects*, which means the chain outran `maxRedirects`. A 3xx with `followRedirect` off is not an error, and a 304 never is |
 | `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request`, or an `AbortSignal.timeout()` fired |
-| `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType`, on a status that was otherwise fine. On an error status the status wins: the body is left as the text that arrived, the hooks still see it, and `throwHttpErrors` decides - so a 500 carrying a proxy's HTML page is an `HTTPError`, not a parse failure |
+| `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType`, on a status that was otherwise fine. An *empty* body is never a parse failure, whatever the status. On an error status the status wins: the body is left as the text that arrived, the hooks still see it, and `throwHttpErrors` decides - so a 500 carrying a proxy's HTML page is an `HTTPError`, not a parse failure |
 | `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
 | `RequestError` | the underlying error's own `code`, or `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
 
@@ -463,8 +512,11 @@ log line and APM group that prints the error. The path identifies the request; t
 leaks. `error.response.request.options.url` still carries the url the request actually went to.
 
 `ValidationError` (`ERR_INVALID_OPTION`) is the one failure that is **not** a `RequestError`, and
-deliberately so: it means the client was configured wrong rather than that a request failed, and it
-is thrown synchronously from create, extend or the call itself, before anything reaches the network.
+deliberately so: it means the client was configured wrong rather than that a request failed. Create
+and extend throw it synchronously; a call rejects with it, like any other failure, before anything
+reaches the network. It stays a `ValidationError` on every route - including the values inside a
+`searchParams` or `form`, which are only checked as the query is built, and including one raised
+from inside an `afterResponse` retry.
 
 `error.message` is the underlying failure's own - `connect ECONNREFUSED 127.0.0.1:443`,
 `getaddrinfo ENOTFOUND …` - not a generic label, so a log line or an APM grouping can tell one
@@ -488,6 +540,11 @@ hooks applied, whether the failure came before the response head (connection ref
 download). `stream.errored`, the `error` event, `stream.response` and `stream.pipeline` all report
 the identical normalised error - undici's raw `SocketError`/`DOMException` never reaches you.
 
+This covers the *request's* failures only. Destroying the stream yourself - `stream.destroy()`, a `for await`
+with a `break`, a `pipeline` whose destination fails - is not a failed request: the error is passed through as
+it stands and the `beforeError` hooks do not run. That matters most where it is easiest to miss, in a proxy:
+a client disconnecting mid-download would otherwise be reported as an upstream failure on every hang-up.
+
 A failure that arrives before the response head is emitted to an `error` listener whether or not
 anything ever reads the stream, so the got-shaped pattern works as written:
 
@@ -506,7 +563,12 @@ attaches no listener.
 
 `204`, `205`, `304` and any `HEAD` response cannot carry a body, so none is parsed. With
 `responseType: 'json'` the body is `undefined`, with `text` it is `''`, and with `buffer` it is an
-empty `Buffer` - rather than a parse failure on an empty string.
+empty `Buffer` - rather than a parse failure on an empty string. (got hands back `''` for the json
+case; `undefined` is a deliberate divergence, pinned in the parity suite.)
+
+A status that *can* carry a body but didn't - a `201 Created` with nothing in it, a `200` with
+`content-length: 0`, a `3xx` read with `followRedirect` off - is not a parse failure either. Under
+`responseType: 'json'` it resolves with `''`, exactly as got does.
 
 ## Response
 
