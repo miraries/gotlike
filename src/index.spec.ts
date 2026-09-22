@@ -5685,6 +5685,237 @@ test('a RequestRetryError from a caller’s own retry interceptor keeps the last
   assert.strictEqual(error.response?.statusCode, 503, 'the exhausted retry must carry its last response');
 });
 
+/* ------------------------------------------- an option named as `undefined` is not a value */
+
+/*
+ * `{throwHttpErrors: opts.throwHttpErrors}` forwarded from a config that didn't set one is an
+ * ordinary thing to write, and a plain spread let the `undefined` win - so the client's own
+ * setting was turned off by a caller who had only meant to pass it along. got skips
+ * `undefined` when it merges options; `mergeOptions` is what makes that true here, and it
+ * covers every option at once rather than the handful anyone thought to guard.
+ */
+test('a per-call option named as undefined keeps the client’s own', async () => {
+  const strict = createClient({throwHttpErrors: true});
+
+  await assert.rejects(() => strict.get('http://localhost:3000/status?code=500', {throwHttpErrors: undefined}), {
+    name: 'HTTPError',
+  });
+});
+
+test('responseType named as undefined keeps the client’s own', async () => {
+  const jsonClient = createClient({responseType: 'json'});
+  const response = await jsonClient.get<{test: string}>('http://localhost:3000/json', {responseType: undefined});
+
+  // The buffer arm is what an `undefined` used to fall through to, so a Buffer here is the
+  // failure this pins - not merely "not parsed".
+  assert.deepStrictEqual(response.body, {test: 'value'});
+});
+
+test('followRedirect named as undefined keeps following', async () => {
+  const following = createClient({followRedirect: true});
+  const response = await following.get('http://localhost:3000/redirect', {followRedirect: undefined});
+
+  // Resolving with the 302 itself - the redirect page as a successful body - is the shape of
+  // the bug: `follows()` said no, so `maxRedirections` was 0 *and* the 3xx wasn't an error.
+  assert.strictEqual(response.statusCode, 200);
+});
+
+test('handlers named as undefined keeps the client’s chain', async () => {
+  let ran = false;
+
+  const handled = createClient({
+    handlers: [
+      (options, next) => {
+        ran = true;
+
+        return next(options);
+      },
+    ],
+  });
+
+  await handled.get('http://localhost:3000/json', {handlers: undefined});
+
+  assert.ok(ran, 'the client’s handler chain must still run');
+});
+
+test('searchParams named as undefined keeps the client’s query', async () => {
+  const scoped = createClient({searchParams: {apiKey: 'secret'}});
+  const response = await scoped.get<{url: string}>('http://localhost:3000/echo', {
+    searchParams: undefined,
+    responseType: 'json',
+  });
+
+  assert.strictEqual(response.body.url, '/echo?apiKey=secret');
+});
+
+test('timeout named as undefined keeps the client’s deadline', async () => {
+  const bounded = createClient({timeout: {request: 50}});
+
+  // The `/timeout` route never answers, so the only thing that can end this is the deadline
+  // the client carries - which an `undefined` used to drop, leaving the request unbounded.
+  await assert.rejects(() => bounded.get('http://localhost:3000/timeout', {timeout: undefined}), {
+    name: 'TimeoutError',
+  });
+});
+
+test('extending with an option named as undefined keeps the parent’s', async () => {
+  const child = createClient({throwHttpErrors: true}).extend({throwHttpErrors: undefined});
+
+  await assert.rejects(() => child.get('http://localhost:3000/status?code=500'), {name: 'HTTPError'});
+});
+
+/* ------------------------------------------------------------ a stream body on the upload path */
+
+/*
+ * `RequestOptions.body` declares `Readable`, and `call()` encodes a `FormData` into one before
+ * the stream paths are reached - so both arrived at `duplex.end(body)`, which takes only a
+ * string, `Buffer` or view. Every `stream.post` carrying either failed with a raw
+ * `ERR_INVALID_ARG_TYPE` about a "chunk", naming nothing a caller would recognise, while the
+ * same body through `post()` had always worked.
+ */
+test('a Readable body given to stream() is uploaded', async () => {
+  const upload = await client.stream('http://localhost:3000/echo', {
+    method: 'POST',
+    body: Readable.from(['hello', ' world']),
+  });
+
+  const echoed = JSON.parse(await text(upload)) as {method: string; body: string};
+
+  assert.strictEqual(echoed.method, 'POST');
+  assert.strictEqual(echoed.body, 'hello world');
+});
+
+test('a FormData body given to stream() is encoded and uploaded', async () => {
+  const form = new FormData();
+
+  form.set('field', 'value');
+
+  const upload = await client.stream('http://localhost:3000/echo', {method: 'POST', body: form});
+  const echoed = JSON.parse(await text(upload)) as {headers: Record<string, string>; body: string};
+
+  assert.match(echoed.headers['content-type'] ?? '', /^multipart\/form-data; boundary=/);
+  assert.match(echoed.body, /name="field"/);
+  assert.match(echoed.body, /\r\n\r\nvalue\r\n/);
+});
+
+/*
+ * `pipe` forwards no error and doesn't end its destination, so a body stream that broke
+ * mid-upload left the request hanging with nothing to report. Destroying the duplex is what
+ * `normaliseStreamErrors` is watching for, which is what turns it into a `RequestError`.
+ */
+test('a Readable body that fails mid-upload is reported as a RequestError', async () => {
+  const source = new Readable({
+    read() {
+      this.push('start');
+      this.destroy(new Error('the source gave up'));
+    },
+  });
+
+  const upload = await client.stream('http://localhost:3000/echo', {method: 'POST', body: source});
+  const error = await failure(text(upload));
+
+  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error.constructor.name}`);
+  assert.strictEqual(error.message, 'the source gave up');
+});
+
+/* ----------------------------------------------------- a polluted Object.prototype stays out */
+
+/*
+ * `validateOptions` was fixed for this once, with `Object.hasOwn` - but every other `for...in`
+ * here walks something a caller handed us too, and those run *after* validation has passed. So
+ * an enumerable property on `Object.prototype` (which is what a prototype-pollution bug in any
+ * dependency leaves behind) was appended to the query of every request and sent as a header on
+ * every request, past the check that exists to catch exactly this.
+ */
+test('a polluted Object.prototype adds neither a query parameter nor a header', async () => {
+  (Object.prototype as Record<string, unknown>)['Polluted'] = 'evil';
+
+  try {
+    const scoped = createClient({
+      headers: {'x-real': 'yes'},
+      searchParams: {base: '1'},
+      // Makes the dispatch-time unfolded-header scan run as well as the construction and
+      // per-call merges. Its inherited upper-case name must not trigger a second fold.
+      hooks: {beforeRequest: [() => undefined]},
+    });
+    const response = await scoped.get<{url: string; headers: Record<string, string>}>('http://localhost:3000/echo', {
+      searchParams: {q: '1'},
+      headers: {'x-call': 'yes'},
+      responseType: 'json',
+    });
+
+    assert.strictEqual(response.body.url, '/echo?base=1&q=1');
+    assert.ok(!Object.hasOwn(response.body.headers, 'polluted'));
+    assert.strictEqual(response.body.headers['x-real'], 'yes');
+    assert.strictEqual(response.body.headers['x-call'], 'yes');
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)['Polluted'];
+  }
+});
+
+/*
+ * The same pollution, non-writable: `lowercaseHeaders` copied it into a fresh object and the
+ * assignment threw, so building a client at all died with a raw `TypeError: Cannot assign to
+ * read only property` from inside a header merge.
+ */
+test('a non-writable polluted property does not break constructing a client', () => {
+  Reflect.defineProperty(Object.prototype, 'frozenPollution', {
+    value: 'evil',
+    enumerable: true,
+    writable: false,
+    configurable: true,
+  });
+
+  try {
+    assert.doesNotThrow(() => createClient({headers: {'x-real': 'yes'}}));
+  } finally {
+    delete (Object.prototype as Record<string, unknown>)['frozenPollution'];
+  }
+});
+
+/* --------------------------------------------------------------------- method case folding */
+
+/*
+ * got's `set method` uppercases; `httpMethods` is the upper-case list, so a lower-case method
+ * was a `ValidationError` here and an ordinary request there - a hard stop for code migrating
+ * over. With `validate: false` it was worse: the value slipped past the check and then missed
+ * `isBodyMethod`, putting a POST on the bodyless path.
+ */
+test('a lower-case method is folded rather than refused', async () => {
+  const response = await client.handle<{method: string; body: string}>(
+    {method: 'post' as 'POST', body: 'payload', responseType: 'json'},
+    'http://localhost:3000/echo',
+  );
+
+  assert.strictEqual(response.body.method, 'POST');
+  assert.strictEqual(response.body.body, 'payload');
+});
+
+test('a lower-case method is folded with validation off', async () => {
+  const unchecked = createClient({validate: false});
+  const response = await unchecked.handle<{method: string; body: string}>(
+    {method: 'post' as 'POST', body: 'payload', responseType: 'json'},
+    'http://localhost:3000/echo',
+  );
+
+  assert.strictEqual(response.body.method, 'POST', 'a mis-cased method must not reach isBodyMethod unfolded');
+  assert.strictEqual(response.body.body, 'payload');
+});
+
+test('a lower-case method on the client itself is folded', async () => {
+  const posting = createClient({method: 'post' as 'POST'});
+  const response = await posting.handle<{method: string}>({responseType: 'json'}, 'http://localhost:3000/echo');
+
+  assert.strictEqual(response.body.method, 'POST');
+});
+
+test('a method that is not an HTTP method is still refused', async () => {
+  await assert.rejects(() => client.handle({method: 'nope' as 'GET'}, 'http://localhost:3000/echo'), {
+    name: 'ValidationError',
+    code: 'ERR_INVALID_OPTION',
+  });
+});
+
 /*
  * Type-level assertions.
  *

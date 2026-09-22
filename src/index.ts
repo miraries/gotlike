@@ -871,6 +871,13 @@ function appendQuery(params: URLSearchParams, input: SearchParams): void {
   }
 
   for (const key in input) {
+    // Own properties only, here and at every other `for...in` over something a caller handed
+    // us. The prototype chain is walked too, so a library that had put an enumerable property
+    // on `Object.prototype` added it to the query of every request that went out.
+    if (!Object.hasOwn(input, key)) {
+      continue;
+    }
+
     const value = input[key];
 
     if (value === null || value === undefined) {
@@ -917,7 +924,9 @@ function mergeSearchParams(base: SearchParams, override: SearchParams): URLSearc
    */
   if (typeof override === 'object' && !(override instanceof URLSearchParams)) {
     for (const key in override) {
-      merged.delete(key);
+      if (Object.hasOwn(override, key)) {
+        merged.delete(key);
+      }
     }
 
     appendQuery(merged, override);
@@ -984,11 +993,17 @@ function hasNoBody(statusCode: number, method: string): boolean {
 }
 
 function hasHeader(headers: IncomingHttpHeaders, name: string): boolean {
-  if (headers[name] !== undefined) {
+  // Own properties throughout: an enumerable `Object.prototype` property would otherwise read
+  // as a header this request already carries, and suppress the `content-type` a body needs.
+  if (Object.hasOwn(headers, name) && headers[name] !== undefined) {
     return true;
   }
 
   for (const key in headers) {
+    if (!Object.hasOwn(headers, key)) {
+      continue;
+    }
+
     // The value has to be defined, not just the key present. `{'content-type': undefined}` is
     // how "unset" reaches undici everywhere else here, and counting it as a header that was
     // already set sent a json body with no `content-type` at all.
@@ -1029,8 +1044,11 @@ function lowercaseHeaders(headers?: IncomingHttpHeaders): IncomingHttpHeaders {
 
   for (const key in headers) {
     // Dropped rather than copied when unset, so `{'Content-Type': undefined}` doesn't survive
-    // as a key that `hasHeader` would have to keep second-guessing.
-    if (headers[key] !== undefined) {
+    // as a key that `hasHeader` would have to keep second-guessing. Own properties only: an
+    // enumerable property on `Object.prototype` was otherwise copied in here and sent as a
+    // header on every request - and a non-writable one made `new Gotlike(...)` itself die with
+    // a raw `TypeError` out of this loop.
+    if (Object.hasOwn(headers, key) && headers[key] !== undefined) {
       normalised[key.toLowerCase()] = headers[key];
     }
   }
@@ -1049,6 +1067,10 @@ function lowercaseHeaders(headers?: IncomingHttpHeaders): IncomingHttpHeaders {
  */
 function hasUnfoldedName(headers: IncomingHttpHeaders): boolean {
   for (const key in headers) {
+    if (!Object.hasOwn(headers, key)) {
+      continue;
+    }
+
     for (let i = 0; i < key.length; i++) {
       const code = key.charCodeAt(i);
 
@@ -1062,6 +1084,30 @@ function hasUnfoldedName(headers: IncomingHttpHeaders): boolean {
 }
 
 /**
+ * Fold a method to upper case, the way got's `set method` does.
+ *
+ * Methods are upper-case on the wire, and `httpMethods` is the upper-case list - so a caller
+ * writing `{method: 'post'}` got a `ValidationError` here where got would have normalised it
+ * and sent the request, which is a hard stop for code migrating over. Worse with
+ * `validate: false`, where the lower-case value slipped past the check and then missed
+ * `isBodyMethod`/`hasNoBody`, routing a POST down the bodyless path.
+ *
+ * Scanned before folding, as `hasUnfoldedName` scans: the answer is almost always "already
+ * upper case", and the scan allocates nothing where `toUpperCase()` may.
+ */
+function normaliseMethod<T extends string>(method: T): T {
+  for (let i = 0; i < method.length; i++) {
+    const code = method.charCodeAt(i);
+
+    if (code >= 97 && code <= 122) {
+      return method.toUpperCase() as T;
+    }
+  }
+
+  return method;
+}
+
+/**
  * Merge per-call headers over a set that is already lower-cased, folding the override's names
  * as they go in. Only the override is walked - the instance defaults are normalised once, at
  * construction, so re-folding them on every request would be wasted work on the hot path.
@@ -1070,6 +1116,10 @@ function mergeHeaders(base: IncomingHttpHeaders, override?: IncomingHttpHeaders)
   const merged: IncomingHttpHeaders = {...base};
 
   for (const key in override) {
+    if (!Object.hasOwn(override, key)) {
+      continue;
+    }
+
     merged[key.toLowerCase()] = override[key];
   }
 
@@ -1094,6 +1144,40 @@ function mergeTimeout(base?: Timeout, override?: Timeout): Timeout | undefined {
   }
 
   return {...base, ...override, request: override.request ?? base?.request};
+}
+
+/**
+ * Spread `override` over `base` into a fresh object, ignoring keys the override names as
+ * `undefined`.
+ *
+ * A key that is *present* with the value `undefined` wins a plain spread, and that is the
+ * shape a caller writes constantly: `{throwHttpErrors: opts.throwHttpErrors}`, forwarded from
+ * a config that didn't set one. got skips `undefined` when it merges options, so a plain
+ * spread was a silent divergence on every option at once - `throwHttpErrors` resolving a 500
+ * as a success, `responseType` falling past the `json`/`text` arms to the buffer one,
+ * `followRedirect` leaving a 302 to resolve as a success whose body is the redirect page,
+ * `handlers` skipping the client's own chain, and `searchParams`/`timeout` dropping the
+ * client's query and deadline. That last pair is the bug `mergeSearchParams` and `mergeTimeout`
+ * exist to prevent, arriving by the other route: both are guarded on `!== undefined`, which is
+ * exactly the case that never fires here.
+ *
+ * Repaired after the spread rather than replacing it. The spread is what carries the symbol
+ * keys `retryWithMergedOptions` tracks depth with, and the usual request names no `undefined`
+ * option at all - so the loop walks a handful of keys, finds nothing and writes nothing. The
+ * `undefined` test comes before `Object.hasOwn` for that reason: it rejects almost every key
+ * on one property read, and the ownership check only has to rule out an inherited key for the
+ * rare one that gets past it.
+ */
+function mergeOptions<T extends object>(base: T, override?: object): T {
+  const merged = {...base, ...override} as Record<string, unknown>;
+
+  for (const key in override) {
+    if (Object.hasOwn(override, key) && (override as Record<string, unknown>)[key] === undefined) {
+      merged[key] = (base as Record<string, unknown>)[key];
+    }
+  }
+
+  return merged as T;
 }
 
 /** Shallow-merge two optional records into a fresh object. */
@@ -2043,7 +2127,10 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
     invalid(`\`responseType\` must be one of ${responseTypes.join(', ')}, got \`${String(responseType)}\``);
   }
 
-  if (method !== undefined && !httpMethods.includes(method)) {
+  // Case-insensitively: got uppercases a method rather than refusing it, and so does
+  // `normaliseMethod` - validating against the raw value would reject what is about to be
+  // folded into something valid.
+  if (method !== undefined && !(typeof method === 'string' && httpMethods.includes(normaliseMethod(method)))) {
     invalid(`\`method\` must be a valid HTTP method, got \`${String(method)}\``);
   }
 
@@ -2192,7 +2279,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      * `buffer` instead of `text`. `FormedOptions` declares both as required, so the rest of the
      * code was right to trust them; this is what makes that true.
      */
-    const merged: RequestOptions = options ? {...defaultOptions, ...options} : {...defaultOptions};
+    const merged: RequestOptions = options ? mergeOptions(defaultOptions, options) : {...defaultOptions};
 
     /*
      * The same copies `extend()` makes, because a directly built client reached them by a
@@ -2203,6 +2290,11 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      */
     merged.hooks = mergeHooks(undefined, merged.hooks);
     merged.handlers = concatHooks(undefined, merged.handlers);
+
+    // Folded once here so `formOptions` only has to look at a per-call method.
+    if (merged.method !== undefined) {
+      merged.method = normaliseMethod(merged.method);
+    }
 
     this.baseOptions = merged;
     this.followsRedirects = merged.followRedirect === true;
@@ -2390,7 +2482,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     const base = this.baseOptions;
-    const formed = {...base, ...options} as FormedOptions;
+    // Not a plain spread: a per-call option present with the value `undefined` must not
+    // silently turn the client's own setting off. See `mergeOptions`.
+    const formed = mergeOptions(base, options) as FormedOptions;
 
     // A body belongs to one request, never to a client. got doesn't merge `json`/`body`/`form`
     // from the defaults and neither does this - a client built with `json` was otherwise
@@ -2464,7 +2558,11 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     if (method !== undefined) {
+      // The verb methods pass an upper-case literal, so the hot path needs no folding at all.
       formed.method = method;
+    } else if (options.method !== undefined) {
+      // The only method that can still be unfolded: the client's was folded at construction.
+      formed.method = normaliseMethod(options.method);
     } else if (formed.method === undefined) {
       // `stream()` and the callable form pass no method, and a client built without the
       // exported defaults carries none either. undici would fill this in, but `call()` routes
@@ -3308,7 +3406,28 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      * caller waits forever.
      */
     if (options.body !== undefined && options.body !== null) {
-      duplex.end(options.body);
+      /*
+       * A stream body is piped in, not handed to `end()`. `RequestOptions.body` declares
+       * `Readable`, and `call()` turns a `FormData` into one before it ever reaches here, so
+       * both arrived at `duplex.end(readable)` - which rejects anything that isn't a string,
+       * `Buffer` or view, and failed every `stream.post(url, {body})` carrying one with
+       * `ERR_INVALID_ARG_TYPE`. The same body through the non-stream path has always worked.
+       *
+       * The source's own failure has to be forwarded by hand: `pipe` neither propagates an
+       * error nor ends the destination, so a source that broke mid-upload left the request
+       * hanging with nothing to report. Destroying the duplex is what `normaliseBodyErrors`
+       * above is watching for, so the caller gets it as a `RequestError` like every other
+       * stream failure. `stream.pipeline` would do both, but it also finishes the duplex's
+       * *readable* half, which is the half the caller is here to read.
+       */
+      if (options.body instanceof Readable) {
+        const source = options.body;
+
+        source.once('error', (error: Error) => duplex.destroy(error));
+        source.pipe(duplex);
+      } else {
+        duplex.end(options.body);
+      }
     }
 
     duplex.response = head;
@@ -3522,8 +3641,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     const base = this.baseOptions;
 
     return new Gotlike<MergeClientOptions<O, E>>({
-      ...base,
-      ...options,
+      // `mergeOptions` rather than a spread, so `extend({throwHttpErrors: undefined})` inherits
+      // the parent's setting instead of turning it off. The keys below are merged explicitly
+      // and are unaffected either way.
+      ...mergeOptions(base, options),
       // Case-insensitively, like the per-request merge: extending with `Authorization` must
       // replace an inherited `authorization` rather than leave the client sending both.
       headers: mergeHeaders(lowercaseHeaders(base?.headers), options.headers),

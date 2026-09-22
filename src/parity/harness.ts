@@ -207,7 +207,24 @@ export function parityTest(name: string, scenario: Scenario): void {
       try {
         returned = await scenario.run(client, server.base);
       } catch (error) {
-        returned = {threw: (error as Error).message};
+        /*
+         * Not compared - failed. A throw that escapes a scenario body is the scenario itself
+         * being broken (a renamed helper, a typo, a method neither client has), and both
+         * clients then produce the identical `{threw: '... is not a function'}`: the
+         * deep-compare passes and the claim is asserted by nothing at all. That is the same
+         * vacuous pass an un-awaited `assert.rejects` gives, and it is worth less than a
+         * missing test, because it reads as coverage.
+         *
+         * An *expected* failure goes through `capture()`, which returns a value describing it
+         * in the terms a caller matches on. Nothing in the suite throws past this point, and a
+         * one-sided throw is a real divergence that should stop the run rather than be folded
+         * into a message string.
+         */
+        assert.fail(
+          `${name}\n\nthe scenario threw while running against ${label}, instead of returning a ` +
+            `value to compare: ${(error as Error).stack ?? String(error)}\n\n` +
+            'An expected failure belongs in `capture()`; anything else is a broken scenario.',
+        );
       }
 
       observations[label] = {returned, wire: server.wire.map(normaliseWire)};
@@ -361,7 +378,14 @@ export function propertyTest<I>(name: string, spec: PropertySpec<I>): void {
         try {
           returned = await spec.run(client, server.base, input);
         } catch (error) {
-          returned = {threw: (error as Error).message};
+          // Same reasoning as in `parityTest`, plus the input that produced it - a generated
+          // case is not reproducible from a stack alone.
+          assert.fail(
+            `${name}\n\nthe scenario threw while running against ${label} (seed ${seed}, case ` +
+              `${i}):\n${JSON.stringify(input, undefined, 2)}\n\n` +
+              `${(error as Error).stack ?? String(error)}\n\n` +
+              'An expected failure belongs in `capture()`; anything else is a broken scenario.',
+          );
         }
 
         observations[label] = {returned, wire: server.wire.map(normaliseWire)};
