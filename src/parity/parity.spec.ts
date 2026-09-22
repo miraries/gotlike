@@ -1,3 +1,4 @@
+import {text} from 'node:stream/consumers';
 import {
   capture,
   parityTest,
@@ -604,7 +605,7 @@ parityTest('a url given only as an option', {
  */
 const otherOrigin = (base: string) => base.replace('127.0.0.1', 'localhost');
 
-type EchoBody = {path: string; headers: Record<string, string>; body: string};
+type EchoBody = {method: string; path: string; headers: Record<string, string>; body: string};
 
 const echoed = (body: unknown) => {
   const echo = body as EchoBody;
@@ -662,6 +663,40 @@ parityTest('a cross-origin hook keeps the authorization and the body it set itse
     const response = await hooked.post(`${base}/echo`, {
       body: 'PAYLOAD',
       headers: {authorization: 'Bearer secret'},
+    });
+
+    return echoed(response.body);
+  },
+});
+
+/*
+ * The same claim, reached by the other way a hook can write headers: assigning a whole new
+ * object instead of mutating the one it was given.
+ *
+ * Every other cross-origin scenario here, and all eight in `index.spec.ts`, mutate in place -
+ * so the write-tracking Proxy was always the thing answering "did the hook touch this", and
+ * nothing ever exercised the case where a hook throws that Proxy away. It did: the freshly
+ * minted credentials for the new origin were stripped as though the hook had never set them,
+ * and the request arrived anonymous at a host it had just authenticated to. The mutation *form*
+ * is part of the input space, not an implementation detail.
+ */
+parityTest('a cross-origin hook that replaces the headers object keeps what it put there', {
+  claim: 'CLAUDE.md: a header the hook wrote is the credentials for where it is sending the request.',
+  run: async (client, base) => {
+    const hooked = client.extend({
+      responseType: 'json',
+      hooks: {
+        beforeRequest: [
+          (options: {url: unknown; headers: Record<string, string>}) => {
+            options.url = `${otherOrigin(base)}/echo/moved`;
+            options.headers = {authorization: 'Bearer fresh', 'x-set-by-hook': '1'};
+          },
+        ],
+      },
+    });
+
+    const response = await hooked.get(`${base}/echo`, {
+      headers: {authorization: 'Bearer secret', cookie: 'session=secret'},
     });
 
     return echoed(response.body);
@@ -816,5 +851,134 @@ parityTest('a FormData body is encoded the way got encodes it', {
       contentType: (echo.headers['content-type'] ?? '').replace(/boundary=[-\w]+/, 'boundary=<b>'),
       body: echo.body.replaceAll(/-{2,}[-\w]+/g, '<b>'),
     };
+  },
+});
+
+/* ------------------------------------------------------------------------------- streams */
+
+/** The stable half of an `/echo` reply: what the request was, not which headers carried it. */
+function streamedEcho(body: string): unknown {
+  const echo = JSON.parse(body) as EchoBody;
+
+  return {method: echo.method, path: echo.path, body: echo.body};
+}
+
+/*
+ * The suite had no stream scenarios at all, which is how the largest and most intricate
+ * subsystem here - two dispatch paths, error normalisation, duplex writable semantics,
+ * release-on-close - went undefended while got has a stream API that makes every bit of it
+ * differentially testable. Its bug history says the same: a piped GET that returned the 302
+ * instead of following it, a bodyless method routed onto the pipeline path where the request
+ * was never sent at all, a mid-body socket reset surfacing undici's raw error.
+ *
+ * `await` is what lets one body drive both clients - got hands the stream back synchronously,
+ * gotlike resolves to it.
+ */
+
+parityTest('a streamed GET delivers the same bytes and sends the same request', {
+  claim: 'README: `stream()` for a bodyless request resolves to a Readable carrying the response body.',
+  run: async (client, base) => {
+    const stream = await client.stream(`${base}/echo/streamed`, {headers: {'x-stream': '1'}});
+
+    // The echoed *headers* are compared through the wire record, which filters the four that
+    // are allowed to differ; returning the raw body here would compare them a second time
+    // without that filter and fail on got's own user-agent.
+    return streamedEcho(await text(stream));
+  },
+});
+
+/*
+ * The upload path: `undici.pipeline` makes the duplex's writable half the request body, which
+ * is a different mechanism from got's and has to put the same bytes on the wire.
+ */
+parityTest('a streamed upload sends the body written into it', {
+  claim: 'CLAUDE.md: a `bodyMethods` method streams through `undici.pipeline`, whose writable half is the body.',
+  run: async (client, base) => {
+    const upload = await client.stream.post(`${base}/echo/uploaded`, {
+      headers: {'content-type': 'text/plain'},
+    });
+
+    // Written across a real gap, which is the case the writable half exists for - and the one
+    // where both clients chunk, so everything on the wire is comparable.
+    upload.write('chunk-one-');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    upload.write('chunk-two-');
+    upload.end('chunk-three');
+
+    return streamedEcho(await text(upload));
+  },
+});
+
+/*
+ * The same upload written and ended in one call, which frames differently - and is the only
+ * thing the stream scenarios found that the two clients disagree about.
+ *
+ * got always chunks a stream body. undici can see that this duplex ended with everything it
+ * will ever carry, so it sends a `content-length` instead. Nothing here asks for either:
+ * gotlike sets no length header, and forcing one framing would mean writing
+ * `transfer-encoding` by hand against undici's own decision. It is not a buffering difference
+ * - the scenario above writes across a gap and chunks exactly as got does - and it can only
+ * arise where the caller had nothing to stream in the first place.
+ */
+parityTest('a streamed upload written in one call is framed by length rather than chunked', {
+  claim: 'CLAUDE.md: `undici.pipeline` takes the request body from the duplex’s writable side.',
+  run: async (client, base) => {
+    const upload = await client.stream.post(`${base}/echo/one-shot`, {headers: {'content-type': 'text/plain'}});
+
+    upload.end('STREAMED-PAYLOAD');
+
+    const echo = JSON.parse(await text(upload)) as EchoBody;
+
+    return {
+      body: echo.body,
+      contentLength: echo.headers['content-length'],
+      transferEncoding: echo.headers['transfer-encoding'],
+    };
+  },
+  divergence: {
+    reason:
+      'undici frames a duplex that has already ended with a `content-length`; got always chunks a stream ' +
+      'body. Neither client asks for either - it is undici’s framing decision, and overriding it would mean ' +
+      'writing `transfer-encoding` by hand against it. Not a buffering difference: an upload written across ' +
+      'a gap chunks on both sides (the scenario above), so this only arises when the caller had nothing to ' +
+      'stream. Both sides pinned, so a change in either is a failure rather than a surprise.',
+    got: {body: 'STREAMED-PAYLOAD', contentLength: undefined, transferEncoding: 'chunked'},
+    gotlike: {body: 'STREAMED-PAYLOAD', contentLength: '16', transferEncoding: undefined},
+  },
+});
+
+/*
+ * A download through a redirecting CDN. This is the case that used to hand back the 302 itself
+ * with an empty body - an empty file and no error - because the piped request had a body
+ * `RedirectHandler` could not replay.
+ */
+parityTest('a streamed GET follows a redirect to the body it points at', {
+  claim: 'CLAUDE.md: requests with no body to replay go through `undici.request`, where redirects work normally.',
+  run: async (client, base) => {
+    const following = client.extend({followRedirect: true});
+    const stream = await following.stream(`${base}/redirect?to=/echo/after-redirect`);
+
+    return streamedEcho(await text(stream));
+  },
+});
+
+/*
+ * A failing status on a stream. got raises it on the stream; so does gotlike, through
+ * `toRequestError`, which is what runs the `beforeError` hooks and attaches the response - a
+ * bare `new HTTPError(...)` skipped both. The two disagree on the error's own shape, so only
+ * the part a caller acts on is compared: that it failed, and on which status.
+ */
+parityTest('a streamed request with a failing status raises on the stream', {
+  claim: 'CLAUDE.md: `throwHttpErrors` on a stream is raised by the readable at read time, on both stream paths.',
+  run: async (client, base) => {
+    const stream = await client.stream(`${base}/status?code=503`);
+
+    try {
+      await text(stream);
+
+      return {outcome: 'resolved'};
+    } catch (error) {
+      return {outcome: 'rejected', status: (error as {response?: {statusCode?: number}}).response?.statusCode};
+    }
   },
 });

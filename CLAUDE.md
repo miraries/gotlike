@@ -100,6 +100,16 @@ Two invariants worth preserving here:
   as merging it *except* when the override names no `request` — `{}`, or the `{request: config.timeout}` of a
   config that didn't set one, which used to drop the client's deadline and leave the request unbounded.
 
+**A string `searchParams` is re-encoded, never concatenated as written** (`stringifyQuery`). `resolveUrl` appends
+the serialised query straight onto the url, so every character of the caller's string landed in the url as a *url*
+character: the first `#` opened a fragment, a fragment is never sent, and every parameter after it vanished off the
+wire with no error — `searchParams: 'next=/home#top&b=2'` reached the server as `?next=/home`. That is the same
+failure `withoutQuery` fixed for the joined url, never fixed for the query being appended to it. It was also
+inconsistent with itself, which is worse to debug than being wrong: `mergeSearchParams` round-trips a string through
+`URLSearchParams`, so the two-sided case encoded correctly while the one-sided case — the common one — did not.
+Running it through `URLSearchParams` is what got does too, so `a=1;b=2` and `q=a b` now encode as got encodes them.
+The constructor strips a leading `?` itself. Object and `URLSearchParams` inputs were always correct.
+
 Header names written by a handler or a `beforeRequest` hook are folded again at dispatch, but only for clients that
 have one (`mayRewriteHeaders`) and only when a scan (`hasUnfoldedName`, which allocates nothing) actually finds an
 upper-case name. A hook writing `headers.Authorization` over an existing `authorization` otherwise left undici sending
@@ -108,6 +118,15 @@ both.
 `options.context` defaults to a shared frozen empty object so `options.context.foo` reads as `undefined` without
 allocating per request, and a stray write fails loudly instead of leaking. When a context *is* set, the request
 gets its own shallow copy of it.
+
+**An unknown key inside `retry` or `hooks` is rejected, and a got option we simply don't implement says so.**
+`retry: {limt: 0}` used to be accepted outright and silently leave the *default* two retries in place; a misspelled
+hook name was accepted and never fired. But `retry.calculateDelay`, `retry.noise` and `hooks.init` are real got
+options that got 16 accepts, so reporting them as "Unknown option" told a caller migrating from `got-cjs@12` that
+they had made a typo. `unimplementedOptions` names each one and why it is missing. Still a hard failure rather than
+an ignore — a `calculateDelay` that silently never runs is the exact failure the check exists to stop — and it is
+in the README's divergence table, because "the client will not construct" is a different migration story from "that
+option does nothing".
 
 **Option validation walks own properties only.** `for...in` climbs the prototype chain, so any library that put an
 enumerable property on `Object.prototype` made every request fail with `Unknown option`.
@@ -279,6 +298,17 @@ the request was sent with and calls `call()` **directly, not `handle()`** — ha
 request, and re-entering them would re-log and re-wrap a request the caller made once. It also clears
 `prefixUrl`, since `options.url` was already resolved against it on the first attempt.
 
+**Going straight to `call()` means skipping `formOptions`, so the retry has to redo its two jobs itself.** It
+validates the hook's options (`validateOptions(newOptions, false)`, gated on `this.validate` exactly as
+`formOptions` gates its own) and folds the method's case (`normaliseMethod`). Without them this was a second,
+permanent `validate: false` that no caller could turn on: `retry({method: 'post'})` put the literal `post` on the
+request line and the server answered 400 where got normalises it and succeeds, `retry({responseType: 'jsn'})` fell
+past the `json`/`text` arms and handed back a `Buffer` where the identical typo on the original call throws, and
+`retry({timeout: {request: 0}})` and `retry({prefixUrl: 'http://h?q=1'})` slipped past the checks written
+specifically to reject them. A `ValidationError` raised here is rethrown untouched by the `afterResponse` catch
+rather than wrapped in a `RequestError`, so the same bad option reports itself the same way on both routes — the
+class is a pinned divergence from got and has to stay distinct.
+
 **The retried request runs only the hooks *before* the one that retried** (`afterResponseLimit`, a symbol on the
 options, same trick as `retryDepth`). Re-running the whole array meant a refreshed request re-fired every earlier
 hook and let the retrying hook see its own retry. got does `hooks.afterResponse.slice(0, index)` for the same
@@ -294,6 +324,14 @@ raw error, skipping the `RequestError` wrapper and the `beforeError` hooks, so a
 on `statusCode` only: got also requires a non-null `body`, which here would reject the legitimate `undefined`
 body of a 204 read as json. An error already in `normalisedErrors` is rethrown untouched so the hooks don't fire
 twice for one failure.
+
+**Which means a hook may hand back a response it built itself, and `throwHttpErrors` has to cope.** The decision
+reads `response.request.options` rather than the outer `options`, because a hook that *retried* replaced the
+response with one the nested `call()` already judged under its own url and flag — but a hand-made
+`{statusCode, body}` carries no `request` at all, and reading straight through it threw a bare
+`Cannot read properties of undefined (reading 'options')` from **outside** the hook loop's `try`. That was the
+last place a raw error could still escape the `RequestError` wrapper and the `beforeError` hooks. It falls back
+to `options` now, which is the right answer for a response that names none.
 
 **`prefixUrl` comes back when the hook supplies a `url`.** It was cleared unconditionally, on the reasoning that
 `options.url` had already been resolved against it - true, but a `url` the hook supplies has *not* been, so a
@@ -346,9 +384,9 @@ their own api to whatever host the hook named. undici already strips these when 
 cross-origin redirect (see the `beforeRedirect` note below); this is the same boundary reached by
 the route the client controls, and got 16 fixed it there for the same reason.
 
-What the hook sets *itself* survives — a header whose value differs from the one it had before the
-hooks ran is the hook saying "these are the credentials for where I am sending this", and a body it
-replaced was built for the new origin. An unchanged body goes, and takes `content-type` and
+What the hook sets *itself* survives — a header the hook **wrote**, assigned or deleted, is the hook
+saying "these are the credentials for where I am sending this", and a body it replaced was built for
+the new origin. An unchanged body goes, and takes `content-type` and
 `content-length` with it (a stale `content-length` would fail the dispatch under undici's
 `strictContentLength`). On the retry path the same test is "did `newOptions` name it", and
 `username`/`password` are cleared too — otherwise `call()` derives the same `authorization` straight
@@ -361,10 +399,34 @@ nothing and parses nothing; `URL` is only reached for when that text actually di
 is the right answer for a default port written out, a host in another case, or userinfo on one
 side. **A url that cannot be parsed counts as a different origin**: this decides whether credentials
 travel, so the unparseable case has to fail towards stripping them. The snapshot of what the
-request carried before the hooks (`crossOriginState`) is one small object, taken only for a client
-that has `beforeRequest` hooks at all — it has to be eager, since whether the origin moved is only
-known once the hooks have run. All of it is measured against got 16 in the parity suite, including
-the cases where nothing is stripped.
+request carried before the hooks (`crossOriginState`) is one small object of booleans — *whether*
+each header was set, never its value — taken only for a client that has `beforeRequest` hooks at
+all; it has to be eager, since whether the origin moved is only known once the hooks have run. All
+of it is measured against got 16 in the parity suite, including the cases where nothing is stripped.
+
+**"Did a hook touch this" is tracked, not inferred from the value** (`trackHookWrites`). Comparing
+values mistook a hook explicitly re-asserting the very same `authorization` string — or rebuilding a
+body that happened to serialise identically — for one that had left it alone, and stripped it anyway,
+which is the opposite of what the paragraph above promises. A `Proxy` over `options.headers` and an
+accessor over `options.body` record the writes, the way got's own `trackStateMutations` does.
+**Both come back off the moment the hook loop ends** (`writes.restore()`). They used to stay on all
+the way to the dispatch, so undici read every header of every request through the `Proxy` — measured
+at ~780ns a request against ~19ns for the plain object, on a client whose whole documented overhead
+is under 500ns, and paid by exactly the clients that always have hooks. `Reflect.set` is called
+without a `receiver` for the same reason: handing the `Proxy` back sends the write round through
+`[[DefineOwnProperty]]` on it again for nothing. There is a test asserting the options the request
+went out with carry neither.
+
+**A header survives only when *both* signals say the hook left it alone**, and neither signal alone
+is enough. The write set goes blind the moment a hook assigns a whole new headers object
+(`options.headers = {authorization: ...}`), which throws the `Proxy` away along with everything it
+recorded — measured, such a hook's freshly minted credentials for the *new* origin were deleted and
+the request went out anonymous, where got 16 sends them and where the value comparison this replaced
+had been right. So `stripCrossOrigin` asks for no recorded write **and** an unchanged value, and
+`crossOriginState` keeps the values for that second half. The body needs only the write test: its
+accessor sits on `options` itself, which a hook cannot replace the way it can replace
+`options.headers`. Replacing the headers object wholesale is ordinary in a signing hook, and the
+symptom was a 401 from the host the hook had just authenticated to.
 
 `beforeError` hooks may return a replacement error; anything that isn't an `Error` is ignored. They run for
 **every** failure path, streams included — see Streams — and for anything a `beforeRequest` or `afterResponse`
@@ -483,6 +545,15 @@ documented divergence from got, not an oversight.
 
 `attemptState()` builds the holder and `dispatchOptions()` hands it to every dispatch, so `retryCount` and
 `beforeRetry` work identically for `call()` and for both stream paths (`StreamHead.retryCount`).
+
+**A hook-driven retry counts as one retry, and the count carries forward from the response the hook was handed.**
+`retryWithMergedOptions` used to add its own `depth` — the *nesting* level of the call — to whatever the nested
+`call()` reported, which is a count of nothing: two hooks each retrying once both ran at depth 1 and reported one
+retry between them, while a retry nested inside another reported three for two. The number now comes from
+`retriesSoFar`, captured per hook from `response.retryCount` (which already includes undici's own network
+retries), plus one; `beforeRetry` is given the same value. Both shapes are pinned against the dispatches a
+`beforeRequest` hook counts, which is the only unarguable number. `retryDepth` remains, but purely as the bound
+`maxAfterResponseRetries` is checked against.
 
 **`countAttempts` also starts the redirect chain over.** A retry is a fresh chain - undici's
 `RedirectHandler` counts hops per attempt - but the redirect tracker's state holder travels with the dispatch
@@ -728,6 +799,23 @@ This is also what undici's own `headersTimeout`/`bodyTimeout` already did, so al
 reaches the interceptor on the `attempts` holder (`AttemptState.restartDeadline`), which only exists for a client
 that retries at all.
 
+**Pausing that deadline is a prediction, and a prediction that misses must not cost the deadline.**
+`OutcomeHandler` stops the timer when `willRetryStatus` says undici is about to retry, so the backoff isn't
+charged to the attempt — but that re-implements a decision undici makes privately in `retry-handler.js`, and a
+false positive used to leave the request running with *no* deadline at all, silently and without end. Measured:
+a `retry: {statusCodes: [202]}` against a trickling body under `timeout: {request: 400}` was still reading at 4s,
+while the same request one status code away gave up at 406ms. Two things fix it, and both are wanted:
+- `willRetryStatus` mirrors undici's own gate — `RetryHandler.onResponseStart` only consults the retry policy
+  for a **3xx and up**, so a `retry.statusCodes` naming a 2xx (a polling client listing `202`) is never retried
+  there however the prediction answers;
+- **`requestSignal.resume()` is the failsafe.** It re-arms a deadline a `pause` took away and no re-dispatch came
+  for, and every path calls it the instant a response reaches the caller — `call()` after `undici.request`
+  resolves, `callBodylessStream` after the head arrives, `callStream` inside the pipeline handler — which is the
+  point at which nothing can be retrying it any more. A no-op unless a pause is outstanding, so the ordinary
+  request pays one boolean read. Any future divergence from undici's internals therefore costs a restarted clock
+  rather than the whole timeout. It is unit-tested through `dispatchOptions` directly: provoking a genuine
+  mispredict over the wire would mean testing undici's retry handler rather than this.
+
 undici's own timeout errors are still mapped, since they give the more specific message when they do fire first.
 The deadline reports itself as a `TimeoutError` DOMException, which lands on the same `TimeoutError`/`ETIMEDOUT`
 as everything else.
@@ -814,6 +902,14 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   moves it, `dispatchesOf` returns nothing and `cleanAll` falls back to `cleanMocks()`. Regex entries stay in the
   `pools` map across a clean for the same reason — handing back a *different* pool is what breaks the derived
   ones.
+- **A `Scope` reused after a `cleanAll()` puts its entry back in the `pools` map.** String origins are dropped by
+  `cleanAll` so the map doesn't just grow, and `Scope#verb` only ever re-activated an entry that was still *in*
+  it — so a scope captured once and reused across a clean (`const scope = nock(host)` at the top of a file with
+  `cleanAll()` in a `beforeEach`) went on registering interceptors that matched, while `hasMockedOrigin` no
+  longer knew the origin was ours. Anything that *missed* those interceptors then fell through to the real
+  network instead of failing closed — a live outbound request, silently, which is the one thing owning an origin
+  exists to prevent. Covered in `nock-default.spec.ts`, since `nock.spec.ts` calls `disableNetConnect()` up front
+  and so can never see a fall-through at all.
 - **Two scopes on one origin share an `isDone()` answer**, regex or string: a pending interceptor reports the
   origin it was registered under and nothing finer. nock answers per scope. So does the shim's limit on
   *different* patterns matching one host — undici consults only the first — both documented in the README rather
@@ -883,6 +979,16 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   first. nock stringifies the body before the callback ever sees it, so `post(url, {body: Buffer.from(json)})`
   handed the callback a raw `Buffer` here where nock gives the parsed object, and a callback reading
   `requestBody.id` got `undefined` against the mock and the right answer against the server.
+- **A streamed upload is drained for the callback, never tee'd.** A `stream.post()` body, or a `FormData` one,
+  reaches the mock as a live `Readable` when no composed interceptor implements `onBodySent`/`onRequestSent`
+  (`decompress` does and is on by default, so this is the `decompress: false` shape). `resolveRequestBody` used
+  to pipe it into two `PassThrough`s — one to read, one put back on `opts.body` for a later read by undici that
+  never comes: `dispatchRequestBody` runs *before* `sendReply()` and is the only thing that ever touches the
+  body. Nothing drained the second one, so past its 16KB high-water mark `pipe` paused the source, the half
+  being read stopped receiving, and the callback's own `await` never resolved. Measured: a 200KB upload never
+  settled and the reply callback was never called at all, while a few hundred bytes fit in the buffer and always
+  worked — which is why the tests needed a real payload to catch it. The bytes are collected and written back
+  onto `opts.body` as a `Buffer`, which is replayable, so a reader appearing later still finds the body.
 - **`restore()` puts the previous global dispatcher back**, not just a deactivated mock. `deactivate()` alone
   makes the mock pass requests through, which looks like a restore until the caller had set a dispatcher of their
   own — a proxy agent, or a pool tuned for their workload. That one stayed replaced for the lifetime of the
@@ -899,6 +1005,21 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
 amigo's `.query(true)`, spribe's capture-via-`reply(function)`) as named tests.
 
 ### Tests
+
+**Three of these are invariant tests rather than scenarios, and that is the point.** Every error bug in this
+repo's history has been *one uncovered path*, not a wrong answer on a covered one — so a table of paths beats a
+test per path, because adding a path is an obvious edit and a missing one is a visible omission:
+
+- *every failure path reports a RequestError or a ValidationError* — the whole error contract in one list:
+  transport failures, timeouts, aborts, parse failures, all four hook kinds throwing, a hook that forgets to
+  return, a hook handing back a response it built itself, and a bad option on each of the two routes into
+  `call()`. Each row reports its own outcome rather than throwing, so a row that stops *failing* reads as a
+  result instead of hiding every row after it.
+- *an afterResponse retry normalises and validates the options it is given* — drives one table of bad options
+  through `formOptions` **and** through the retry merge and requires the same answer from both. That is what
+  makes "the retry path is a second `validate: false`" a failure rather than something to notice later.
+- *a status listed in retry.statusCodes that undici will not retry keeps its deadline*, plus the unit test for
+  `resume()` — the deadline can only be lost by a mispredicted pause, and both halves are pinned.
 
 `index.spec.ts` boots a real `http.createServer` on port 3000 in `test.before` with route-based behaviors
 (`/json`, `/timeout`, `/stream`, `/headers`, `/status?code=`, `/redirect`, `/retry`, `/truncate`). The `/retry`
@@ -987,6 +1108,15 @@ Three pieces:
   so a red build is reproducible: a suite that generates fresh inputs per run fails on one machine and passes
   on the next, which is worse than not running. ~2,000 cases across eight seeds currently agree with got; the
   one disagreement it found is pinned in `parity.spec.ts` (a leading slash under `prefixUrl`).
+
+  **A generator has to reach every input *shape*, not just every subsystem.** Two of these targeted query
+  serialisation for a long time while `searchParams` went unencoded onto the url for the string form — because
+  `query()` only ever built a `Record<string,string>`, so `stringifyQuery`'s string branch was never compared
+  against got at all, and the alphabet carried no `#`. Coverage stayed green throughout: it measures execution,
+  not which shape executed it. The same applies to a call *form* — eight cross-origin hook tests all mutated
+  `options.headers` in place, so the case where a hook assigns a new object went unexercised and lost the hook's
+  own credentials. When a bug turns out to be "nobody passed it that way", widen the generator rather than
+  adding one more example.
 - **`nock-harness.ts` / `nock-parity.spec.ts`** — the same idea for the mocking shim, against **real nock 14**.
   nock intercepts node's http stack and the shim replaces undici's global dispatcher, so each side is driven by
   the client it can actually intercept — nock with got, the shim with gotlike — and what is compared is the only
@@ -1006,9 +1136,10 @@ than they look:
   sides stay pinned, so the test fails if gotlike drifts *and* if a got upgrade changes got. A `skip`
   would catch neither.
 
-The suite prints the full inventory when it finishes: **four request headers and six behaviours**
+The suite prints the full inventory when it finishes: **four request headers and seven behaviours**
 against got 16, and two against nock. It started at five and seven; what closed the gap was fixing what
-the suite found rather than recording it:
+the suite found rather than recording it (the seventh behaviour is the stream-upload framing below,
+which arrived with the stream scenarios rather than from anything changing here):
 
 - **an `accept` derived from `responseType`**, which got sends and this did not — the one that changed
   what comes *back*, since a content-negotiating upstream could answer gotlike with HTML where it

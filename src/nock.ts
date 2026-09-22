@@ -1,4 +1,5 @@
 import type {Url} from 'node:url';
+import {Readable} from 'node:stream';
 import {getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
 import type {MockInterceptor} from 'undici/types/mock-interceptor.js';
 import type {Dispatcher, Interceptable} from 'undici';
@@ -16,6 +17,33 @@ const originalDispatcher: Dispatcher = getGlobalDispatcher();
 
 if (process.env.NOCK_OFF !== 'true') {
   setGlobalDispatcher(mockAgent);
+}
+
+/**
+ * Timers backing a `.delay()`ed reply that hasn't fired yet, so `abortPendingRequests()` has
+ * something to cancel. undici's own `MockInterceptor.delay()` has no such hook - its timer is
+ * internal to `mock-utils.js`, with no handle exposed for cancelling it after the fact - so
+ * every delay is implemented here instead (see `awaitDelay`), specifically to keep this set
+ * accurate. Real nock's `abortPendingRequests` does the same thing to its own wrapped timers
+ * (`common.removeAllTimers`): it does not deliver an abort error to the caller, it just makes
+ * sure the timer holding a reply back never fires, which is what "pending" means once a request
+ * has already matched an interceptor and is only waiting on its delay.
+ */
+const pendingDelayTimers = new Set<NodeJS.Timeout>();
+
+function awaitDelay(ms: number | undefined): Promise<void> {
+  if (ms === undefined) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      pendingDelayTimers.delete(timer);
+      resolve();
+    }, ms);
+
+    pendingDelayTimers.add(timer);
+  });
 }
 
 /** A nock origin as undici keys it: an exact origin, or a pattern matching several. */
@@ -175,6 +203,80 @@ type ReplyFunction = (
 type ReplyBodyFunction = (this: ReplyContext, uri: string, requestBody: unknown) => ReplyBody | Promise<ReplyBody>;
 
 /**
+ * The request body a reply callback should be handed, as bytes.
+ *
+ * For `gotlike.stream.post()`/`.put()`, and for a `FormData` body on the plain promise API,
+ * `undici.pipeline`/`undici.request` hand the mock a live `Readable` rather than the bytes that
+ * will eventually flow through it - the duplex's writable side (or the encoded `FormData`) is
+ * read lazily. What arrives here depends on whether any composed interceptor implements
+ * `onBodySent`/`onRequestSent` (`decompress`, `retry`, `redirect`, `dedupe`, `cache` all do, via
+ * the pass-through `DecoratorHandler` base every one of them wraps the real handler in - even
+ * the ones that never call it):
+ *
+ * - **one does**: undici has already drained the `Readable` itself (`dispatchRequestBody` in its
+ *   own `mock-utils.js`) and hands over the result - not the bytes, but a fresh plain object
+ *   exposing them as a replayable `{[Symbol.asyncIterator]}`, which is what `[object Object]`
+ *   was made of.
+ * - **none does** (a plain client, `decompress: false` and nothing else composed): undici passes
+ *   the body through untouched, so this is still the live, unread `Readable`.
+ *
+ * Either way, a reply callback used to see something with no bytes in it at all.
+ *
+ * **The stream is drained, not tee'd.** It used to be piped into two `PassThrough`s - one to
+ * read, one put back on `opts.body` for a later read by undici - on the belief that undici reads
+ * the body again after this callback resolves. It does not: `dispatchRequestBody` runs *before*
+ * `sendReply()` and is the only thing that ever touches it, so nothing drained the second
+ * `PassThrough` and, past its 16KB high-water mark, `pipe` paused the source, the half being
+ * read stopped receiving, and the callback's `await` never resolved. Measured: a `stream.post`
+ * of 200KB never settled, and the reply callback was never called at all. The drained bytes go
+ * back on `opts.body` as a `Buffer`, which is replayable, so a reader appearing later still
+ * finds the body rather than an exhausted stream.
+ *
+ * A body *matcher* (`nock(host).post(path, matcher)`) deciding which interceptor answers a
+ * streamed request stays broken regardless: undici picks the interceptor before either path
+ * above ever runs, against the same unread stream, so a matcher on a streamed upload never
+ * matches and the request falls through to the real network. Not fixed here; a caller who needs
+ * to assert on a streamed body's content still has to do it from the reply callback.
+ */
+async function resolveRequestBody(opts: {body?: unknown}): Promise<unknown> {
+  const body = opts.body;
+
+  if (body instanceof Readable) {
+    const collected = await collectAsyncIterable(body);
+
+    // Back onto the options as bytes: the stream is spent now, and a `Buffer` is what anything
+    // reading it after us can still make sense of.
+    opts.body = collected;
+
+    return collected;
+  }
+
+  if (isAsyncIterable(body)) {
+    return collectAsyncIterable(body);
+  }
+
+  return body;
+}
+
+function isAsyncIterable(value: unknown): value is AsyncIterable<Buffer | string> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as {[Symbol.asyncIterator]?: unknown})[Symbol.asyncIterator] === 'function'
+  );
+}
+
+async function collectAsyncIterable(source: AsyncIterable<Buffer | string>): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of source) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  return Buffer.concat(chunks);
+}
+
+/**
  * nock hands reply callbacks a parsed object when the request looked like JSON, and the
  * raw string otherwise.
  *
@@ -211,6 +313,13 @@ function parseRequestBody(body: unknown, headers: Record<string, string>): unkno
  */
 function bodyValueMatches(expected: unknown, actual: unknown): boolean {
   if (expected instanceof RegExp) {
+    // The same expected value is reused across every request a persisted interceptor answers,
+    // so a `/g`/`y` matcher's `lastIndex` survived from the previous call: a body matched on
+    // request 1, advanced `lastIndex` past the match, and request 2 with an identical body
+    // missed because `test()` resumed searching from there instead of the start. Reset the way
+    // the origin matcher already does.
+    expected.lastIndex = 0;
+
     return typeof actual === 'string' && expected.test(actual);
   }
 
@@ -387,6 +496,11 @@ function matchPath(matcher: PathMatcher, path: string): boolean {
     return matcher(path);
   }
 
+  // A `persist()`ed interceptor reuses this same RegExp for every request it answers, so a
+  // `/g`/`y` pattern's `lastIndex` carried over from the previous call and made it alternate
+  // between matching and missing an identical path. Reset first, as the origin matcher does.
+  matcher.lastIndex = 0;
+
   return matcher.test(path);
 }
 
@@ -412,6 +526,11 @@ function queryValueMatches(actual: URLSearchParams, name: string, expected: unkn
 /** One expected query value against one that arrived, with nock's leaf matchers. */
 function queryLeafMatches(value: string, expected: unknown): boolean {
   if (expected instanceof RegExp) {
+    // Same reset, same reason: this RegExp is reused across every request a persisted
+    // interceptor answers, so a `/g`/`y` matcher's `lastIndex` otherwise survived from the
+    // previous call and made an identical query value alternate between matching and missing.
+    expected.lastIndex = 0;
+
     return expected.test(value);
   }
 
@@ -678,7 +797,7 @@ class Interceptor {
     return this.#pool.intercept(options);
   }
 
-  #applyScopeOptions(mockScope: {times(n: number): any; persist(): any; delay(ms: number): any}): Scope {
+  #applyScopeOptions(mockScope: {times(n: number): any; persist(): any}): Scope {
     if (this.#times !== undefined) {
       mockScope.times(this.#times);
     }
@@ -687,9 +806,9 @@ class Interceptor {
       mockScope.persist();
     }
 
-    if (this.#delay !== undefined) {
-      mockScope.delay(this.#delay);
-    }
+    // Not applied here: undici's own `.delay()` has no way to cancel the timer it starts, which
+    // is exactly what `abortPendingRequests()` needs to do. Both reply paths await `awaitDelay`
+    // themselves instead - see `pendingDelayTimers`.
 
     return this.#scope;
   }
@@ -735,9 +854,18 @@ class Interceptor {
     }
 
     return this.#applyScopeOptions(
-      // `=== undefined`, not `??`: `reply(200, null)` means a body of `null`, and coercing it
-      // to `''` turned a mocked null response into a parse failure.
-      interceptor.reply(responseCodeOrFunction, (body === undefined ? '' : body) as any, replyOptions(body, headers)),
+      interceptor.reply(async () => {
+        // Own timer rather than undici's `.delay()` - see `awaitDelay`.
+        await awaitDelay(this.#delay);
+
+        return {
+          statusCode: responseCodeOrFunction,
+          // `=== undefined`, not `??`: `reply(200, null)` means a body of `null`, and coercing
+          // it to `''` turned a mocked null response into a parse failure.
+          data: (body === undefined ? '' : body) as any,
+          responseOptions: replyOptions(body, headers),
+        };
+      }),
     );
   }
 
@@ -746,10 +874,18 @@ class Interceptor {
     return this.#applyScopeOptions(
       interceptor.reply(async (opts: any) => {
         const context = this.#context(opts);
+        // See `resolveRequestBody`: a streamed upload arrives here as the live `Readable`
+        // undici hands straight over, so the bytes have to be collected before the callback
+        // can be shown anything.
+        const body = await resolveRequestBody(opts);
+
+        // Own timer rather than undici's `.delay()` - see `awaitDelay`.
+        await awaitDelay(this.#delay);
+
         const [statusCode, data, replyHeaders] = await resolve.call(
           context,
           this.#uri(opts.path),
-          parseRequestBody(opts.body, context.req.headers),
+          parseRequestBody(body, context.req.headers),
         );
 
         return {
@@ -803,6 +939,16 @@ class Scope {
 
     if (entry) {
       entry.active = true;
+    } else {
+      /*
+       * Put back, not skipped. `cleanAll()` drops string origins from the map, so a Scope
+       * captured once and reused across one - `const scope = nock(host)` at the top of a file
+       * with `cleanAll()` in a `beforeEach` - went on registering interceptors that matched
+       * while `hasMockedOrigin` no longer knew the origin was ours. Anything that *missed*
+       * those interceptors then fell through to the real network instead of failing closed,
+       * which is the one thing this shim owns an origin to prevent, and it did so silently.
+       */
+      pools.set(this.#poolKey, {pool: this.#pool, origin: this.#origin, active: true});
     }
 
     const interceptor = new Interceptor(this, this.#pool, this.#basePath, method, path, body, options);
@@ -965,7 +1111,17 @@ Object.assign(nock, {
     }
   },
   abortPendingRequests() {
-    // undici has no equivalent; interceptors are removed instead.
+    // A request already matched to an interceptor and now only waiting on `.delay()` never
+    // gets a reply: its timer is cancelled without ever resolving, so `mockDispatch` never
+    // completes it - the same "leave it hanging" behaviour real nock's own
+    // `removeAllTimers`-based `abortPendingRequests` has. Registered-but-unused interceptors
+    // are dropped too, as this shim has always done.
+    for (const timer of pendingDelayTimers) {
+      clearTimeout(timer);
+    }
+
+    pendingDelayTimers.clear();
+
     this.cleanAll();
   },
 });

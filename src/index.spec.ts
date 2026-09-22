@@ -3,20 +3,25 @@ import assert from 'node:assert';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import {clearInterval} from 'node:timers';
+import {setTimeout as sleep} from 'node:timers/promises';
 import {Readable, Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {text} from 'node:stream/consumers';
 import {randomUUID} from 'node:crypto';
+import {types} from 'node:util';
 import {Agent, Dispatcher, getGlobalDispatcher, interceptors, MockAgent, setGlobalDispatcher} from 'undici';
 import nock from './nock.ts';
 import client, {
   AbortError,
   createClient,
+  type GotlikeStream,
+  type GotlikeUploadStream,
   type HandlerFunction,
   Gotlike,
   HTTPError,
   ParseError,
   RequestError,
+  type RequestOptions,
   type Response as GotlikeResponse,
   TimeoutError,
   ValidationError,
@@ -576,6 +581,38 @@ test('timeout.request bounds the whole request, not just the gap between chunks'
 });
 
 /**
+ * A status the client lists as retryable must not cost the request its deadline.
+ *
+ * The retry bookkeeping stops the deadline when it expects undici to retry a response, so the
+ * backoff isn't charged to the attempt - but that is a *prediction*, and a prediction that
+ * misses used to leave the request with no deadline at all. undici only consults its retry
+ * policy for a 3xx and up (`RetryHandler.onResponseStart`), so a `retry.statusCodes` naming a
+ * 2xx - a polling client listing `202`, say - is never retried there however the prediction
+ * answers. Measured before the fix: the same request one status code away from this one gave
+ * up at 406ms, while this one was still reading a trickling body at 4s with no error at all.
+ *
+ * Both halves are pinned by this: the prediction now mirrors undici's own `>= 300` gate, and
+ * `resume()` puts the deadline back as soon as a response reaches the caller, so a prediction
+ * that misses for some *other* reason costs a restarted clock rather than the whole timeout.
+ */
+test('a status listed in retry.statusCodes that undici will not retry keeps its deadline', async () => {
+  const trickleClient = client.extend({
+    timeout: {request: 700},
+    // `/trickle` answers 200, which undici never routes through its retry policy.
+    retry: {statusCodes: [200], limit: 2, backoffLimit: 10},
+  });
+
+  const start = process.hrtime.bigint();
+
+  const error = await failure(trickleClient.get('http://localhost:3000/trickle'));
+
+  const elapsedMs = Number(process.hrtime.bigint() - start) / 1_000_000;
+
+  assert.strictEqual(error.code, 'ETIMEDOUT');
+  assert.ok(elapsedMs < 1500, `expected the deadline to survive the paused retry, ran for ${elapsedMs}ms`);
+});
+
+/**
  * Count the deadline timers `timeout.request` arms, and how many are still pending.
  *
  * The deadline used to be an `AbortSignal.timeout`, which cannot be cancelled: an abandoned
@@ -1006,6 +1043,298 @@ test('afterResponse can retry with merged options', async () => {
   assert.strictEqual(response.request.options.context.alreadyRetried, true);
 });
 
+/*
+ * `retryWithMergedOptions` re-enters `call()` with the merged options, and that nested call
+ * already decides `throwHttpErrors`/`isHttpError` for *itself* using them - the outer loop used
+ * to decide a second time using the original, pre-retry options, which meant a hook retrying
+ * with `throwHttpErrors: false` and a new url still got an `HTTPError` naming the *old* url, as
+ * long as the original request's own `throwHttpErrors` was left at its default `true`.
+ */
+test('an afterResponse retry’s own throwHttpErrors and url settle the outcome, not the original request’s', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.statusCode === 500) {
+            return retryWithMergedOptions({
+              url: 'http://localhost:3000/status?code=503',
+              throwHttpErrors: false,
+            });
+          }
+
+          return response;
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get('http://localhost:3000/status?code=500');
+
+  assert.strictEqual(response.statusCode, 503);
+  assert.match(String(response.url), /code=503/);
+});
+
+/*
+ * got documents that calling `retryWithMergedOptions` fires `beforeRetry` hooks and that the
+ * retried response's `retryCount` reflects it. Neither happened here: the retry recursed
+ * straight into `call()` rather than through undici's retry interceptor, which is the only
+ * other place either of those fired from.
+ */
+test('retryWithMergedOptions increments retryCount and fires beforeRetry', async () => {
+  const seen: [Error | undefined, number | undefined, number][] = [];
+
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRetry: [
+        (error, statusCode, retryCount) => {
+          seen.push([error, statusCode, retryCount]);
+        },
+      ],
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.statusCode === 401) {
+            return retryWithMergedOptions({headers: {authorization: 'Bearer refreshed'}});
+          }
+
+          return response;
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get('http://localhost:3000/unauthorized');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.retryCount, 1);
+  assert.strictEqual(seen.length, 1);
+  assert.strictEqual(seen[0]?.[1], 401);
+  assert.strictEqual(seen[0]?.[2], 1);
+});
+
+/**
+ * `retryCount` counts retries, and the count used to be the *nesting* level of the
+ * `retryWithMergedOptions` call instead.
+ *
+ * Two hooks each retrying once is two retries however they interleave, but `depth` only grows
+ * when one retry happens inside another - so two hooks retrying in sequence reported one
+ * retry between them, and a nested pair reported three for two. Both shapes are pinned here
+ * against the dispatches a `beforeRequest` hook counts, which is the only unarguable number.
+ */
+test('retryCount counts every afterResponse retry, nested or in sequence', async () => {
+  const counted = {dispatches: 0};
+
+  /** Two hooks, the first of which only retries once it sees what the second added. */
+  const nested = client.extend({
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      beforeRequest: [() => void counted.dispatches++],
+      afterResponse: [
+        (response, retry) =>
+          response.request.options.headers['x-from-second'] === undefined
+            ? response
+            : retry({headers: {'x-from-first': '1'}, prefixUrl: undefined}),
+        (response, retry) =>
+          response.request.options.headers['x-from-second'] === undefined
+            ? retry({headers: {'x-from-second': '1'}, prefixUrl: undefined})
+            : response,
+      ],
+    },
+  });
+
+  const nestedResponse = await nested.get('http://localhost:3000/json');
+
+  assert.strictEqual(counted.dispatches, 3, 'expected the original request plus two retries');
+  assert.strictEqual(nestedResponse.retryCount, 2);
+
+  /** The same two retries, but each hook retrying on its own rather than one inside the other. */
+  counted.dispatches = 0;
+
+  let firstRetried = false;
+  let secondRetried = false;
+
+  const sequential = client.extend({
+    responseType: 'json',
+    throwHttpErrors: false,
+    hooks: {
+      beforeRequest: [() => void counted.dispatches++],
+      afterResponse: [
+        (response, retry) => {
+          if (firstRetried) {
+            return response;
+          }
+
+          firstRetried = true;
+
+          return retry({headers: {'x-first': '1'}, prefixUrl: undefined});
+        },
+        (response, retry) => {
+          if (secondRetried) {
+            return response;
+          }
+
+          secondRetried = true;
+
+          return retry({headers: {'x-second': '1'}, prefixUrl: undefined});
+        },
+      ],
+    },
+  });
+
+  const sequentialResponse = await sequential.get('http://localhost:3000/json');
+
+  assert.strictEqual(counted.dispatches, 3, 'expected the original request plus two retries');
+  assert.strictEqual(sequentialResponse.retryCount, 2);
+});
+
+/**
+ * A retry's options get the same normalisation and validation a per-call options object gets.
+ *
+ * `retryWithMergedOptions` goes straight to `call()`, so it is the one route in that skips
+ * `formOptions` - which made it a second, permanent `validate: false` that no caller could turn
+ * on. A lower-case `method` reached the request line verbatim and the server answered 400 (got
+ * normalises it and succeeds), and a misspelled `responseType` fell past the `json`/`text` arms
+ * to hand back a `Buffer` where the identical typo on the original call throws.
+ */
+test('an afterResponse retry normalises and validates the options it is given', async () => {
+  /*
+   * The "already retried" marker travels in `context`, not in a header: the table below feeds
+   * this whole option objects, `headers` among them, and a marker header would overwrite the
+   * very value under test - which is how the first draft of this reported a gap that was its
+   * own harness.
+   */
+  const retried = (newOptions: RequestOptions) =>
+    client.extend({
+      responseType: 'json',
+      throwHttpErrors: false,
+      hooks: {
+        afterResponse: [
+          (response, retry) =>
+            response.request.options.context['retried'] === undefined
+              ? retry({...newOptions, context: {retried: true}})
+              : response,
+        ],
+      },
+    });
+
+  // Folded to `POST`, as `formOptions` folds it - not sent as the literal `post`.
+  const response = await retried({method: 'post'}).post<Echo>('http://localhost:3000/echo');
+
+  assert.strictEqual(response.body.method, 'POST');
+
+  /*
+   * The invariant, rather than a handful of examples: whatever `formOptions` refuses on a normal
+   * call, the retry merge refuses too. Both routes are driven from the same table, so an option
+   * whose validation only one of them applies shows up as a failure here - which is what the
+   * retry path was, wholesale, for every rule at once.
+   */
+  const rejected: {label: string; options: unknown}[] = [
+    {label: 'a misspelled responseType', options: {responseType: 'jsn'}},
+    {label: 'a method that is not one', options: {method: 'NOTAMETHOD'}},
+    {label: 'a timeout that is not an object', options: {timeout: 1000}},
+    {label: 'timeout.request of 0', options: {timeout: {request: 0}}},
+    {label: 'a non-finite timeout.request', options: {timeout: {request: Number.POSITIVE_INFINITY}}},
+    {label: 'headers that are not an object', options: {headers: []}},
+    {label: 'a prefixUrl carrying a query', options: {prefixUrl: 'http://localhost:3000?q=1'}},
+    {label: 'a prefixUrl carrying a fragment', options: {prefixUrl: 'http://localhost:3000#f'}},
+    {label: 'searchParams that are not a query', options: {searchParams: 5}},
+    {label: 'a form that is not an object', options: {form: 'a=1'}},
+    {label: 'an unknown option', options: {nonsense: 1}},
+    {label: 'a client-only option per request', options: {hooks: {beforeRequest: []}}},
+    {label: 'retry per request', options: {retry: {limit: 1}}},
+  ];
+
+  const disagreed: string[] = [];
+
+  /*
+   * Describes the outcome rather than assuming one. An option that stops being rejected has to
+   * read as a disagreement on its own row - throwing here instead would hide every row after it,
+   * which is how a table test quietly becomes a test of its first entry.
+   */
+  const outcome = async (run: () => Promise<unknown>): Promise<string> => {
+    try {
+      await run();
+
+      return 'resolved';
+    } catch (error) {
+      return error instanceof ValidationError
+        ? `ValidationError/${error.code}`
+        : `${(error as Error).constructor.name}: ${(error as Error).message}`;
+    }
+  };
+
+  for (const {label, options} of rejected) {
+    const onCall = await outcome(() => client.get('http://localhost:3000/json', options as RequestOptions));
+    const onRetry = await outcome(() => retried(options as RequestOptions).get('http://localhost:3000/json'));
+
+    if (onCall !== onRetry) {
+      disagreed.push(`${label}\n    on the call:  ${onCall}\n    on the retry: ${onRetry}`);
+    }
+  }
+
+  assert.deepStrictEqual(
+    disagreed,
+    [],
+    `the retry merge and formOptions disagree about these options:\n  ${disagreed.join('\n  ')}`,
+  );
+});
+
+/**
+ * A got option this does not implement says so, rather than reading as a misspelling.
+ *
+ * got accepts `retry.calculateDelay`, `retry.noise` and `hooks.init`; gotlike refuses all three,
+ * because silently ignoring them means a backoff tuning that never applies and an `init` hook
+ * that never fires - the very thing the unknown-key check exists to stop. That makes it a
+ * behavioural divergence from got, so it is named as one in the message and in the README.
+ */
+test('a got option gotlike does not implement is refused by name', () => {
+  // Cast at the boundary: these are got's option names, which `RequestOptions` deliberately
+  // does not declare - a caller migrating from got is writing them in untyped or loosely typed
+  // code, which is exactly the case the runtime check is here for.
+  const options: {label: string; value: unknown}[] = [
+    {label: '`retry.calculateDelay` is not implemented', value: {retry: {calculateDelay: () => 0}}},
+    {label: '`retry.noise` is not implemented', value: {retry: {noise: 100}}},
+    {label: '`hooks.init` is not implemented', value: {hooks: {init: [() => {}]}}},
+  ];
+
+  for (const {label: expected, value} of options) {
+    assert.throws(
+      () => createClient(value as RequestOptions),
+      (error: Error) =>
+        error instanceof ValidationError &&
+        error.message.startsWith(expected) &&
+        // Not the generic "Unknown option", which is what a real typo still gets.
+        !error.message.startsWith('Unknown option'),
+      `expected ${expected}`,
+    );
+  }
+
+  // A genuine typo is still a typo.
+  assert.throws(() => createClient({retry: {limt: 0}} as RequestOptions), /Unknown option `retry.limt`/);
+});
+
+/**
+ * `isResponseLike` deliberately accepts anything carrying a numeric `statusCode`, so a hook may
+ * hand back a response it built itself - and one of those has no `request` on it. Reading
+ * `response.request.options` straight through threw a bare `Cannot read properties of undefined
+ * (reading 'options')` from outside the hook loop's own try, which was the last place a raw
+ * error could escape the `RequestError` wrapper and the `beforeError` hooks entirely.
+ */
+test('an afterResponse hook may return a response it built itself', async () => {
+  const extClient = client.extend({
+    hooks: {
+      afterResponse: [() => ({statusCode: 200, body: 'replaced'}) as unknown as GotlikeResponse<string>],
+    },
+  });
+
+  const response = await extClient.get('http://localhost:3000/json');
+
+  assert.strictEqual(response.body, 'replaced');
+  assert.strictEqual(response.statusCode, 200);
+});
+
 test('afterResponse retry keeps prefixUrl from being applied twice', async () => {
   const extClient = client.extend({
     prefixUrl: 'http://localhost:3000',
@@ -1127,6 +1456,30 @@ test('beforeError can replace the thrown error', async () => {
       return true;
     },
   );
+});
+
+/*
+ * `toRequestError` awaited each `beforeError` hook with nothing to catch a throw - so a hook
+ * that itself threw escaped as that raw error rather than the `RequestError` already built,
+ * indistinguishable from a network failure to anything matching `instanceof RequestError`. got
+ * wraps the same failure in a `RequestError` rather than letting it through raw.
+ */
+test('a beforeError hook that throws is wrapped in a RequestError rather than escaping raw', async () => {
+  const extClient = client.extend({
+    hooks: {
+      beforeError: [
+        () => {
+          throw new Error('hook exploded');
+        },
+      ],
+    },
+  });
+
+  const err = await failure<RequestError>(extClient.get('http://localhost:3000/status?code=500'));
+
+  assert.ok(err instanceof RequestError);
+  assert.match(err.message, /hook exploded/);
+  assert.strictEqual((err.cause as Error).message, 'hook exploded');
 });
 
 /**
@@ -2570,6 +2923,37 @@ test('validation runs on create and extend, throwing synchronously', () => {
 });
 
 /*
+ * A misspelled nested key inside `retry` or `hooks` used to be accepted outright: `retry:
+ * {limt: 0}` silently kept the default `limit` (enabling two retries the caller meant to turn
+ * off), and `hooks: {beforeReqest: [...]}` silently never called the hook it named at all -
+ * both indistinguishable from a working configuration until something downstream misbehaved.
+ * Only reachable at create/extend time, since `retry`/`hooks` are client-only options and a
+ * per-request `{retry: {...}}` is refused before ever reaching the nested check.
+ */
+test('an unknown key inside retry is rejected rather than silently ignored', () => {
+  assert.throws(() => new Gotlike({retry: {limt: 0} as never}), {
+    name: 'ValidationError',
+    code: 'ERR_INVALID_OPTION',
+    message: /Unknown option `retry\.limt`/,
+  });
+
+  assert.throws(() => client.extend({retry: {statusCode: [500]} as never}), /Unknown option `retry\.statusCode`/);
+});
+
+test('an unknown hook name is rejected rather than silently dropped', () => {
+  assert.throws(() => new Gotlike({hooks: {beforeReqest: [() => undefined]} as never}), {
+    name: 'ValidationError',
+    code: 'ERR_INVALID_OPTION',
+    message: /Unknown option `hooks\.beforeReqest`/,
+  });
+
+  assert.throws(
+    () => client.extend({hooks: {afterResonse: [() => undefined]} as never}),
+    /Unknown option `hooks\.afterResonse`/,
+  );
+});
+
+/*
  * got refuses this outright rather than picking a winner; the argument used to overwrite the
  * option with nothing said. Measured against got 16, which rejects a `url` key in an options
  * object in every position - a change that landed in got 15. gotlike keeps it, because the
@@ -2609,7 +2993,7 @@ test('validate false skips the per-request check but not the client one', async 
   const lax = new Gotlike({responseType: 'text', validate: false});
 
   // would be rejected as an unknown option otherwise
-  const response = await lax.get('http://localhost:3000/json', {nonsense: true} as never);
+  const response = await lax.get('http://localhost:3000/json', {nonsense: true} as RequestOptions);
 
   assert.strictEqual(response.statusCode, 200);
 
@@ -2812,6 +3196,50 @@ test('timeout.request does not expire during retry backoff', async () => {
 
   assert.strictEqual(response.body, 'flaky ok');
   assert.strictEqual(response.retryCount, 1);
+});
+
+/**
+ * Pausing the deadline for a retry is a *prediction* (`willRetryStatus`), and a prediction that
+ * misses must not cost the request its deadline outright - which is what it used to do, with no
+ * error and no end. `resume()` is the failsafe, called the moment a response reaches the caller
+ * on all three paths, and is exercised here directly: the prediction now mirrors undici's own
+ * gate closely enough that provoking a miss over the wire means reaching into `retry-handler.js`
+ * for whichever divergence is left this week, which is a test that measures undici rather than
+ * this.
+ */
+test('a deadline paused for a retry that never comes is put back', async () => {
+  const deadlineClient = new Gotlike({timeout: {request: 60}, retry: {limit: 2}});
+
+  // Nothing is paused, so `resume` must arm nothing: `release` is still the end of this one.
+  const idle = deadlineClient.dispatchOptions(deadlineClient.formOptions({}));
+
+  idle.resume();
+  idle.release();
+
+  const paused = deadlineClient.dispatchOptions(deadlineClient.formOptions({}));
+
+  assert.ok(paused.attempts?.pauseDeadline, 'a retrying client carries the deadline controls');
+
+  // The deadline is what `signal` is built from when `timeout.request` is set.
+  const pausedSignal = paused.signal;
+  const idleSignal = idle.signal;
+
+  assert.ok(pausedSignal instanceof AbortSignal);
+  assert.ok(idleSignal instanceof AbortSignal);
+
+  paused.attempts.pauseDeadline();
+  paused.resume();
+
+  const fired = await Promise.race([
+    new Promise<boolean>((resolve) => pausedSignal.addEventListener('abort', () => resolve(true))),
+    sleep(500, false),
+  ]);
+
+  assert.strictEqual(fired, true, 'the resumed deadline never fired');
+  assert.strictEqual((pausedSignal.reason as Error).name, 'TimeoutError');
+  assert.strictEqual(idleSignal.aborted, false, 'a released deadline fired anyway');
+
+  paused.release();
 });
 
 /*
@@ -4509,6 +4937,177 @@ test('a same-origin hook rewrite keeps everything', async () => {
   assert.strictEqual(response.body.body, 'PAYLOAD');
 });
 
+/*
+ * `splitUserinfo` only ever ran on the url a request started with, before the `beforeRequest`
+ * hooks saw it - so a hook rewriting to a url carrying *new* credentials (signing onto a
+ * discovered endpoint, say) had them go out anonymous: undici ignores userinfo in the url
+ * outright, and nothing derived an `authorization` header for it a second time.
+ */
+test('a beforeRequest hook rewriting the url to carry new credentials sends Basic auth for them', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://newuser:newpass@localhost:3000/echo';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://localhost:3000/json');
+
+  assert.strictEqual(
+    response.body.headers['authorization'],
+    'Basic ' + Buffer.from('newuser:newpass').toString('base64'),
+  );
+});
+
+/*
+ * Cross-origin stripping used to compare the header/body *value* before and after the hooks ran,
+ * so a hook that explicitly re-asserted the very same `authorization` string - or rebuilt a body
+ * that happened to come out identical - read as untouched and was stripped anyway, contradicting
+ * "values set by the hook survive". `trackHookWrites` tells the two apart by tracking the write
+ * itself rather than comparing values.
+ */
+test('a cross-origin hook keeps an authorization it explicitly re-set to the same value', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://localhost:3000/echo/moved';
+          options.headers['authorization'] = 'Bearer secret';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://127.0.0.1:3000/json', {
+    body: 'PAYLOAD',
+    headers: {authorization: 'Bearer secret'},
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer secret');
+});
+
+/**
+ * Deleting a header is a hook saying what the request should carry, just as assigning one is.
+ *
+ * The tracking records both, so the cross-origin strip has nothing left to decide for a name
+ * the hook already dealt with - and a `cookie` it deliberately dropped stays dropped while the
+ * `authorization` it put there for the new origin survives.
+ */
+test('a cross-origin hook that deletes a header has that respected too', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://localhost:3000/echo/moved';
+          delete options.headers['cookie'];
+          options.headers['authorization'] = 'Bearer for-the-new-origin';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://127.0.0.1:3000/json', {
+    headers: {cookie: 'session=secret', authorization: 'Bearer for-the-old-origin'},
+  });
+
+  assert.strictEqual(response.body.headers['cookie'], undefined);
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer for-the-new-origin');
+});
+
+/**
+ * A hook may replace `options.headers` outright rather than mutating it, and the credentials it
+ * put there for the new origin have to survive that.
+ *
+ * Assigning a new object throws the write-tracking Proxy away along with everything it recorded,
+ * so the strip concluded the hook had "never touched" `authorization` and deleted the token it
+ * had just minted - the request reached the new origin anonymous, and all the caller saw was a
+ * 401 from a host they had just authenticated to. got 16 sends the hook's header. This is why
+ * the strip needs the value comparison as well as the write set: neither signal alone is enough.
+ */
+test('a cross-origin hook that replaces the headers object keeps the credentials it set', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://localhost:3000/echo/moved';
+          options.headers = {authorization: 'Bearer for-the-new-origin', 'x-keep': '1'};
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get<Echo>('http://127.0.0.1:3000/json', {
+    headers: {authorization: 'Bearer for-the-old-origin', cookie: 'session=secret'},
+  });
+
+  assert.strictEqual(response.body.headers['authorization'], 'Bearer for-the-new-origin');
+  assert.strictEqual(response.body.headers['x-keep'], '1');
+  // The object the hook installed carries no cookie, so the session did not travel either.
+  assert.strictEqual(response.body.headers['cookie'], undefined);
+});
+
+test('a cross-origin hook keeps a body it explicitly re-set to an equal value', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.url = 'http://localhost:3000/echo/moved';
+          options.body = 'PAYLOAD';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://127.0.0.1:3000/json', {body: 'PAYLOAD'});
+
+  assert.strictEqual(response.body.body, 'PAYLOAD');
+});
+
+/**
+ * The cross-origin bookkeeping lives for the hook loop and no longer.
+ *
+ * Telling "the hook set this" from "the hook left this standing" needs a Proxy over
+ * `options.headers` and an accessor over `options.body` - but those used to stay in place all
+ * the way to the dispatch, so undici read every header of every request through the Proxy.
+ * Measured at ~780ns a request against ~19ns for the plain object, on a client whose entire
+ * documented overhead is under 500ns, and paid by exactly the clients that always have hooks.
+ *
+ * Asserted on the options the response carries, which is the same object the dispatch was
+ * made with.
+ */
+test('the beforeRequest hook bookkeeping is off the options again by the time the request goes out', async () => {
+  const extClient = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          options.headers['x-log-id'] = 'abc';
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.post<Echo>('http://localhost:3000/echo', {body: 'PAYLOAD'});
+  const dispatched = response.request.options;
+
+  const bodyDescriptor = Object.getOwnPropertyDescriptor(dispatched, 'body');
+
+  assert.strictEqual(types.isProxy(dispatched.headers), false, 'headers reached undici as a Proxy');
+  assert.ok(bodyDescriptor && 'value' in bodyDescriptor, '`body` was left as an accessor');
+
+  // And the tracking still did its job while the hooks were running.
+  assert.strictEqual(dispatched.headers['x-log-id'], 'abc');
+  assert.strictEqual(response.body.body, 'PAYLOAD');
+});
+
 // A default port written out is the same origin, which is why the comparison falls back to
 // `URL` rather than trusting the authority text.
 test('a hook rewrite to the same origin written differently is not treated as cross-origin', async () => {
@@ -5157,6 +5756,68 @@ test('extend merges searchParams with the parent’s', async () => {
   assert.strictEqual(parentResponse.body.url, '/echo?apiKey=secret&v=1');
 });
 
+/*
+ * The constructor's spread handed back the caller's own `URLSearchParams`/object by reference,
+ * so mutating it after `createClient(...)` returned silently changed every request the client
+ * made from then on - the same failure mode `mergeRecords`/`concatHooks`/`mergeHooks` already
+ * guard `context`/`handlers`/`hooks` against, just missed for `searchParams`.
+ */
+test('a client built with searchParams snapshots it rather than sharing the caller’s object', async () => {
+  const params = new URLSearchParams({token: 'a'});
+  const scoped = new Gotlike({prefixUrl: 'http://localhost:3000', responseType: 'json', searchParams: params});
+
+  params.set('token', 'b');
+
+  const response = await scoped.get<Echo>('echo');
+
+  assert.strictEqual(response.body.url, '/echo?token=a');
+});
+
+test('extend() with searchParams snapshots it rather than sharing the caller’s object', async () => {
+  const params = new URLSearchParams({token: 'a'});
+  const scoped = client.extend({prefixUrl: 'http://localhost:3000', responseType: 'json', searchParams: params});
+
+  params.set('token', 'b');
+
+  const response = await scoped.get<Echo>('echo');
+
+  assert.strictEqual(response.body.url, '/echo?token=a');
+});
+
+/**
+ * A string `searchParams` is re-encoded, not concatenated as written.
+ *
+ * `resolveUrl` appends the serialised query straight onto the url, so every character in the
+ * caller's string landed in the url as a url character: the first `#` opened a fragment, a
+ * fragment is never sent, and every parameter after it vanished off the wire with no error.
+ * `next=<url>#anchor` is an entirely ordinary value to put in a query.
+ *
+ * It was inconsistent with itself too, which is worse to debug than being wrong: the two-sided
+ * case went through `mergeSearchParams`, which round-trips through `URLSearchParams` and so
+ * encoded correctly, while the one-sided case - the common one - did not.
+ */
+test('a string searchParams is encoded rather than concatenated verbatim', async () => {
+  const scoped = client.extend({prefixUrl: 'http://localhost:3000', responseType: 'json'});
+
+  // A `#` used to truncate the query here: the server saw `/echo?next=/home` and `b` was gone.
+  const fragment = await scoped.get<Echo>('echo', {searchParams: 'next=/home#top&b=2'});
+
+  assert.strictEqual(fragment.body.url, '/echo?next=%2Fhome%23top&b=2');
+
+  // got's encoding, which is `URLSearchParams`': a `;` is an ordinary character in a value.
+  const semicolon = await scoped.get<Echo>('echo', {searchParams: 'a=1;b=2'});
+
+  assert.strictEqual(semicolon.body.url, '/echo?a=1%3Bb%3D2');
+
+  // The same value on a client that also carries a query - the path that was always right -
+  // has to agree with the one that was not.
+  const merged = await client
+    .extend({prefixUrl: 'http://localhost:3000', responseType: 'json', searchParams: {v: '1'}})
+    .get<Echo>('echo', {searchParams: 'next=/home#top&b=2'});
+
+  assert.strictEqual(merged.body.url, '/echo?v=1&next=%2Fhome%23top&b=2');
+});
+
 test('searchParams merge across strings and URLSearchParams too', async () => {
   const extClient = client.extend({
     prefixUrl: 'http://localhost:3000',
@@ -5239,6 +5900,21 @@ test('stream carries the verb helpers got puts on it', async () => {
 
   assert.strictEqual(echo.method, 'POST');
   assert.strictEqual(echo.body, 'through-stream-post');
+});
+
+/*
+ * `null` is a legal `body` (declared on `RequestOptions`) and means the same "no body" it does
+ * on the non-stream path. The upload duplex's writable half used to be ended only when `body`
+ * was neither `undefined` nor `null`, so `stream.post(url, {body: null})` left it open for a
+ * caller who had explicitly said there was nothing to write, and the request hung forever.
+ */
+test('stream.post with an explicit null body ends the request rather than hanging', async () => {
+  const upload = await client.stream.post('http://localhost:3000/echo', {body: null});
+
+  const echo = JSON.parse(await text(upload)) as Echo;
+
+  assert.strictEqual(echo.method, 'POST');
+  assert.strictEqual(echo.body, '');
 });
 
 test('the stream verbs take options and hooks like any other call', async () => {
@@ -5981,6 +6657,145 @@ test('a method that is not an HTTP method is still refused', async () => {
   });
 });
 
+/**
+ * Invariant: **every** failure reaches the caller as a `RequestError` or a `ValidationError`.
+ *
+ * Those two classes are the whole contract - one says the request failed, the other says the
+ * caller configured something wrong - and the README tells callers to match on them. A raw
+ * `Error` or `TypeError` escaping means the `beforeError` hooks did not run and
+ * `instanceof RequestError` silently missed a failure.
+ *
+ * This is deliberately a table rather than one test per row. Every error bug in this repo's
+ * history has been *one uncovered path*, not a wrong class on a covered one: a throwing
+ * `beforeRequest` hook, a throwing `beforeError` hook, a hook that forgot to return, a
+ * hand-made response with no `request` on it. Listing the paths in one place makes adding a
+ * new one an obvious edit, and makes a newly-uncovered one a visible omission rather than a
+ * test nobody wrote.
+ */
+test('every failure path reports a RequestError or a ValidationError, never a raw error', async () => {
+  const hooked = (hooks: RequestOptions['hooks']) => client.extend({responseType: 'json', hooks});
+
+  const paths: [string, () => Promise<unknown>][] = [
+    ['connection refused', () => client.get('http://127.0.0.1:1/nope')],
+    ['dns failure', () => client.get('http://does-not-exist.invalid/nope')],
+    ['http error status', () => client.get('http://localhost:3000/status?code=500')],
+    // `/stream` answers 200 with `hello\n` repeated, which is not json.
+    ['parse failure on an ok status', () => client.get('http://localhost:3000/stream', {responseType: 'json'})],
+    ['malformed url', () => client.get('not-a-url')],
+    ['timeout', () => client.get('http://localhost:3000/timeout', {timeout: {request: 50}})],
+    ['aborted', () => client.get('http://localhost:3000/timeout', {signal: AbortSignal.abort()})],
+    [
+      'aborted with a custom reason',
+      () => client.get('http://localhost:3000/timeout', {signal: AbortSignal.abort(new Error('cancelled'))}),
+    ],
+    ['circular json', () => client.post('http://localhost:3000/echo', {json: circular()})],
+    // Hooks: each of the four, throwing an Error and throwing something that is not one.
+    [
+      'beforeRequest throws',
+      () =>
+        hooked({
+          beforeRequest: [
+            () => {
+              throw new Error('hook');
+            },
+          ],
+        }).get('http://localhost:3000/json'),
+    ],
+    [
+      'beforeRequest throws a non-Error',
+      () =>
+        hooked({
+          beforeRequest: [
+            () => {
+              throw 'hook';
+            },
+          ],
+        }).get('http://localhost:3000/json'),
+    ],
+    [
+      'afterResponse throws',
+      () =>
+        hooked({
+          afterResponse: [
+            () => {
+              throw new Error('hook');
+            },
+          ],
+        }).get('http://localhost:3000/json'),
+    ],
+    [
+      'afterResponse forgets to return',
+      () => hooked({afterResponse: [(() => undefined) as never]}).get('http://localhost:3000/json'),
+    ],
+    [
+      // A hook may hand back a response it built itself (`isResponseLike` accepts anything with
+      // a numeric `statusCode`), and that one has no `request` on it - which used to be read
+      // through unconditionally, from outside the hook loop's try, as a raw TypeError.
+      'afterResponse returns a hand-made error response',
+      () =>
+        hooked({afterResponse: [(() => ({statusCode: 500, body: 'x'})) as never]}).get('http://localhost:3000/json'),
+    ],
+    [
+      'beforeError throws',
+      () =>
+        hooked({
+          beforeError: [
+            () => {
+              throw new Error('hook');
+            },
+          ],
+        }).get('http://localhost:3000/status?code=500'),
+    ],
+    [
+      'beforeError returns a non-Error',
+      () => hooked({beforeError: [(() => 'nope') as never]}).get('http://localhost:3000/status?code=500'),
+    ],
+    // Configuration mistakes, on both routes into `call()`.
+    ['a bad option on the call', () => client.get('http://localhost:3000/json', {responseType: 'jsn' as never})],
+    [
+      'a bad option on an afterResponse retry',
+      () =>
+        hooked({
+          afterResponse: [
+            (response, retry) =>
+              response.request.options.headers['x-retried'] === undefined
+                ? retry({responseType: 'jsn' as never, headers: {'x-retried': '1'}})
+                : response,
+          ],
+        }).get('http://localhost:3000/json'),
+    ],
+  ];
+
+  const wrong: string[] = [];
+
+  for (const [label, run] of paths) {
+    let error: Error;
+
+    try {
+      await run();
+      wrong.push(`${label}: RESOLVED instead of failing`);
+      continue;
+    } catch (caught) {
+      error = caught as Error;
+    }
+
+    if (!(error instanceof RequestError) && !(error instanceof ValidationError)) {
+      wrong.push(`${label}: ${error.constructor.name} - ${error.message}`);
+    }
+  }
+
+  assert.deepStrictEqual(wrong, [], `these failure paths escaped the error contract:\n  ${wrong.join('\n  ')}`);
+});
+
+/** A value `JSON.stringify` refuses, for the serialisation-failure path above. */
+function circular(): unknown {
+  const value: Record<string, unknown> = {};
+
+  value['self'] = value;
+
+  return value;
+}
+
 /*
  * Type-level assertions.
  *
@@ -6040,6 +6855,19 @@ async function typeAssertions() {
   expectType<Buffer>()((await client.get('u')).rawBody);
   expectType<number>()((await client.get('u')).retryCount);
   expectType<number>()((await (await client.stream('u')).response).retryCount);
+
+  // `{isStream: true}` is documented as equivalent to `.stream(...)` - nothing about `handle()`,
+  // the verb methods or the callable form used to key on it, so this claimed `Response<T>` while
+  // resolving to a `GotlikeStream` at runtime.
+  expectType<GotlikeStream>()(await client.get('u', {isStream: true}));
+  expectType<GotlikeStream>()(await client.head('u', {isStream: true}));
+  expectType<GotlikeUploadStream>()(await client.post('u', {isStream: true}));
+  expectType<GotlikeUploadStream>()(await client.put('u', {isStream: true}));
+  expectType<GotlikeUploadStream>()(await client.patch('u', {isStream: true}));
+  expectType<GotlikeUploadStream>()(await client.delete('u', {isStream: true}));
+  expectType<GotlikeUploadStream>()(await client.query('u', {isStream: true}));
+  expectType<GotlikeStream | GotlikeUploadStream>()(await client('u', {isStream: true}));
+  expectType<GotlikeStream | GotlikeUploadStream>()(await client({url: 'u', isStream: true}));
 }
 
 void typeAssertions;

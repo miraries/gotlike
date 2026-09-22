@@ -20,6 +20,16 @@ const spicyPathChars = "abc019 %+&=:@,;'()!$*";
 const queryKeyChars = 'abcXYZ019_-';
 const queryValueChars = "abc019 %+&=/:@.,~!*'()";
 
+/**
+ * The same, plus the three characters that decide whether a query survives the trip.
+ *
+ * `#` ends the query and starts a fragment, which is never sent; `;` and `+` are ordinary
+ * characters in a value that several encoders disagree about. None of them were in the alphabet
+ * above, which is half of why a string `searchParams` went unencoded onto the url for so long -
+ * the generator could name the bug's subsystem but never its input.
+ */
+const fragileQueryValueChars = "abc019 %+&=/:@.,~!*'()#;?";
+
 function segment(rng: Rng): string {
   const alphabet = rng.bool() ? pathChars : spicyPathChars;
 
@@ -93,6 +103,48 @@ propertyTest('a client searchParams and a per-call one merge the way got merges 
   run: async (client, base, input) => {
     const scoped = client.extend({prefixUrl: base, responseType: 'json', searchParams: input.base});
     const response = await scoped.get('echo', {searchParams: input.override});
+
+    return (response.body as {path: string}).path;
+  },
+});
+
+/*
+ * `searchParams` takes three shapes - a string, a `URLSearchParams` and a plain object - and each
+ * one reaches the wire by a different route through `stringifyQuery`. The suite explored only the
+ * object, so the string branch was never compared against got at all: it was concatenated onto
+ * the url exactly as written, and the first `#` in it opened a fragment that took every parameter
+ * after it off the wire, silently. `resolveUrl` also has to reconcile a query the *url* already
+ * carries, so that is generated too.
+ *
+ * Whatever shape the caller uses, the same pairs must reach the server the same way.
+ */
+propertyTest('searchParams reaches the wire the same way whatever shape it is given in', {
+  claim: 'CLAUDE.md: `searchParams` replaces the url’s own query; a string is re-encoded, not concatenated.',
+  cases: 90,
+  generate: (rng) => ({
+    shape: rng.pick(['string', 'params', 'object'] as const),
+    // Unique keys, so all three shapes can represent the same pairs faithfully - an object
+    // cannot hold a repeated key, and the point here is the shape rather than repetition.
+    pairs: Array.from({length: 1 + rng.int(3)}, (_, index) => [
+      `${rng.string(queryKeyChars, 1 + rng.int(4))}${index}`,
+      rng.string(fragileQueryValueChars, rng.int(6)),
+    ]) as [string, string][],
+    // Half the cases put a query on the url as well, which `searchParams` has to replace.
+    urlQuery: rng.bool(),
+  }),
+  run: async (client, base, input) => {
+    // Built inside `run`, never in `generate`: a `URLSearchParams` is mutable, and one shared
+    // across both clients would let the first run alter what the second is given.
+    const asString = input.pairs.map(([key, value]) => `${key}=${value}`).join('&');
+    const searchParams =
+      input.shape === 'string'
+        ? asString
+        : input.shape === 'params'
+          ? new URLSearchParams(asString)
+          : Object.fromEntries(new URLSearchParams(asString));
+
+    const scoped = client.extend({prefixUrl: base, responseType: 'json'});
+    const response = await scoped.get(input.urlQuery ? 'echo?carried=1' : 'echo', {searchParams});
 
     return (response.body as {path: string}).path;
   },

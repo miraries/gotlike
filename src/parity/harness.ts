@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert';
+import type {Duplex, Readable} from 'node:stream';
 import realGot from 'got';
 import gotlike from '../index.ts';
 import {startParityServer, type ParityServer, type WireRecord} from './server.ts';
@@ -17,7 +18,19 @@ export type ParityClient = {
   delete: (url: string, options?: Record<string, unknown>) => Promise<AnyResponse>;
   head: (url: string, options?: Record<string, unknown>) => Promise<AnyResponse>;
   extend: (options: Record<string, unknown>) => ParityClient;
+  /**
+   * got returns a stream synchronously; gotlike resolves to one, because its `beforeRequest`
+   * hooks are async and awaiting them is worth more than the sync return (a documented
+   * divergence). `MaybeAsync` is what lets one scenario body drive both - `await` settles the
+   * difference and leaves everything *about* the stream comparable.
+   */
+  stream: {
+    (url: string, options?: Record<string, unknown>): MaybeAsync<Readable>;
+    post: (url: string, options?: Record<string, unknown>) => MaybeAsync<Duplex>;
+  };
 };
+
+type MaybeAsync<T> = T | Promise<T>;
 
 export type AnyResponse = {
   statusCode: number;

@@ -110,13 +110,15 @@ Supports:
 | `url` as an option - `gotlike({ url, ... })` | **rejected since got 15** - a `TypeError` for a `url` key in any options object, `extend()` included; got 12 and 14 accepted it | **kept** - the callable form is built on it. Passing a url as an argument *and* as an option is rejected on both sides |
 | `responseType: 'buffer'` | a `Uint8Array` since got 15 | a real **`Buffer`**. `Buffer` extends `Uint8Array`, so it satisfies anything typed for one, and callers feeding `sharp()` and friends need the subclass. `response.rawBody` likewise |
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
+| `retry.calculateDelay`, `retry.noise`, `hooks.init` | accepted | a **`ValidationError`** naming the option - "not implemented", not "unknown". Ignoring them would mean a backoff tuning that silently never applies and an `init` hook that silently never fires, which is the failure the unknown-key check exists to stop. Drop them, or cap the backoff with `retry.backoffLimit` and move `init` work into `beforeRequest` |
+| an unknown key in `retry` or `hooks` | accepted and ignored | a **`ValidationError`**. `retry: { limt: 0 }` used to leave the *default* two retries in place, and a misspelled hook name simply never fired |
 
 ### Forced by undici
 
 | | behaviour |
 | --- | --- |
 | `timeout.request` | a cap on a whole **attempt**, as got's is - it covers every phase, and it starts over for each retry rather than being a budget for the sequence. undici's own `headersTimeout`/`bodyTimeout` are per-phase and `bodyTimeout` restarts on every chunk, so a slowly trickling response would never trip them - a deadline signal enforces the total on top. That also sidesteps undici's coarse 1s timer wheel, so sub-second timeouts fire on time |
-| `retry` | maps onto undici's `retry` interceptor. `limit` defaults to got's 2, and `Retry-After` is honoured, but `calculateDelay`/`noise` are not implemented and `maxRetryAfter` degrades to "honour the header or don't". The retried **status codes and methods are undici's defaults**, not got's - set `statusCodes`/`methods` explicitly if that matters |
+| `retry` | maps onto undici's `retry` interceptor. `limit` defaults to got's 2, and `Retry-After` is honoured, but `calculateDelay`/`noise` are not implemented (and are *rejected* rather than ignored - see the table above) and `maxRetryAfter` degrades to "honour the header or don't". The retried **status codes and methods are undici's defaults**, not got's - set `statusCodes`/`methods` explicitly if that matters |
 | `beforeRedirect`, `beforeRetry` | **cannot delay or cancel** - undici decides both inside a synchronous dispatch interceptor, so a returned promise is not awaited |
 | `300 Multiple Choices` | **followed** when `followRedirect` is on, because undici's redirect interceptor counts 300 as redirectable. got 15 stopped following it (RFC 9110 makes it a SHOULD for user agents) and hands the 300 back instead. 304 is not followed by either |
 | streamed request bodies | **not replayed across a 307/308**, which must preserve method and body. 301/302/303 are fine (they rewrite to GET and drop the body); non-streamed bodies replay normally |
@@ -515,7 +517,7 @@ response.rawBody     // Buffer of the bytes received; computed on first access, 
 response.ok          // statusCode in the 2xx range
 response.statusCode
 response.headers
-response.retryCount  // 0 unless `retry` is configured
+response.retryCount  // retries undici made, plus any an afterResponse hook drove; 0 without either
 response.timings.phases.total
 response.request.options
 ```

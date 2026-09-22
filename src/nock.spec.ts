@@ -1,9 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert';
+import {text} from 'node:stream/consumers';
 import {getGlobalDispatcher} from 'undici';
 import {parse as parseUrl} from 'node:url';
 import nock, {type ReplyFunctionResult} from './nock.ts';
-import client, {type RequestError} from './index.ts';
+import client, {createClient, type RequestError} from './index.ts';
 
 /**
  * Await something expected to fail and hand back the error.
@@ -112,6 +113,21 @@ test('matches a regex path, including under a base path', async () => {
   assert.strictEqual(response.body.error, '0');
 });
 
+/*
+ * A `persist()`ed interceptor reuses the same RegExp for every request it answers. `test()` on
+ * a `/g`/`y` pattern advances `lastIndex` past a match, so a request that matched left the
+ * pattern primed to resume searching from there rather than the start - the next, identical
+ * request missed, and the one after that matched again. Reset before every test, the way the
+ * origin matcher already did.
+ */
+test('a persisted global-flag regex path matches every request, not every other one', async () => {
+  nock('http://mock.test').persist().get(/^\/x/g).reply(200, 'matched');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual((await client.get(`http://mock.test/x${i}`)).body, 'matched', `request ${i}`);
+  }
+});
+
 test('matches a function path', async () => {
   nock('http://mock.test')
     .get((path) => path.startsWith('/dynamic'))
@@ -206,6 +222,22 @@ test('a regex query value still has to match', async () => {
   const missed = await failure(client.get('http://mock.test/re', {searchParams: {token: 'zzz'}}));
 
   assertUnmatched(missed, 'a value the regex rejects should not match');
+});
+
+/*
+ * Same statefulness bug as the path matcher, on the leaf a query *value* is tested with: a
+ * `/g` pattern's `lastIndex` survived from one request to the next on a persisted interceptor.
+ */
+test('a persisted global-flag regex query value matches every request, not every other one', async () => {
+  nock('http://mock.test').persist().get('/re').query({token: /^abc/g}).reply(200, 'matched');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual(
+      (await client.get('http://mock.test/re', {searchParams: {token: 'abcdef'}})).body,
+      'matched',
+      `request ${i}`,
+    );
+  }
 });
 
 test('query accepts a predicate value', async () => {
@@ -406,6 +438,97 @@ test('reply(function) hands back a non-json Buffer body as text', async () => {
   });
 
   assert.strictEqual(capturedBody, 'plain words');
+});
+
+/*
+ * `gotlike.stream.post()`/`.put()` send the body through `undici.pipeline`'s writable side,
+ * which MockAgent hands the reply callback as the live pipeline `Readable` rather than the
+ * bytes that will eventually flow through it - a plain object as far as the callback or a body
+ * matcher is concerned. `resolveRequestBody` drains it so the callback still sees real content.
+ */
+test('reply(function) sees the actual bytes of a streamed upload, not the pipeline body object', async () => {
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/streamed')
+    .reply(function (_uri, requestBody) {
+      capturedBody = requestBody;
+
+      return [200, 'ok'];
+    });
+
+  const upload = await client.stream.post('http://mock.test/streamed', {
+    headers: {'content-type': 'application/json'},
+  });
+
+  upload.end(JSON.stringify({amount: 5}));
+
+  assert.strictEqual(await text(upload), 'ok');
+  assert.deepStrictEqual(capturedBody, {amount: 5});
+});
+
+/*
+ * The other of the two shapes `resolveRequestBody` has to handle: with no interceptor composed
+ * that implements `onBodySent`/`onRequestSent` (`decompress` does, and is on by default -
+ * `decompress: false` is what turns this shape off), undici calls this reply callback *before*
+ * reading the request body itself, so `opts.body` is still the live, unread `Readable` rather
+ * than the already-drained wrapper the other test exercises.
+ */
+test('reply(function) sees a streamed upload’s bytes on a client with no decompress interceptor either', async () => {
+  const plain = createClient({decompress: false});
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/streamed-plain')
+    .reply(function (_uri, requestBody) {
+      capturedBody = requestBody;
+
+      return [200, 'ok'];
+    });
+
+  const upload = await plain.stream.post('http://mock.test/streamed-plain', {
+    headers: {'content-type': 'application/json'},
+  });
+
+  upload.end(JSON.stringify({amount: 5}));
+
+  assert.strictEqual(await text(upload), 'ok');
+  assert.deepStrictEqual(capturedBody, {amount: 5});
+});
+
+/**
+ * The same shape, but with a body big enough to matter - which is what the two tests above
+ * could never catch.
+ *
+ * The live `Readable` used to be piped into two `PassThrough`s, one to read and one put back
+ * on `opts.body` for a later read by undici that never comes (`dispatchRequestBody` runs
+ * *before* the reply callback and is the only thing that touches the body). Nothing drained
+ * the second one, so past its 16KB high-water mark `pipe` paused the source, the half being
+ * read stopped receiving, and the callback's own await never resolved: measured, a 200KB
+ * upload never settled and the reply callback was never called at all. A few hundred bytes
+ * fits in the buffer and always worked, which is exactly why this needs a real payload.
+ */
+test('reply(function) sees a streamed upload larger than a stream buffer', async () => {
+  const plain = createClient({decompress: false});
+  const payload = 'x'.repeat(200 * 1024);
+  let capturedLength = -1;
+
+  nock('http://mock.test')
+    .post('/streamed-large')
+    .reply(function (_uri, requestBody) {
+      capturedLength = typeof requestBody === 'string' ? requestBody.length : -1;
+
+      return [200, 'ok'];
+    });
+
+  const upload = await plain.stream.post('http://mock.test/streamed-large', {
+    headers: {'content-type': 'text/plain'},
+  });
+
+  upload.end(payload);
+
+  assert.strictEqual(await text(upload), 'ok');
+  assert.strictEqual(capturedLength, payload.length);
 });
 
 test('reply(function) uri is relative to the base path and keeps the query', async () => {
@@ -1184,4 +1307,36 @@ test('abortPendingRequests drops every registered interceptor', async () => {
     await failure(client.get('http://aborted.test/p')),
     'abortPendingRequests must leave nothing registered',
   );
+});
+
+/*
+ * `abortPendingRequests` used to be `cleanAll()` alone, which removes interceptors nothing has
+ * matched yet but does nothing for a request that already matched one and is only waiting on
+ * its `.delay()` - that request went on to complete normally. Real nock's own
+ * `abortPendingRequests` (`common.removeAllTimers`) does not deliver an abort error either: it
+ * just makes sure the timer holding the reply back never fires, leaving the request hanging.
+ * This asserts the same "never settles" outcome, which is what `awaitDelay`'s own timer being
+ * cancelled produces here.
+ */
+test('abortPendingRequests aborts a request already waiting on delay()', async () => {
+  nock('http://aborted.test').get('/slow').delay(150).reply(200, 'late');
+
+  let settled = false;
+
+  client.get('http://aborted.test/slow').then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+
+  // Give the request time to reach the mock, match the interceptor and start waiting on the
+  // delay - well before the delay itself would fire.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  nock.abortPendingRequests();
+
+  // Comfortably past the original 150ms delay, so a request that had not in fact been aborted
+  // would have settled by now.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  assert.strictEqual(settled, false, 'a request aborted mid-delay must never settle');
 });

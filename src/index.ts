@@ -272,7 +272,12 @@ type AttemptState = DispatchState & {
   onRetry?: (error: Error | undefined, statusCode: number | undefined, retryCount: number) => void;
   /** Starts the request deadline over for a new attempt. See `requestSignal`. */
   restartDeadline?: () => void;
-  /** Stops the attempt deadline while the retry interceptor is waiting to redispatch. */
+  /**
+   * Stops the attempt deadline while the retry interceptor is waiting to redispatch.
+   *
+   * Only ever a *guess* that a retry is coming - see `willRetryStatus`. `resumeDeadline`, called
+   * the moment a response reaches the caller, is what makes a wrong guess harmless.
+   */
   pauseDeadline?: () => void;
   /** Whether a response will be retried rather than exposed to the caller. */
   willRetryStatus?: (statusCode: number) => boolean;
@@ -502,6 +507,13 @@ type SharedDispatchOptions = UndiciRequestOptions &
      * `timeout.request` was set. See `requestSignal`.
      */
     release: () => void;
+
+    /**
+     * Puts back a deadline the retry bookkeeping paused for a retry that never came. Must be
+     * called as soon as a response reaches the caller, on every path. A no-op when nothing is
+     * paused, which is every ordinary request. See `requestSignal`.
+     */
+    resume: () => void;
   };
 
 /** The `release` of a request that has no deadline to cancel. */
@@ -731,11 +743,19 @@ function sameOrigin(previous: string, next: string): boolean {
 }
 
 /**
- * What the request carried before the `beforeRequest` hooks ran, for the cross-origin check.
+ * What the cross-origin headers held before the `beforeRequest` hooks ran.
+ *
+ * The *values*, not just whether they were set, because they are the second of two signals
+ * `stripCrossOrigin` needs. `trackHookWrites` answers "did a hook touch this" and is the better
+ * answer where it applies - but it only sees writes made *through* `options.headers`, and a hook
+ * is free to replace that object outright (`options.headers = {authorization: ...}`), which
+ * throws the Proxy away along with everything it recorded. Comparing values catches that case,
+ * and comparing writes catches the case values cannot (a hook re-asserting an identical string).
+ * Neither alone is enough; see `stripCrossOrigin`.
  *
  * One small object, and only for a client that has `beforeRequest` hooks at all - a client
  * without them cannot move the origin here, and allocates nothing. It has to be taken eagerly:
- * whether the origin moved is only known after the hooks have run, and by then the values it
+ * whether the origin moved is only known after the hooks have run, and by then the headers it
  * records have been overwritten.
  */
 type CrossOriginState = {
@@ -744,7 +764,6 @@ type CrossOriginState = {
   cookie2: unknown;
   host: unknown;
   proxyAuthorization: unknown;
-  body: unknown;
 };
 
 function crossOriginState(options: FormedOptions): CrossOriginState {
@@ -756,54 +775,179 @@ function crossOriginState(options: FormedOptions): CrossOriginState {
     cookie2: headers['cookie2'],
     host: headers['host'],
     proxyAuthorization: headers['proxy-authorization'],
-    body: options.body,
   };
+}
+
+/** What `beforeRequest` hooks explicitly wrote, as opposed to what they merely left standing. */
+type HookWrites = {
+  /** Header names, lower-cased, that a hook assigned or deleted - regardless of the value. */
+  headers: Set<string>;
+  body: boolean;
+  /**
+   * Take the instrumentation back off, leaving plain data properties behind. Must be called
+   * once the hooks have finished - see `trackHookWrites`.
+   */
+  restore: () => void;
+};
+
+/**
+ * Wraps `options.headers` and the `body` property of `options` for the duration of the
+ * `beforeRequest` hook loop, so `stripCrossOrigin` can ask "did a hook touch this" instead of
+ * "does it still equal what it was before the hooks ran".
+ *
+ * That equality check is what `crossOriginState`/`stripCrossOrigin` used on their own: a hook
+ * that explicitly re-asserted the very same `authorization` string, or rebuilt a body that
+ * happened to serialise identically, read as untouched and was stripped anyway - the opposite
+ * of what "values set by the hook survive" promises. got tells the two apart with its own
+ * `trackStateMutations`, a Proxy over the options being merged; this is the same idea scoped to
+ * the handful of fields the cross-origin boundary cares about, and only ever installed for a
+ * client that has `beforeRequest` hooks in the first place.
+ *
+ * **For the duration of the hook loop, and no longer.** The Proxy used to stay on
+ * `options.headers` all the way to the dispatch, so undici read every header of every request
+ * through it - measured at ~780ns a request against ~19ns for the plain object, on a client
+ * whose entire documented overhead is under 500ns, and paid by the one kind of client that
+ * always has hooks. `restore()` puts the plain objects back the moment the hooks are done, so
+ * the cost is the two allocations and the handful of writes a hook actually makes. It leaves a
+ * `headers` a hook replaced wholesale alone, since the Proxy is no longer what is there.
+ */
+function trackHookWrites(options: FormedOptions): HookWrites {
+  const names = new Set<string>();
+  const target = options.headers;
+
+  // No `receiver`: passing the Proxy back as one sends the write round through
+  // `[[DefineOwnProperty]]` on the Proxy again, which is the slow path and buys nothing here -
+  // `target` is a plain object with no accessors of its own.
+  const proxy = new Proxy(target, {
+    set(obj, prop, value) {
+      if (typeof prop === 'string') {
+        names.add(prop.toLowerCase());
+      }
+
+      return Reflect.set(obj, prop, value);
+    },
+    deleteProperty(obj, prop) {
+      if (typeof prop === 'string') {
+        // Added, not removed: a hook that *deletes* a header has said what the request should
+        // carry just as surely as one that assigns it, and the strip below must not put its
+        // own interpretation back over the top.
+        names.add(prop.toLowerCase());
+      }
+
+      return Reflect.deleteProperty(obj, prop);
+    },
+  });
+
+  options.headers = proxy;
+
+  let body = options.body;
+  const writes: HookWrites = {
+    headers: names,
+    body: false,
+    restore: () => {
+      if (options.headers === proxy) {
+        options.headers = target;
+      }
+
+      Object.defineProperty(options, 'body', {
+        value: body,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    },
+  };
+
+  Object.defineProperty(options, 'body', {
+    configurable: true,
+    enumerable: true,
+    get: () => body,
+    set: (value: FormedOptions['body']) => {
+      writes.body = true;
+      body = value;
+    },
+  });
+
+  return writes;
 }
 
 /**
  * Drop what must not cross an origin boundary, keeping whatever the hook set for the new one.
  *
- * A header the hook rewrote is the hook saying "these are the credentials for where I am
- * sending this", so it survives; one that still holds the value it had before the hooks ran was
- * meant for the origin being left, and goes. The body follows the same rule by identity - a
- * hook that replaced it built it for the new origin, one that did not was not asked whether its
- * payload should be sent somewhere else. `content-type` and `content-length` describe the body
- * that is being dropped, and a stale `content-length` would fail the dispatch outright under
- * undici's `strictContentLength`.
+ * A header the hook wrote - assigned or deleted, tracked by `trackHookWrites` rather than
+ * compared by value - is the hook saying "these are the credentials for where I am sending
+ * this", so it survives; one it never touched was meant for the origin being left, and goes.
+ * Equality used to stand in for "did a hook touch this", which mistook a hook explicitly
+ * re-asserting the very same `authorization` string (or rebuilding a body that happened to
+ * serialise identically) for one that had left it alone, and stripped it anyway - the opposite
+ * of what "values set by the hook survive" promises. The body follows the same rule: a hook
+ * that assigned it, even back to an equal value, built it for the new origin. `content-type`
+ * and `content-length` describe the body being dropped, and a stale `content-length` would fail
+ * the dispatch outright under undici's `strictContentLength`.
  *
  * Measured against got 16, which strips the same five headers, keeps a hook-set `authorization`
  * and a hook-set body, and drops an unchanged one along with its `content-type`.
  */
-function stripCrossOrigin(options: FormedOptions, before: CrossOriginState): void {
+function stripCrossOrigin(options: FormedOptions, before: CrossOriginState, writes: HookWrites): void {
   const headers = options.headers;
 
-  if (before.authorization !== undefined && headers['authorization'] === before.authorization) {
+  /*
+   * A header goes only when *both* signals say the hook left it alone - it recorded no write
+   * through `options.headers`, and the value standing there is still the one from before.
+   *
+   * Either test alone gets a real case wrong, in opposite directions. Writes alone miss a hook
+   * that assigned a whole new headers object (`options.headers = {authorization: ...}`), which
+   * discards the Proxy and everything it had recorded: measured, such a hook's freshly minted
+   * credentials for the *new* origin were deleted and the request went out anonymous, where got
+   * 16 sends them. Values alone miss a hook that re-asserted an identical string, which is the
+   * bug `trackHookWrites` was added for. Requiring both keeps each one's case.
+   */
+  if (
+    before.authorization !== undefined &&
+    !writes.headers.has('authorization') &&
+    headers['authorization'] === before.authorization
+  ) {
     delete headers['authorization'];
   }
 
-  if (before.cookie !== undefined && headers['cookie'] === before.cookie) {
+  if (before.cookie !== undefined && !writes.headers.has('cookie') && headers['cookie'] === before.cookie) {
     delete headers['cookie'];
   }
 
-  if (before.cookie2 !== undefined && headers['cookie2'] === before.cookie2) {
+  if (before.cookie2 !== undefined && !writes.headers.has('cookie2') && headers['cookie2'] === before.cookie2) {
     delete headers['cookie2'];
   }
 
-  if (before.host !== undefined && headers['host'] === before.host) {
+  if (before.host !== undefined && !writes.headers.has('host') && headers['host'] === before.host) {
     delete headers['host'];
   }
 
-  if (before.proxyAuthorization !== undefined && headers['proxy-authorization'] === before.proxyAuthorization) {
+  if (
+    before.proxyAuthorization !== undefined &&
+    !writes.headers.has('proxy-authorization') &&
+    headers['proxy-authorization'] === before.proxyAuthorization
+  ) {
     delete headers['proxy-authorization'];
   }
 
-  if (options.body !== undefined && options.body === before.body) {
+  /*
+   * The body needs only the one signal: its accessor sits on `options` itself, which a hook
+   * cannot replace the way it can replace `options.headers`, so `writes.body` never goes blind.
+   * `content-type` and `content-length` are dropped on the write test alone for the same reason
+   * they are dropped at all - there is no body left for them to describe, whoever set them.
+   */
+  if (options.body !== undefined && !writes.body) {
     options.body = undefined;
     options.json = undefined;
     options.form = undefined;
 
-    delete headers['content-type'];
-    delete headers['content-length'];
+    if (!writes.headers.has('content-type')) {
+      delete headers['content-type'];
+    }
+
+    if (!writes.headers.has('content-length')) {
+      delete headers['content-length'];
+    }
   }
 }
 
@@ -866,8 +1010,25 @@ type RetryDepth = {[retryDepth]?: number; [afterResponseLimit]?: number};
  * with a comma into a single `?a=1%2C2` instead - a wrong query string, produced silently.
  */
 function stringifyQuery(input: SearchParams): string {
+  /*
+   * A string is re-encoded, not handed over as written.
+   *
+   * `resolveUrl` concatenates the result straight onto the url, so anything the caller's string
+   * contains lands in the url as a url *character*: the first `#` opened a fragment, everything
+   * after it went with the fragment, and a fragment is never sent - so
+   * `searchParams: 'next=/home#top&b=2'` reached the server as `?next=/home` with `b` gone
+   * entirely, silently and on the wire. That is the same failure `withoutQuery` fixed for the
+   * *joined* url; it was never fixed for the query being appended to it.
+   *
+   * `URLSearchParams` is what got runs a string through too, so this also settles a divergence
+   * the suites could not see: `a=1;b=2` and `q=a b` now encode as got encodes them. And it makes
+   * the option self-consistent - `mergeSearchParams` already round-trips a string, so a string
+   * query behaved one way on a client that also had one and another way on a client that didn't.
+   *
+   * The constructor strips a leading `?` itself, so the manual slice this replaces is redundant.
+   */
   if (typeof input === 'string') {
-    return input.startsWith('?') ? input.slice(1) : input;
+    return new URLSearchParams(input).toString();
   }
 
   if (input instanceof URLSearchParams) {
@@ -974,6 +1135,26 @@ function mergeSearchParams(base: SearchParams, override: SearchParams): URLSearc
   }
 
   return merged;
+}
+
+/**
+ * Snapshot a client's own `searchParams` at create/extend time, so mutating the object the
+ * caller passed in afterwards cannot reach back into the client.
+ *
+ * `mergeOptions`'s spread, and `extend()`'s one-sided fallback, both handed back the caller's
+ * own `URLSearchParams`/object *by reference* - `createClient({searchParams: params})` followed
+ * by `params.set(...)` changed every request the client made afterwards, silently and on the
+ * wire, which is exactly the failure mode `mergeRecords`/`concatHooks`/`mergeHooks` already
+ * guard `context`/`handlers`/`hooks` against. `mergeSearchParams` itself always builds a fresh
+ * `URLSearchParams`, so only the case where one side is absent - the one the shallow spread was
+ * relying on to be cheap - needed this. A string is immutable and returned as-is.
+ */
+function cloneSearchParams(value?: SearchParams): SearchParams | undefined {
+  if (value === undefined || typeof value === 'string') {
+    return value;
+  }
+
+  return value instanceof URLSearchParams ? new URLSearchParams(value) : {...value};
 }
 
 /**
@@ -1225,6 +1406,47 @@ function mergeRecords<T extends object>(base?: T, override?: T): T | undefined {
 
 const hookNames = ['beforeRequest', 'afterResponse', 'beforeError', 'beforeRetry', 'beforeRedirect'] as const;
 
+/**
+ * Every key `RetryOptions` declares, checked the same way `knownOptionMap` checks the
+ * top-level options - a typo here does not throw the way a top-level one does otherwise.
+ * `retry: {limt: 0}` used to be accepted outright and silently enabled the *default* two
+ * retries instead of the caller's intended zero, since nothing ever read the misspelled key.
+ */
+const knownRetryKeys = new Set<keyof RetryOptions>([
+  'limit',
+  'methods',
+  'statusCodes',
+  'errorCodes',
+  'backoffLimit',
+  'maxRetryAfter',
+]);
+
+/**
+ * got options this does not implement, and the reason, so they report themselves as missing
+ * rather than as misspelled.
+ *
+ * got accepts all of these (measured against got 16), and the retry pair is documented here as
+ * "not implemented" - which reads as "ignored", not "the client will not construct". A caller
+ * dropping gotlike into a `got-cjs@12` call site that tunes its backoff deserves to be told
+ * which it is. Still a hard failure, because the alternative is a `calculateDelay` that silently
+ * never runs and an `init` hook that silently never fires, which is the very thing the
+ * unknown-key check was added to stop. Recorded in the README's divergence table.
+ */
+const unimplementedOptions = new Map<string, string>([
+  ['retry.calculateDelay', "undici's RetryHandler owns the backoff schedule; use `retry.backoffLimit` to cap it"],
+  ['retry.noise', "undici's RetryHandler owns the backoff schedule"],
+  ['hooks.init', 'no equivalent stage - `beforeRequest` receives the formed options instead'],
+]);
+
+/** Reject a known got option this does not implement, saying so. Falls through for a typo. */
+function rejectUnimplemented(qualified: string): void {
+  const reason = unimplementedOptions.get(qualified);
+
+  if (reason !== undefined) {
+    invalid(`\`${qualified}\` is not implemented by gotlike - ${reason}`);
+  }
+}
+
 /** Concatenates every hook array, so extending a client adds to its hooks rather than replacing them. */
 function mergeHooks(base?: Hooks, override?: Hooks): Hooks | undefined {
   if (!base && !override) {
@@ -1288,12 +1510,19 @@ function requestSignal(options: FormedOptions): {
   signal?: AbortSignal;
   release: () => void;
   pause: () => void;
+  resume: () => void;
   restart: () => void;
 } {
   const timeout = options.timeout?.request;
 
   if (timeout === undefined) {
-    return {signal: options.signal, release: noRelease, pause: noRelease, restart: noRelease};
+    return {
+      signal: options.signal,
+      release: noRelease,
+      pause: noRelease,
+      resume: noRelease,
+      restart: noRelease,
+    };
   }
 
   // Built from an `AbortController` rather than `AbortSignal.timeout`, which cannot be
@@ -1312,11 +1541,36 @@ function requestSignal(options: FormedOptions): {
     }, timeout).unref();
 
   let timer = arm();
+  /** Whether a `pause` is outstanding, so `resume` knows there is a deadline owed. */
+  let paused = false;
 
   return {
     signal: options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal,
-    release: () => clearTimeout(timer),
-    pause: () => clearTimeout(timer),
+    release: () => {
+      paused = false;
+      clearTimeout(timer);
+    },
+    pause: () => {
+      paused = true;
+      clearTimeout(timer);
+    },
+    /*
+     * Put back a deadline that `pause` took away and no re-dispatch came for.
+     *
+     * `pause` fires on a *prediction* that undici is about to retry (`willRetryStatus`), and a
+     * prediction that misses used to leave the request running with no deadline whatsoever -
+     * measured, a `timeout: {request: 400}` against a trickling body was still going at 4s with
+     * no error, where the same request one status code away gave up at 406ms. Every path calls
+     * this the moment a response actually reaches it, which is the point at which nothing can
+     * be retrying it any more, so a wrong guess costs a restarted clock rather than the whole
+     * deadline. A no-op when nothing is paused, which is every ordinary request.
+     */
+    resume: () => {
+      if (paused) {
+        paused = false;
+        timer = arm();
+      }
+    },
     /*
      * `timeout.request` bounds an *attempt*, as got's does and as undici's own
      * `headersTimeout`/`bodyTimeout` do - so a retry starts the clock again. One signal spans
@@ -1329,6 +1583,7 @@ function requestSignal(options: FormedOptions): {
      * this starts it again only when the new attempt is actually dispatched.
      */
     restart: () => {
+      paused = false;
       clearTimeout(timer);
       timer = arm();
     },
@@ -1877,6 +2132,17 @@ export type WholeResponse = {resolveBodyOnly?: false};
 export type BodyOnly = {resolveBodyOnly: true};
 
 /**
+ * `{isStream: true}` - the runtime equivalent of calling `.stream(...)` instead of a verb
+ * method. Nothing about `handle()`, the verb methods or the callable form's overloads used to
+ * key on it, so `client.get(url, {isStream: true})` type-checked as `Promise<Response<T>>`
+ * while resolving to a `GotlikeStream` at runtime - correctly typed caller code compiled and
+ * then read `undefined` off every field a `Response` declares. Kept as its own type, first in
+ * each overload list, so it wins regardless of what `responseType`/`resolveBodyOnly` a call
+ * also names - both are ignored once `isStream` is set (see `handle()` and `formOptions()`).
+ */
+export type IsStream = {isStream: true};
+
+/**
  * The body type a client's own `responseType` implies, for a call that doesn't name one.
  * `json` lands on `unknown` rather than `any`, so it still has to be narrowed somewhere.
  */
@@ -2229,6 +2495,15 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
       invalid('`retry` must be an object like `{limit: 2}`');
     }
 
+    for (const key in retry) {
+      if (Object.hasOwn(retry, key) && !knownRetryKeys.has(key as keyof RetryOptions)) {
+        // A got option we don't implement names itself; anything else is a typo.
+        rejectUnimplemented(`retry.${key}`);
+
+        invalid(`Unknown option \`retry.${key}\``);
+      }
+    }
+
     if (
       retry.limit !== undefined &&
       (typeof retry.limit !== 'number' ||
@@ -2243,6 +2518,18 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
   if (hooks !== undefined) {
     if (typeof hooks !== 'object' || hooks === null) {
       invalid('`hooks` must be an object');
+    }
+
+    // A misspelled hook name (`beforeReqest`) used to be accepted silently and simply never
+    // called - dropping whatever signing, auth or logging it was meant to add, with nothing
+    // to say why. `hookNames` is the exhaustive list, so anything else is a typo.
+    for (const key in hooks) {
+      if (Object.hasOwn(hooks, key) && !(hookNames as readonly string[]).includes(key)) {
+        // As above: got's own `init` says so rather than reading as a misspelling.
+        rejectUnimplemented(`hooks.${key}`);
+
+        invalid(`Unknown option \`hooks.${key}\``);
+      }
     }
 
     for (const name of hookNames) {
@@ -2337,6 +2624,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      */
     merged.hooks = mergeHooks(undefined, merged.hooks);
     merged.handlers = concatHooks(undefined, merged.handlers);
+    // Same reasoning, same one-sided gap: the spread above handed back the caller's own
+    // `URLSearchParams`/object by reference, so mutating it after `createClient(...)` returned
+    // silently changed every request the client made from then on. See `cloneSearchParams`.
+    merged.searchParams = cloneSearchParams(merged.searchParams);
 
     // Folded once here so `formOptions` only has to look at a per-call method.
     if (merged.method !== undefined) {
@@ -2456,8 +2747,22 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         }),
     };
 
+    /*
+     * Whether undici is about to retry this response rather than hand it over, which is the
+     * only reason to stop the attempt's deadline (see `requestSignal`).
+     *
+     * It is a prediction of a decision undici makes privately, so it is wrong the moment
+     * `retry-handler.js` changes - and a false positive used to mean a request with *no*
+     * deadline at all, silently, for as long as the body took to arrive. `resumeDeadline` in
+     * `call()` and on both stream paths is what bounds that now; this only has to be right
+     * often enough to keep a real retry's backoff off the caller's clock.
+     *
+     * `>= 300` mirrors undici's own gate: `RetryHandler.onResponseStart` only consults the
+     * retry policy for a 3xx and up, so a `retry.statusCodes` naming a 2xx - a polling client
+     * listing `202`, say - is never retried there however this answers.
+     */
     state.willRetryStatus = (statusCode) =>
-      statusCode >= 200 &&
+      statusCode >= 300 &&
       replayableBody &&
       state.count <= maxRetries &&
       methods.includes(options.method) &&
@@ -2636,6 +2941,11 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     return formed;
   }
 
+  handle(
+    options: RequestOptions & IsStream,
+    url?: string | URL,
+    method?: Dispatcher.HttpMethod,
+  ): Promise<GotlikeStream | GotlikeUploadStream>;
   handle(options: TextCall & BodyOnly, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<string>;
   handle(options: BufferCall & BodyOnly, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<Buffer>;
   handle<T>(options: RequestOptions & BodyOnly, url?: string | URL, method?: Dispatcher.HttpMethod): Promise<T>;
@@ -2741,6 +3051,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       headersTimeout: options.timeout?.request,
       signal: deadline.signal,
       release: deadline.release,
+      resume: deadline.resume,
       maxRedirections: this.follows(options) ? maxRedirections : 0,
       // Only when redirects are actually in play. Allocating it for any client that merely
       // *had* a `beforeRedirect` hook meant a per-request object the tracker never read.
@@ -2806,12 +3117,33 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     let error: Error = new ErrorClass(message, code, cause, options, response);
 
     if (this.beforeErrorHooks) {
-      for (const hook of this.beforeErrorHooks) {
-        const replacement = await hook(error as RequestError);
+      /*
+       * A throwing hook - or one that rejects - used to escape this function entirely: nothing
+       * here caught it, so `await this.toRequestError(...)` itself rejected with the hook's raw
+       * throw, skipping the `RequestError` wrapper for a failure that already had one built.
+       * Every call site does `throw await this.toRequestError(...)`, so that raw value became
+       * the error every caller saw - indistinguishable from a network failure to anything
+       * matching on `instanceof RequestError`, and never reaching `normalisedErrors` either,
+       * so a stream failure fell back to the *original*, unnormalised transport error too (see
+       * `normaliseStreamErrors`). got wraps the same failure in a `RequestError` rather than
+       * letting it through raw, so this does too.
+       */
+      try {
+        for (const hook of this.beforeErrorHooks) {
+          const replacement = await hook(error as RequestError);
 
-        if (replacement instanceof Error) {
-          error = replacement;
+          if (replacement instanceof Error) {
+            error = replacement;
+          }
         }
+      } catch (hookError) {
+        error = new RequestError(
+          messageOf(hookError, 'beforeError hook failed'),
+          codeOf(hookError, 'ERR_REQUEST_ERROR'),
+          hookError as Error,
+          options,
+          response,
+        );
       }
     }
 
@@ -2906,10 +3238,16 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         // Taken before the hooks run because that is the only moment it exists - see
         // `crossOriginState`. One allocation, and only for a client that has hooks.
         const before = crossOriginState(options);
+        // Installed for the same reason and the same audience - see `trackHookWrites`.
+        const writes = trackHookWrites(options);
 
         for (const hook of this.beforeRequestHooks) {
           await hook(options);
         }
+
+        // The instrumentation is only needed while the hooks can still write, and `writes` is
+        // settled now - so everything below, undici included, reads plain objects again.
+        writes.restore();
 
         /*
          * A hook may rewrite `options.url` - request signing does exactly that. The dispatch
@@ -2935,10 +3273,30 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
            * reached by the other route. got 16 does it too, which is what fixed it there.
            */
           if (!sameOrigin(url, next)) {
-            stripCrossOrigin(options, before);
+            stripCrossOrigin(options, before, writes);
           }
 
-          url = options.url = next;
+          /*
+           * `splitUserinfo` only ever ran on the url this request started with, before the
+           * hooks saw it - so a hook that rewrote the url to `http://new-user:new-pass@host/`
+           * (signing onto a discovered endpoint, say) had those credentials go out anonymous:
+           * undici ignores userinfo in the url outright, and nothing derived a header for it a
+           * second time. Skipped under `parseUserinfo: false`, same as the pre-hook parse this
+           * mirrors. A hook that set its own `authorization` explicitly still wins.
+           */
+          const rewrittenUserinfo = this.parseUserinfo ? splitUserinfo(next) : undefined;
+
+          if (rewrittenUserinfo) {
+            if (!hasHeader(options.headers, 'authorization')) {
+              const credentials = `${rewrittenUserinfo.username}:${rewrittenUserinfo.password}`;
+
+              options.headers['authorization'] = 'Basic ' + Buffer.from(credentials).toString('base64');
+            }
+
+            url = options.url = rewrittenUserinfo.url;
+          } else {
+            url = options.url = next;
+          }
         }
       }
 
@@ -3015,6 +3373,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       };
 
       undiciResponse = await undici.request(url, requestOptions);
+
+      // The response is ours, so nothing is going to retry it - if the retry bookkeeping paused
+      // the deadline expecting one, the body read below would otherwise run unbounded.
+      dispatch.resume();
 
       if (hasNoBody(undiciResponse.statusCode, options.method)) {
         // 204/205/304 and HEAD cannot carry a body, so there is nothing to parse. Attempting
@@ -3188,8 +3550,16 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       try {
         for (let index = 0; index < limit; index++) {
           const hook = hooks[index]!;
+          const triggerStatusCode = response.statusCode;
+          /*
+           * Retries behind the response this hook is being handed - network ones undici made,
+           * plus any earlier hook's. Carried into the retry so its own count continues from
+           * here rather than starting over: two hooks that each retry once are two retries,
+           * and the counter is the only thing a caller has to see that.
+           */
+          const retriesSoFar = response.retryCount;
           const returned = await hook(response, (newOptions) =>
-            this.retryWithMergedOptions<T>(options, newOptions, index),
+            this.retryWithMergedOptions<T>(options, newOptions, index, triggerStatusCode, retriesSoFar),
           );
 
           if (!isResponseLike(returned)) {
@@ -3202,7 +3572,13 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         // Anything raised through `toRequestError` - the retry's own failure, an exhausted
         // retry budget - is already normalised and has already run the hooks. Re-wrapping it
         // would fire them a second time.
-        if (normalisedErrors.has(error as object)) {
+        //
+        // A `ValidationError` passes through for a different reason: it says the caller
+        // configured something wrong rather than that a request failed, and the class is kept
+        // distinct from `RequestError` everywhere else (it is a pinned divergence from got in
+        // the parity suite). A bad option handed to `retryWithMergedOptions` has to report
+        // itself the same way the identical option on the original call does.
+        if (normalisedErrors.has(error as object) || error instanceof ValidationError) {
           throw error;
         }
 
@@ -3216,12 +3592,32 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       }
     }
 
-    if (options.throwHttpErrors && isHttpError(response.statusCode, this.follows(options))) {
+    /*
+     * `response.request.options`, not the outer `options` - an `afterResponse` hook that
+     * retried replaced `response` with one built from `retryWithMergedOptions`'s merged
+     * options (a new `url`, a `throwHttpErrors: false`, ...), and that nested call already
+     * decided whether *it* should throw using those. Reading the outer, pre-retry `options`
+     * here re-ran that decision against the wrong url and the wrong flag: a hook retrying
+     * with `throwHttpErrors: false` still got an `HTTPError` naming the original url, because
+     * the original request had `throwHttpErrors: true`. For a request with no retry,
+     * `response.request.options` and `options` are the same object, so this changes nothing.
+     *
+     * Falls back rather than assuming: `isResponseLike` deliberately accepts anything carrying
+     * a numeric `statusCode`, so a hook handing back a response it built itself - `{statusCode:
+     * 200, body}` - has no `request` at all. Reading straight through it threw a bare
+     * `Cannot read properties of undefined (reading 'options')` from *outside* the hook loop's
+     * try, which is the one place a raw error could still escape the `RequestError` wrapper and
+     * the `beforeError` hooks. The request's own options are the right answer for a response
+     * that names none.
+     */
+    const effectiveOptions = response.request?.options ?? options;
+
+    if (effectiveOptions.throwHttpErrors && isHttpError(response.statusCode, this.follows(effectiveOptions))) {
       throw await this.toRequestError(
-        httpErrorMessage(response.statusCode, options),
+        httpErrorMessage(response.statusCode, effectiveOptions),
         httpErrorCode,
         undefined,
-        options,
+        effectiveOptions,
         response,
         HTTPError,
       );
@@ -3263,6 +3659,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // same way `call()` normalises it, `beforeError` hooks included.
       return asStream(Readable.from([]), undefined, await this.toStreamError(error as Error, options));
     }
+
+    // The response is ours, so nothing is going to retry it - see the same call in `call()`.
+    dispatch.resume();
 
     // The body is what the deadline still has to cover: the head has arrived, but a trickling
     // or truncated body is exactly what `timeout.request` is there to catch. Dumping it below
@@ -3391,6 +3790,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
     try {
       duplex = undici.pipeline(options.url as string, dispatch, ({statusCode, headers, body}) => {
+        // The response is ours, so nothing is going to retry it - see the same call in `call()`.
+        dispatch.resume();
+
         const streamHead = makeStreamHead(statusCode, headers, options, dispatch, startTime);
 
         resolveHead(streamHead);
@@ -3467,8 +3869,17 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      * `bodyMethods` ones. If that routing is ever widened, this needs an `end()` for the
      * bodyless case again - without one `undici.pipeline` never sends the request and the
      * caller waits forever.
+     *
+     * `null` is a legal `body` (declared as such on `RequestOptions`) and means the same thing
+     * here it does on the non-stream path: no body. It used to fall through this check entirely
+     * and leave the writable half open for a caller who had explicitly said there was nothing
+     * to write - `stream.post(url, {body: null})` hung forever waiting for an `end()` nobody
+     * was going to call, on a call site that had already asked for the request to be sent as
+     * it stood. `duplex.end()` with no argument is what that call means.
      */
-    if (options.body !== undefined && options.body !== null) {
+    if (options.body === null) {
+      duplex.end();
+    } else if (options.body !== undefined) {
       /*
        * A stream body is piped in, not handed to `end()`. `RequestOptions.body` declares
        * `Readable`, and `call()` turns a `FormData` into one before it ever reaches here, so
@@ -3510,8 +3921,32 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     newOptions: RequestOptions,
     /** Index of the `afterResponse` hook driving this retry; absent when called directly. */
     hookIndex?: number,
+    /** The status that triggered this retry, for `beforeRetry` - absent when called directly. */
+    triggerStatusCode?: number,
+    /**
+     * Retries already behind the response that triggered this one, so `retryCount` keeps
+     * counting rather than restarting. Absent when called directly, where there is no
+     * response to have counted any.
+     */
+    retriesSoFar = 0,
   ): Promise<Response<T>> {
+    /*
+     * The hook's options get the same check a per-call options object gets, because this is the
+     * one route into `call()` that does not go through `formOptions` - so nothing validated them
+     * and nothing normalised them. That made the retry path a second, permanent `validate: false`
+     * that no caller could turn on: `retry({responseType: 'jsn'})` fell past the `json`/`text`
+     * arms and handed back a `Buffer`, `retry({timeout: {request: 0}})` slipped past the check
+     * written specifically to reject `0`, and `retry({prefixUrl: 'http://h?q=1'})` past the one
+     * that keeps a prefix from mangling the join. Gated on `this.validate`, exactly as
+     * `formOptions` gates its own.
+     */
+    if (this.validate) {
+      validateOptions(newOptions, false);
+    }
+
     const depth = ((options as RetryDepth)[retryDepth] ?? 0) + 1;
+    /** Which retry this is, across every route that produced one. */
+    const retryCount = retriesSoFar + 1;
 
     if (depth > maxAfterResponseRetries) {
       // A hook that keeps retrying on a status it never stops seeing - an auth refresh that
@@ -3534,6 +3969,17 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // normalise both sides: a refreshed `authorization` has to replace the stale one.
       headers: mergeHeaders(lowercaseHeaders(options.headers), newOptions.headers),
     } as FormedOptions;
+
+    /*
+     * Folded here for the same reason `formOptions` folds it: the wire wants an upper-case
+     * method, and `isBodyMethod`/`hasNoBody` match on one. A hook writing `retry({method:
+     * 'post'})` - which is ordinary, and which got normalises - put the literal `post` on the
+     * request line and the server answered 400, surfaced as an `HTTPError` naming a method the
+     * caller never typed in that case.
+     */
+    if (newOptions.method !== undefined) {
+      merged.method = normaliseMethod(newOptions.method);
+    }
 
     // Every header this function drops asks the same question first - did the hook name it
     // itself? A header the hook set is the hook saying what the retry should carry, and wins
@@ -3698,7 +4144,33 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       (merged as RetryDepth)[afterResponseLimit] = hookIndex;
     }
 
-    return this.call<T>(merged);
+    /*
+     * got documents that calling `retryWithMergedOptions` triggers `beforeRetry` hooks, and
+     * that the retried response's `retryCount` reflects it - neither happened here, because
+     * this retry recurses straight into `call()` rather than through undici's retry
+     * interceptor, which is the only other place `beforeRetry` fires and `retryCount` is
+     * counted from. `error` is `undefined`: nothing here failed to get a response, a hook
+     * chose to retry one it already had, which is exactly the shape `onResponseError`'s
+     * counterpart on the network-retry path reports as "a status, not an error".
+     */
+    if (this.beforeRetryHooks) {
+      for (const hook of this.beforeRetryHooks) {
+        hook(undefined, triggerStatusCode, retryCount);
+      }
+    }
+
+    const result = await this.call<T>(merged);
+
+    /*
+     * Retries the nested call made itself, plus everything behind the response that triggered
+     * this one, plus this retry. `depth` used to stand in for the last two, and `depth` is the
+     * *nesting* level rather than a count of anything: two hooks retrying in sequence both ran
+     * at depth 1 and reported one retry between them, while a retry that nested inside another
+     * reported three for two. Measured against the dispatches a `beforeRequest` hook counted.
+     */
+    result.retryCount += retryCount;
+
+    return result;
   }
 
   extend<E extends RequestOptions>(options: E): Gotlike<MergeClientOptions<O, E>> {
@@ -3727,7 +4199,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       searchParams:
         base?.searchParams !== undefined && options.searchParams !== undefined
           ? mergeSearchParams(base.searchParams, options.searchParams)
-          : (options.searchParams ?? base?.searchParams),
+          : // One-sided, so nothing merges the two - but it must still not hand back the
+            // parent's or the caller's own object unchanged. See `cloneSearchParams`.
+            cloneSearchParams(options.searchParams ?? base?.searchParams),
       // Handlers and hooks accumulate, so an extended client keeps the parent's.
       handlers: concatHooks(base?.handlers, options.handlers),
       hooks: mergeHooks(base?.hooks, options.hooks),
@@ -3749,6 +4223,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     return (this.#stream ??= makeStreamClient(this));
   }
 
+  get(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeStream>;
   get(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   get(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   get(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -3761,6 +4236,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     return this.handle<T>(options, url, 'GET');
   }
 
+  post(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   post(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   post(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   post(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -3773,6 +4249,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     return this.handle<T>(options, url, 'POST');
   }
 
+  delete(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   delete(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   delete(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   delete(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -3791,6 +4268,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * `client(url, {method: 'HEAD'})` - so a drop-in caller writing `client.head(url)` got a
    * TypeError. Found by the parity suite, which could not run its HEAD scenario at all.
    */
+  head(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeStream>;
   head(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   head(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   head(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -3803,6 +4281,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     return this.handle<T>(options, url, 'HEAD');
   }
 
+  put(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   put(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   put(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   put(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -3815,6 +4294,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     return this.handle<T>(options, url, 'PUT');
   }
 
+  patch(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   patch(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   patch(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   patch(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -3827,6 +4307,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     return this.handle<T>(options, url, 'PATCH');
   }
 
+  query(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   query(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   query(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   query(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -3846,6 +4327,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
  */
 export type CallableClient<O extends ClientOptions = ClientOptions> = Omit<Gotlike<O>, 'extend'> & {
   /* `client({url, ...})`, the options-only form got's export also accepts. */
+  (options: RequestOptions & IsStream): Promise<GotlikeStream | GotlikeUploadStream>;
   (options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   (options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   (options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
@@ -3854,6 +4336,7 @@ export type CallableClient<O extends ClientOptions = ClientOptions> = Omit<Gotli
   (options: BufferCall & BodyOnly): Promise<Buffer>;
   <T>(options: RequestOptions & BodyOnly): Promise<T>;
   <T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  (url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeStream | GotlikeUploadStream>;
   (url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   (url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
   (url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
