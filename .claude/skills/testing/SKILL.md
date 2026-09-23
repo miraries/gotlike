@@ -1,6 +1,6 @@
 ---
 name: testing
-description: How gotlike tests are written and why — the invariant-table style, the shared http server and its routes, retry-test pitfalls (backoffLimit, per-test-id counters, why mock.timers is unusable), and the coverage gate with its four deliberately-uncovered branches. Read before adding or changing a test in src/**/*.spec.ts, or before touching the coverage thresholds.
+description: How gotlike tests are written and why — the invariant-table style, the shared http server and its routes, retry-test pitfalls (backoffLimit, per-test-id counters, why mock.timers is unusable), and the coverage gate with its five deliberately-uncovered branches. Read before adding or changing a test in src/**/*.spec.ts, or before touching the coverage thresholds.
 ---
 
 # Tests
@@ -81,7 +81,7 @@ functions. What that pass turned up is worth knowing, because it was all public 
 `put`/`patch`/`delete` on the client and five of the eight verbs on a nock `Scope` had no test at all,
 nor did `once`/`twice`/`thrice`, `delay`, `abortPendingRequests`, or `enableNetConnect`.
 
-**Four uncovered branches remain, and all four are deliberate.** They are listed here so nobody has to work
+**Five uncovered branches remain, and all five are deliberate.** They are listed here so nobody has to work
 out a second time whether they matter:
 
 | where | why it is uncovered |
@@ -90,11 +90,12 @@ out a second time whether they matter:
 | `index.ts` redirect tracker, `lastStatusCode === undefined` | Unreachable in practice — `countAttempts` resets `redirects.count` to 0 on a retry, so a retried attempt's first hop never reaches the callback. **Not removable:** it is also the narrowing that makes `lastStatusCode` a `number` for the hook call below it, and deleting it is a type error rather than a no-op. |
 | `index.ts` `callStream` http-error readable, `raised` guard | Needs undici's duplex to pull twice before the queued destroy lands — a race, not a behaviour. Any test for it would be flaky. |
 | `nock.ts` `cleanAll`'s `cleanMocks()` fallback | Only runs if undici moves its `dispatches` symbol, which is the future it exists for. |
+| `index.ts` `IsolatedAbortHandler.lead`, `addWaitingHandler` not a function | Only runs if undici renames the method on its `DeduplicationHandler`; it degrades to not counting parked requests rather than throwing on every deduped request. |
 
 A fifth used to be here and is now gone: `callStream`'s `else if (!isBodyMethod(...))` arm was **dead**, since
 its only call site already gates on `isBodyMethod`. It was deleted, and the comment in its place records what
 has to come back if that routing is ever widened — without an `end()` for the bodyless case `undici.pipeline`
 never sends the request and the caller waits forever.
 
-**Don't chase 100%.** The number is a means of finding untested behaviour, and the four above have been looked
+**Don't chase 100%.** The number is a means of finding untested behaviour, and the five above have been looked
 at. Raising the threshold past what they allow buys a test for a race and a test for a type narrowing.

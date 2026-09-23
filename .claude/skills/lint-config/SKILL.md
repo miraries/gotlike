@@ -48,6 +48,9 @@ it back on.
 | `typescript/require-await` | Same reason the eslint rule above it is off: a hook or a test callback is `async` to satisfy a signature, not because it has something to await. |
 - **oxfmt** (`.oxfmtrc.json`) with `bracketSpacing: false`, to match the brace style already in the repo
   rather than reformatting every line to a new one.
+  **Markdown is in `ignorePatterns`** (`**/*.md`). The only markdown under `src`/`benchmark` is the hand-wrapped
+  `CLAUDE.md` notes, which oxfmt would re-pad (every table row to the widest cell) and rewrite (`*x*` to `_x_`),
+  turning a one-row edit into a whole-table diff. The README is outside the formatted paths for the same reason.
 - **Two tsconfigs.** `tsconfig.json` is the *checking* config: `noEmit`, includes the spec files, and allows
   `.ts` import specifiers (which the specs use). `tsconfig.build.json` extends it to emit `dist/` and excludes
   the specs. **The specs were previously not type-checked at all** — the build config's `exclude` kept them

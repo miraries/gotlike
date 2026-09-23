@@ -101,23 +101,60 @@ function hasMockedOrigin(requestOrigin: string): boolean {
   return false;
 }
 
+type NetConnectMatcher = string | RegExp | ((host: string) => boolean);
+
+/**
+ * What `nock.enableNetConnect()`/`disableNetConnect()` asked for: every host, none, or the listed
+ * ones. In nock this governs *unmocked* hosts only - an origin with a scope fails closed on a miss
+ * whatever it says.
+ *
+ * It used to be applied to mocked origins as well: calling either function switched the
+ * per-origin check below off for the rest of the process, so after the ordinary teardown
+ * `nock.enableNetConnect()` a typo'd path on a mocked host became a live request to the real
+ * one - silently, and in every test file mocha ran after it.
+ */
+let netConnectPolicy: boolean | NetConnectMatcher[] = true;
+
+/** Which setting MockAgent currently holds, so a dispatch only switches it when it has to. */
+let appliedNetConnect: 'closed' | 'policy' | undefined;
+
+function applyNetConnectPolicy(): void {
+  if (netConnectPolicy === true) {
+    mockAgent.enableNetConnect();
+
+    return;
+  }
+
+  mockAgent.disableNetConnect();
+
+  if (netConnectPolicy !== false) {
+    for (const matcher of netConnectPolicy) {
+      mockAgent.enableNetConnect(matcher as string);
+    }
+  }
+}
+
 /*
  * MockAgent's public network matcher receives only `host`, which loses the scheme and cannot
  * distinguish `http://example.test` from `https://example.test`. Choose its fallback policy
- * synchronously at dispatch time instead, while the complete origin is still available. The
- * mock match (or miss) is decided before `dispatch()` returns, so another request cannot
- * observe the temporary setting between these two calls.
+ * synchronously at dispatch time instead, while the complete origin is still available: closed
+ * for an origin with registered mocks, the caller's `netConnectPolicy` for any other. The mock
+ * match (or miss) is decided before `dispatch()` returns, so another request cannot observe the
+ * temporary setting between these two calls.
  */
-let usesDefaultNetConnect = true;
 const mockDispatch = mockAgent.dispatch.bind(mockAgent);
 
 mockAgent.dispatch = (options, handler) => {
-  if (usesDefaultNetConnect) {
-    if (hasMockedOrigin(String(options.origin))) {
+  const wanted = hasMockedOrigin(String(options.origin)) ? 'closed' : 'policy';
+
+  if (appliedNetConnect !== wanted) {
+    if (wanted === 'closed') {
       mockAgent.disableNetConnect();
     } else {
-      mockAgent.enableNetConnect();
+      applyNetConnectPolicy();
     }
+
+    appliedNetConnect = wanted;
   }
 
   return mockDispatch(options, handler);
@@ -826,11 +863,6 @@ class Interceptor {
     };
   }
 
-  /** The uri a reply callback sees: path relative to the base path, query included. */
-  #uri(path: string): string {
-    return this.#basePath && path.startsWith(this.#basePath) ? path.slice(this.#basePath.length) : path;
-  }
-
   reply(responseCode: number, body?: ReplyBody | ReplyBodyFunction, headers?: ReplyHeaders): Scope;
   reply(replyFunction: ReplyFunction): Scope;
   reply(
@@ -887,7 +919,14 @@ class Interceptor {
 
         const [statusCode, data, replyHeaders] = await resolve.call(
           context,
-          this.#uri(opts.path),
+          /*
+           * The request's whole path, base path and query included - what nock hands over
+           * (`options.path`). This used to strip the scope's base path, so
+           * `nock('http://h/api').get('/x')` gave the callback `/x?a=1` where nock 14 gives
+           * `/api/x?a=1` (measured) - and a test verifying a signature computed over the path,
+           * as the aggregator's Spribe suite does, checked it against the wrong string.
+           */
+          opts.path,
           parseRequestBody(body, context.req.headers),
         );
 
@@ -1076,14 +1115,17 @@ Object.assign(nock, {
   isActive() {
     return this.active;
   },
+  // Both only record the policy; the next dispatch applies it. See `netConnectPolicy`.
   disableNetConnect() {
-    usesDefaultNetConnect = false;
-    mockAgent.disableNetConnect();
+    netConnectPolicy = false;
+    appliedNetConnect = undefined;
   },
-  enableNetConnect(host?: string | RegExp | ((host: string) => boolean)) {
-    usesDefaultNetConnect = false;
-    // undici's overloads don't accept `undefined` for the "allow everything" form.
-    return host === undefined ? mockAgent.enableNetConnect() : mockAgent.enableNetConnect(host as string);
+  enableNetConnect(host?: NetConnectMatcher) {
+    // A host adds to the allow-list, as undici's own `enableNetConnect(host)` does; no host
+    // allows everything.
+    netConnectPolicy =
+      host === undefined ? true : Array.isArray(netConnectPolicy) ? [...netConnectPolicy, host] : [host];
+    appliedNetConnect = undefined;
   },
   pendingMocks() {
     return mockAgent.pendingInterceptors();

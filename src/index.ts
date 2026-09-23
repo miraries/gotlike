@@ -568,6 +568,265 @@ function makeRedirectTracker(hooks?: Hooks['beforeRedirect']): Dispatcher.Dispat
   );
 }
 
+/**
+ * Keeps one caller's abort from failing every other request `dedupe` collapsed onto it.
+ *
+ * undici's deduplicate interceptor sends the first of a group of identical in-flight requests and
+ * parks the rest on it, and the dispatch it sends is controlled by *that first caller alone*: its
+ * `abort` tears the shared request down, and the error it aborted with is handed to every parked
+ * request (`DeduplicationHandler.onResponseError`). Here every request with a `timeout.request`
+ * or a `signal` aborts through its own controller, so - measured - one caller's `abort()` failed
+ * a second, unrelated caller with `AbortError`, and a 100ms deadline failed a request that had
+ * asked for 5s with `TimeoutError` at 100ms. Nothing on the second request had been aborted.
+ *
+ * Two interceptors, one either side of `dedupe`. `outer` wraps every request dedupe could group
+ * in an `IsolatedAbortHandler`, whose controller is the only way anything above reaches the
+ * dispatch. `inner` sees what dedupe actually sends: a group's first request arrives wrapped in
+ * dedupe's own handler, and `lead` counts every request dedupe then parks on it, through that
+ * handler's own `addWaitingHandler`. An abort ends *this* caller's request at once, with its own
+ * reason, and leaves the dispatch running only while something is parked on it; otherwise it is
+ * aborted for real, exactly as before. A parked request's controller is already its own (dedupe
+ * gives each one a separate controller), so aborting it never needs isolating.
+ *
+ * Counted through dedupe rather than by a key of our own. A key of origin, method and path - what
+ * this used to count - is coarser than dedupe's, which also compares headers, and dedupe also
+ * sends a request independently once the first one's body has started streaming. Both counted as
+ * parked when nothing was: an aborted request with a different `authorization` was left running,
+ * holding its socket and draining its body, until undici's 300s default timeout if no
+ * `timeout.request` was set. A consumer destroying a response body goes through the same `abort`,
+ * and is covered by the same rule.
+ */
+function isolateDedupedAborts(methods: readonly string[]): {
+  inner: Dispatcher.DispatcherComposeInterceptor;
+  outer: Dispatcher.DispatcherComposeInterceptor;
+} {
+  /**
+   * The request passing through `dedupe` right now. dedupe dispatches synchronously, so `inner`
+   * reads it before anything else can dispatch.
+   */
+  let entering: IsolatedAbortHandler | undefined;
+
+  const outer: Dispatcher.DispatcherComposeInterceptor = (dispatch) =>
+    function IsolateDedupedAborts(opts, handler) {
+      // Nothing dedupe would not group, which is also why the handler has no upgrade path.
+      if (!methods.includes(opts.method) || opts.upgrade) {
+        return dispatch(opts, handler);
+      }
+
+      const isolated = new IsolatedAbortHandler(handler);
+      const previous = entering;
+
+      entering = isolated;
+
+      try {
+        return dispatch(opts, isolated);
+      } finally {
+        entering = previous;
+      }
+    };
+
+  const inner: Dispatcher.DispatcherComposeInterceptor = (dispatch) =>
+    function WatchDedupeLeaders(opts, handler) {
+      const leader = entering;
+
+      entering = undefined;
+
+      // dedupe passes a request it sends on its own through unchanged; one it wrapped leads a group.
+      if (leader !== undefined && handler !== leader) {
+        leader.lead(handler as unknown as DedupeGroup);
+      }
+
+      return dispatch(opts, handler);
+    };
+
+  return {inner, outer};
+}
+
+/** The part of undici's `DeduplicationHandler` that parks a request on the one it sent. */
+type DedupeGroup = {addWaitingHandler?: (handler: Dispatcher.DispatchHandler) => boolean};
+
+/**
+ * The controller an `IsolatedAbortHandler` hands upwards in place of the shared dispatch's.
+ * Everything but `abort` goes straight through; `abort` asks the handler first.
+ */
+class IsolatedController {
+  /** The shared dispatch's controller, once it has started. */
+  target?: Dispatcher.DispatchController;
+  /** Set once this caller has been failed on its own; the handler drops everything after. */
+  detached = false;
+  #aborted = false;
+  #reason: Error | null = null;
+  #onAbort: (reason: Error) => void;
+
+  constructor(onAbort: (reason: Error) => void) {
+    this.#onAbort = onAbort;
+  }
+
+  pause(): void {
+    this.target?.pause();
+  }
+
+  resume(): void {
+    this.target?.resume();
+  }
+
+  abort(reason: Error): void {
+    if (this.#aborted) {
+      return;
+    }
+
+    this.#aborted = true;
+    this.#reason = reason;
+    this.#onAbort(reason);
+  }
+
+  get aborted(): boolean {
+    return this.#aborted || (this.target?.aborted ?? false);
+  }
+
+  get reason(): Error | null {
+    return this.#reason ?? this.target?.reason ?? null;
+  }
+
+  get paused(): boolean {
+    return !this.detached && (this.target?.paused ?? false);
+  }
+
+  // undici's request handler reads these off the controller it was given.
+  get rawHeaders(): unknown {
+    return (this.target as {rawHeaders?: unknown} | undefined)?.rawHeaders;
+  }
+
+  get rawTrailers(): unknown {
+    return (this.target as {rawTrailers?: unknown} | undefined)?.rawTrailers;
+  }
+}
+
+class IsolatedAbortHandler implements Dispatcher.DispatchHandler {
+  #handler: Dispatcher.DispatchHandler;
+  /** Requests dedupe has parked on this one's dispatch and that are still reading it. */
+  #waiters = 0;
+  /** The request this one is parked on, when it is parked. */
+  #leader?: IsolatedAbortHandler;
+  #settled = false;
+  #controller = new IsolatedController((reason) => this.#abort(reason));
+
+  constructor(handler: Dispatcher.DispatchHandler) {
+    this.#handler = handler;
+  }
+
+  /**
+   * Count the requests dedupe parks on this one, by wrapping the `addWaitingHandler` of the
+   * handler dedupe sent it with. If undici ever renames that, nothing is counted and an abort
+   * tears the dispatch down as it would without this interceptor - which the dedupe tests catch.
+   * Uncovered by design, like nock's `cleanMocks()` fallback.
+   */
+  lead(group: DedupeGroup): void {
+    const add = group.addWaitingHandler;
+
+    if (typeof add !== 'function') {
+      return;
+    }
+
+    // Every request dedupe can park came through `outer`, which is keyed on the same methods.
+    group.addWaitingHandler = (parked) => {
+      const handler = parked as IsolatedAbortHandler;
+
+      // Counted before the call: dedupe starts the parked request inside it, and a caller that
+      // aborts right there is counted back out through `#settle`.
+      handler.#leader = this;
+      this.#waiters++;
+
+      const added = add.call(group, handler);
+
+      // Not parked - dedupe sends it on its own - so it never started and never settles here.
+      if (!added) {
+        handler.#leader = undefined;
+        this.#waiters--;
+      }
+
+      return added;
+    };
+  }
+
+  /** Counted out of its leader exactly once, however the request ended. */
+  #settle(): void {
+    if (this.#settled) {
+      return;
+    }
+
+    this.#settled = true;
+
+    if (this.#leader !== undefined) {
+      this.#leader.#waiters--;
+    }
+  }
+
+  #abort(reason: Error): void {
+    const controller = this.#controller;
+    const target = controller.target;
+
+    // Nothing parked on this dispatch, or it is a parked request's own: abort it as undici would.
+    if (target === undefined || this.#settled || this.#waiters === 0) {
+      target?.abort(reason);
+
+      return;
+    }
+
+    controller.detached = true;
+    this.#settle();
+
+    // Backpressure this caller applied must not stall the requests still reading the dispatch.
+    if (target.paused) {
+      target.resume();
+    }
+
+    this.#handler.onResponseError?.(controller as unknown as Dispatcher.DispatchController, reason);
+  }
+
+  get #upstream(): Dispatcher.DispatchController {
+    return this.#controller as unknown as Dispatcher.DispatchController;
+  }
+
+  onRequestStart(controller: Dispatcher.DispatchController, context: any): void {
+    this.#controller.target = controller;
+    this.#handler.onRequestStart?.(this.#upstream, context);
+  }
+
+  onResponseStart(
+    controller: Dispatcher.DispatchController,
+    statusCode: number,
+    headers: IncomingHttpHeaders,
+    statusMessage?: string,
+  ): void {
+    if (!this.#controller.detached) {
+      this.#handler.onResponseStart?.(this.#upstream, statusCode, headers, statusMessage);
+    }
+  }
+
+  onResponseData(controller: Dispatcher.DispatchController, chunk: Buffer): void {
+    if (!this.#controller.detached) {
+      this.#handler.onResponseData?.(this.#upstream, chunk);
+    }
+  }
+
+  onResponseEnd(controller: Dispatcher.DispatchController, trailers: IncomingHttpHeaders): void {
+    this.#settle();
+
+    if (!this.#controller.detached) {
+      this.#handler.onResponseEnd?.(this.#upstream, trailers);
+    }
+  }
+
+  onResponseError(controller: Dispatcher.DispatchController, error: Error): void {
+    this.#settle();
+
+    if (!this.#controller.detached) {
+      this.#handler.onResponseError?.(this.#upstream, error);
+    }
+  }
+}
+
 type RetryHandlerOptions = NonNullable<Parameters<typeof interceptors.retry>[0]>;
 
 type UndiciRequestOptions = NonNullable<Parameters<typeof undici.request>[1]> & InterceptorOptions;
@@ -630,6 +889,25 @@ const acceptEncoding = [
 const absoluteUrl = /^[a-z][a-z\d+\-.]*:\/\//i;
 
 const leadingSlashes = /^\/+/;
+
+/**
+ * What `options.url` is set to once resolved: a `URL`, as got hands handlers and hooks, so
+ * `options.url.href`, `.pathname` and an in-place `options.url.searchParams.set('sig', …)` all
+ * work as they do there. `String()` of it is also what undici puts on the wire - percent-encoded,
+ * host lower-cased, a bare origin given its `/`. It used to be the raw string, so a hook signing
+ * it signed `/a b/ü` while the server received `/a%20b/%C3%BC`, and `.href` was `undefined`.
+ * ~300ns a call; the url is parsed here instead of only inside undici.
+ *
+ * Lenient: a url `new URL` rejects is handed back as the string, so it still fails where it
+ * always did - inside the dispatch, as `ERR_INVALID_URL`, or on the stand-in stream for `stream()`.
+ */
+function asUrl(url: string): URL | string {
+  try {
+    return new URL(url);
+  } catch {
+    return url;
+  }
+}
 
 /** Credentials carried in a url's authority, and the url with them removed. */
 type Userinfo = {
@@ -1159,6 +1437,68 @@ function stripCrossOrigin(options: FormedOptions, before: CrossOriginState, writ
   }
 }
 
+function basicAuthorization(username?: string, password?: string): string {
+  return 'Basic ' + Buffer.from(`${username ?? ''}:${password ?? ''}`).toString('base64');
+}
+
+/**
+ * `url` carrying `searchParams` as its query, replacing whatever query it had - the rule
+ * `resolveUrl` applies, for a url that is already resolved.
+ *
+ * For a `beforeRequest` hook that wrote to `options.searchParams` and left `options.url` alone.
+ * The url is resolved *before* the hooks run, so the write was read by nothing: in got 12 both
+ * `options.searchParams = {...}` and `options.searchParams.set(...)` land on the request url,
+ * and here a signature or an api key added that way silently never left the process. Compared
+ * against the query the url already carries rather than tracked, because an in-place `.set()` on
+ * the `URLSearchParams` is invisible to any accessor - and the comparison hands back `url`
+ * untouched for a hook that never went near the query. Only reached by a client that has
+ * `beforeRequest` hooks and a request that carries `searchParams`.
+ */
+function withQuery(url: string, searchParams: SearchParams): string {
+  const search = stringifyQuery(searchParams);
+  const query = url.indexOf('?');
+
+  if (search === (query === -1 ? '' : url.slice(query + 1))) {
+    return url;
+  }
+
+  return search ? withoutQuery(url) + '?' + search : withoutQuery(url);
+}
+
+/**
+ * Honour a `beforeRequest` hook that set `options.username`/`options.password`.
+ *
+ * The Basic-auth header is derived before the hooks run, so a hook supplying credentials this way
+ * sent the request anonymously - or with the credentials it was replacing. got 12 keeps them on the
+ * request url and node derives the header at dispatch, so the hook's are the ones that go out.
+ *
+ * The header is only re-derived when it is the one derived from the previous credentials (or there
+ * is none): an `authorization` the caller or the hook set explicitly wins, as it does everywhere
+ * else - node likewise only applies `auth` when no `Authorization` header is set.
+ */
+function applyHookCredentials(
+  options: FormedOptions,
+  before: {username?: string; password?: string},
+  derived: string | undefined,
+  writes: HookWrites,
+): void {
+  if (options.username === before.username && options.password === before.password) {
+    return;
+  }
+
+  const current = options.headers['authorization'];
+
+  if (writes.headers.has('authorization') || (current !== undefined && current !== derived)) {
+    return;
+  }
+
+  if (hasCredentials(options.username, options.password)) {
+    options.headers['authorization'] = basicAuthorization(options.username, options.password);
+  } else {
+    delete options.headers['authorization'];
+  }
+}
+
 /**
  * got's phrasing for an HTTP error, **without the query string**.
  *
@@ -1207,7 +1547,13 @@ const retryDepth = Symbol('gotlike.retryDepth');
  */
 const afterResponseLimit = Symbol('gotlike.afterResponseLimit');
 
-type RetryDepth = {[retryDepth]?: number; [afterResponseLimit]?: number};
+/**
+ * The url `handle()` resolved before running the handler chain, carried the same way, so `call()`
+ * can tell a url a handler rewrote from the one it was handed. See `call()`.
+ */
+const resolvedForHandlers = Symbol('gotlike.resolvedForHandlers');
+
+type RetryDepth = {[retryDepth]?: number; [afterResponseLimit]?: number; [resolvedForHandlers]?: string};
 
 /**
  * Serialise `searchParams` / `form` values.
@@ -1716,6 +2062,18 @@ const unimplementedOptions = new Map<string, string>([
   ['retry.calculateDelay', "undici's RetryHandler owns the backoff schedule; use `retry.backoffLimit` to cap it"],
   ['retry.noise', "undici's RetryHandler owns the backoff schedule"],
   ['hooks.init', 'no equivalent stage - `beforeRequest` receives the formed options instead'],
+  // got's per-phase timeouts. Accepting and ignoring one left the request bounded by whatever
+  // else was set, or by nothing at all - `extend({timeout: {response: 100_000}})` is how the
+  // aggregator writes it. `extend()` is generic, so the type does not stop it either.
+  ...['lookup', 'connect', 'secureConnect', 'socket', 'send', 'response', 'read'].map(
+    (phase) =>
+      [
+        `timeout.${phase}`,
+        phase === 'connect' || phase === 'secureConnect'
+          ? 'bound the connection with the client-level `connectTimeout`, or the whole request with `timeout.request`'
+          : 'only `timeout.request` is supported, and it bounds every phase of the request',
+      ] as const,
+  ),
 ]);
 
 /** Reject a known got option this does not implement, saying so. Falls through for a typo. */
@@ -2420,7 +2778,7 @@ export type StreamHead = {
   statusCode: number;
   ok: boolean;
   headers: IncomingHttpHeaders;
-  url: string | URL;
+  url: string;
   /** How many times the request was retried. Always 0 unless `retry` is configured. */
   retryCount: number;
   timings: {
@@ -2517,7 +2875,7 @@ function makeStreamHead(
     ok: isOk(statusCode),
     headers,
     // Where the response came from, which is not `options.url` once redirects moved it.
-    url: dispatch.redirects?.lastUrl ?? (options.url as string | URL),
+    url: dispatch.redirects?.lastUrl ?? String(options.url),
     retryCount: retriesFrom(dispatch.attempts),
     timings: {
       phases: {
@@ -2595,7 +2953,7 @@ export type Response<T = any> = {
    */
   body: T;
   headers: IncomingHttpHeaders;
-  readonly url: string | URL;
+  readonly url: string;
   statusCode: number;
   /** Whether `statusCode` is in the 2xx range. */
   ok: boolean;
@@ -2672,8 +3030,8 @@ class GotlikeResponse<T> implements Response<T> {
   }
 
   /** The url the response came from - the last hop's, when redirects were followed. */
-  get url(): string | URL {
-    return this.#url ?? (this.request.options.url as string | URL);
+  get url(): string {
+    return this.#url ?? String(this.request.options.url);
   }
 
   get rawBody(): Buffer {
@@ -2927,6 +3285,16 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
   if (timeout !== undefined) {
     if (typeof timeout !== 'object' || timeout === null) {
       invalid('`timeout` must be an object like `{request: 5000}`');
+    }
+
+    // The same unknown-key check as `retry` and `hooks`: `request` is the only key read, so any
+    // other one is a bound that silently never applies.
+    for (const key in timeout) {
+      if (Object.hasOwn(timeout, key) && key !== 'request') {
+        rejectUnimplemented(`timeout.${key}`);
+
+        invalid(`Unknown option \`timeout.${key}\``);
+      }
     }
 
     /*
@@ -3411,7 +3779,14 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       }
 
       if (options.dedupe) {
-        chain.push(interceptors.deduplicate(options.dedupe === true ? undefined : options.dedupe));
+        const dedupeOptions = options.dedupe === true ? undefined : options.dedupe;
+
+        // Either side of `deduplicate`: one wraps every request it could group, the other sees
+        // which of them it sent and counts what it parked on each - see `isolateDedupedAborts`.
+        // Keyed on the same methods dedupe groups, `GET` by default.
+        const isolated = isolateDedupedAborts(dedupeOptions?.methods ?? ['GET']);
+
+        chain.push(isolated.inner, interceptors.deduplicate(dedupeOptions), isolated.outer);
       }
 
       if (options.cache) {
@@ -3595,6 +3970,18 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // synchronously - `new Gotlike(...)` isn't async.
     try {
       formed = this.formOptions(options, url, method);
+
+      /*
+       * got hands handlers a url already resolved against `prefixUrl` and `searchParams`, and
+       * the aggregator's logging handler reads it before calling `next`. It used to see the
+       * bare `'games/launch'` here and the full url only after `next` resolved, since `call()`
+       * resolves onto the same object. Recorded, so `call()` can tell whether a handler rewrote
+       * the url - see the matching read there.
+       */
+      if (formed.handlers) {
+        formed.url = asUrl(this.resolveUrl(formed));
+        (formed as RetryDepth)[resolvedForHandlers] = String(formed.url);
+      }
     } catch (error) {
       return Promise.reject(error);
     }
@@ -3821,7 +4208,29 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     try {
       // The resolved URL is what hooks and handlers should see and what request signing
       // needs, so write it back before anything gets a look at the options.
-      url = options.url = this.resolveUrl(options);
+      const handed = (options as RetryDepth)[resolvedForHandlers];
+
+      if (handed === undefined) {
+        options.url = asUrl(this.resolveUrl(options));
+      } else {
+        /*
+         * `handle()` already resolved the url for the handler chain. Resolving it again is
+         * idempotent unless a handler rewrote it - and then `searchParams` replaced the query the
+         * handler had just built: `options.url.searchParams.set('sig', …)`, the got way to sign a
+         * url, was silently dropped off the wire whenever the request also carried
+         * `searchParams` (got 16 sends both). The rule the `beforeRequest` hooks get below: a
+         * url rewritten to an absolute one is taken as written, a relative one is resolved again.
+         * A handler that only changed `searchParams` leaves the url equal and is re-resolved as
+         * before. Cleared once read, so a retry spreading these options does not inherit it.
+         */
+        (options as RetryDepth)[resolvedForHandlers] = undefined;
+
+        const current = String(options.url ?? '');
+
+        options.url = asUrl(current !== handed && absoluteUrl.test(current) ? current : this.resolveUrl(options));
+      }
+
+      url = String(options.url);
 
       // `http://user:pass@host/` carries credentials that undici ignores, so they have to
       // come off the url and go into the header here - before hooks see either. got gets this
@@ -3831,7 +4240,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       const userinfo = this.parseUserinfo ? splitUserinfo(url) : undefined;
 
       if (userinfo) {
-        url = options.url = userinfo.url;
+        options.url = asUrl(userinfo.url);
+        url = String(options.url);
       }
 
       // Serialise up front so `beforeRequest` hooks can read and re-sign `options.body`
@@ -3875,13 +4285,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
       // `hasCredentials`, not `!== undefined`: an empty username and password are no
       // credentials at all, and got sends no header for them.
-      if (hasCredentials(username, password) && !hasHeader(options.headers, 'authorization')) {
-        const credentials = `${username ?? ''}:${password ?? ''}`;
+      /** The header derived here, if any, so a hook changing the credentials can replace it. */
+      let derivedAuthorization: string | undefined;
 
-        options.headers['authorization'] = 'Basic ' + Buffer.from(credentials).toString('base64');
+      if (hasCredentials(username, password) && !hasHeader(options.headers, 'authorization')) {
+        derivedAuthorization = basicAuthorization(username, password);
+        options.headers['authorization'] = derivedAuthorization;
       }
 
       if (this.beforeRequestHooks) {
+        // What the url and the header above were derived from, so a hook that changes either
+        // without touching `options.url` is still honoured - see `withQuery` and
+        // `applyHookCredentials`.
+        const credentialsBefore = {username: options.username, password: options.password};
         // Taken before the hooks run because that is the only moment it exists - see
         // `crossOriginState`. One allocation, and only for a client that has hooks.
         const before = crossOriginState(options);
@@ -3915,9 +4331,12 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
          * the whole point of signing it. Only a relative one is resolved again, so a hook can
          * still rewrite the path and have `prefixUrl` applied.
          */
-        if (options.url !== url) {
-          const rewritten = String(options.url ?? '');
-          const next = absoluteUrl.test(rewritten) ? rewritten : this.resolveUrl(options);
+        // Compared by value: the url is a `URL`, and a hook may rewrite it in place
+        // (`options.url.searchParams.set('sig', …)`) rather than assign a new one.
+        const rewritten = String(options.url ?? '');
+
+        if (rewritten !== url) {
+          const next = String(asUrl(absoluteUrl.test(rewritten) ? rewritten : this.resolveUrl(options)));
 
           /*
            * A hook that moves the request to another origin does not take the credentials with
@@ -3949,16 +4368,29 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
               hasCredentials(rewrittenUserinfo.username, rewrittenUserinfo.password) &&
               !hasHeader(options.headers, 'authorization')
             ) {
-              const credentials = `${rewrittenUserinfo.username}:${rewrittenUserinfo.password}`;
-
-              options.headers['authorization'] = 'Basic ' + Buffer.from(credentials).toString('base64');
+              options.headers['authorization'] = basicAuthorization(
+                rewrittenUserinfo.username,
+                rewrittenUserinfo.password,
+              );
             }
 
-            url = options.url = rewrittenUserinfo.url;
+            options.url = asUrl(rewrittenUserinfo.url);
           } else {
-            url = options.url = next;
+            options.url = asUrl(next);
+          }
+
+          url = String(options.url);
+        } else if (options.searchParams !== undefined) {
+          const updated = withQuery(url, options.searchParams);
+
+          // Unchanged is the common case, and it keeps the hook's `URL` rather than reparsing.
+          if (updated !== url) {
+            options.url = asUrl(updated);
+            url = String(options.url);
           }
         }
+
+        applyHookCredentials(options, credentialsBefore, derivedAuthorization, writes);
       }
 
       /*
@@ -4340,7 +4772,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // path that keeps it replayable across a redirect. The cast is for `FormData`: undici
       // declares its own, structurally different from the global one this option accepts, and
       // by here a `FormData` has already been encoded to a stream and cannot reach this.
-      undiciResponse = await undici.request(options.url as string, {
+      undiciResponse = await undici.request(String(options.url), {
         ...dispatch,
         body: options.body as UndiciRequestOptions['body'],
       });
@@ -4507,7 +4939,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     let responded: StreamHead | undefined;
 
     try {
-      duplex = undici.pipeline(options.url as string, dispatch, ({statusCode, headers, body}) => {
+      duplex = undici.pipeline(String(options.url), dispatch, ({statusCode, headers, body}) => {
         // The response is ours, so nothing is going to retry it - see the same call in `call()`.
         dispatch.resume();
 
@@ -4718,9 +5150,21 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // six places to write `||` where `&&` was meant and silently keep a stale credential.
     const hookSet = (name: string): boolean => newOptions.headers !== undefined && hasHeader(newOptions.headers, name);
 
-    // A retry is a merge like any other, so a query the hook adds joins the one the request
-    // already carried instead of erasing it.
-    if (options.searchParams !== undefined && newOptions.searchParams !== undefined) {
+    /*
+     * A `url` the hook supplies brings its own query, and the first attempt's `searchParams` do
+     * not come with it. They used to: `call()` lays `searchParams` over whatever query the url
+     * carries, so a refresh hook doing `retry({url: 'https://h/p?token=new'})` after a call made
+     * with `searchParams: {a: 1}` put `/p?a=1` on the wire - the new token silently dropped, the
+     * refresh failing with the same 401 it was meant to fix. got's `searchParams` is a view of the
+     * url's own, so a new url replaces it outright (measured against got 16: `/p?token=new`, and a
+     * new url with no query sends none). Only the hook's own `searchParams`, if it named any, go
+     * over the new url.
+     */
+    if (newOptions.url !== undefined) {
+      merged.searchParams = cloneSearchParams(newOptions.searchParams);
+    } else if (options.searchParams !== undefined && newOptions.searchParams !== undefined) {
+      // A retry is a merge like any other, so a query the hook adds joins the one the request
+      // already carried instead of erasing it.
       merged.searchParams = mergeSearchParams(options.searchParams, newOptions.searchParams);
     } else if (merged.searchParams !== undefined) {
       // One-sided, so the spread aliased the first attempt's query or the hook's own object.

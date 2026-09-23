@@ -48,6 +48,12 @@ async function failure<E extends Error = RequestError>(promise: Promise<unknown>
 
 const requestCounts: Record<string, number> = {};
 
+/** Responses on `/counted-slow` whose connection closed before the server finished them. */
+let abandonedResponses = 0;
+
+/** The same for `/trickle`. */
+let abandonedTrickles = 0;
+
 const serverState: {retryCounts: Record<string, number>} = {
   retryCounts: {
     default: 0,
@@ -80,7 +86,13 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     }, 250);
 
     ticker.unref();
-    res.on('close', () => clearInterval(ticker));
+    res.on('close', () => {
+      clearInterval(ticker);
+
+      if (!res.writableFinished) {
+        abandonedTrickles++;
+      }
+    });
 
     return;
   }
@@ -151,6 +163,21 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
       res.setHeader('content-type', 'application/json');
       res.end(JSON.stringify({count: requestCounts['/counted']}));
     }, 20);
+
+    return;
+  }
+
+  if (req.url === '/counted-slow') {
+    // Long enough to abort one of several deduped requests part-way; records a response the
+    // client walked away from, so a test can tell a dispatch that was really torn down.
+    const timer = setTimeout(() => res.end('counted-slow'), 150);
+
+    res.on('close', () => {
+      if (!res.writableFinished) {
+        clearTimeout(timer);
+        abandonedResponses++;
+      }
+    });
 
     return;
   }
@@ -930,6 +957,135 @@ test('extend client with handler', async () => {
 });
 
 /*
+ * Handlers ran before `call()` resolved the url, so one reading `options.url` before `next`
+ * saw the bare relative path - and the full url after `next`, since `call()` resolves onto the
+ * same object. got hands handlers the resolved url, and the aggregator logs it from there.
+ */
+test('handlers see the url resolved against prefixUrl and searchParams, before and after next', async () => {
+  const seen: string[] = [];
+
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000/echo',
+    searchParams: {a: 1},
+    handlers: [
+      async (options, next) => {
+        seen.push(String(options.url));
+
+        const response = await next(options);
+
+        seen.push(String(options.url));
+
+        return response;
+      },
+    ],
+  });
+
+  const response = await extClient.get('items', {searchParams: {b: 2}, responseType: 'json'});
+  const expected = 'http://localhost:3000/echo/items?a=1&b=2';
+
+  assert.deepStrictEqual(seen, [expected, expected]);
+  assert.strictEqual((response.body as {url: string}).url, '/echo/items?a=1&b=2');
+});
+
+/*
+ * `options.url` was left exactly as written, so a hook signing it signed `/a b/ü` while undici
+ * put `/a%20b/%C3%BC` on the wire. got's `URL` prints the encoded form - the one sent - so
+ * handlers, hooks, the wire and `response.url` must all agree on it.
+ */
+test('handlers, hooks and the wire all see the url in its normalised, encoded form', async () => {
+  const seen: string[] = [];
+
+  const extClient = client.extend({
+    prefixUrl: 'http://LOCALHOST:3000/echo',
+    handlers: [
+      (options, next) => {
+        seen.push(String(options.url));
+
+        return next(options);
+      },
+    ],
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          seen.push(String(options.url));
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get('a b/ü', {responseType: 'json'});
+  const expected = 'http://localhost:3000/echo/a%20b/%C3%BC';
+
+  assert.strictEqual(typeof response.url, 'string');
+
+  assert.deepStrictEqual(seen, [expected, expected]);
+  assert.strictEqual(response.url, expected);
+  assert.strictEqual((response.body as {url: string}).url, new URL(expected).pathname);
+});
+
+/*
+ * got hands handlers and hooks a `URL`, and the aggregator's code is written against one:
+ * `(options.url as URL).href` in its logging handler was `undefined` on a string. A hook
+ * signing through `options.url.searchParams.set(...)` has to reach the wire as well, which a
+ * string could never express - and a rewrite in place is invisible to an identity check.
+ */
+test('handlers and hooks get a URL, and a hook rewriting it in place reaches the wire', async () => {
+  const hrefs: string[] = [];
+
+  const extClient = client.extend({
+    prefixUrl: 'http://localhost:3000/echo',
+    handlers: [
+      async (options, next) => {
+        hrefs.push((options.url as URL).href);
+
+        const response = await next(options);
+
+        hrefs.push((options.url as URL).href);
+
+        return response;
+      },
+    ],
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          (options.url as URL).searchParams.set('sig', 'abc');
+        },
+      ],
+    },
+  });
+
+  const response = await extClient.get('items', {searchParams: {a: 1}, responseType: 'json'});
+
+  assert.strictEqual((response.body as {url: string}).url, '/echo/items?a=1&sig=abc');
+  assert.strictEqual(response.url, 'http://localhost:3000/echo/items?a=1&sig=abc');
+  assert.ok(response.request.options.url instanceof URL);
+  assert.deepStrictEqual(hrefs, [
+    'http://localhost:3000/echo/items?a=1',
+    'http://localhost:3000/echo/items?a=1&sig=abc',
+  ]);
+});
+
+// A url built by the caller is theirs: resolving it must hand hooks a fresh `URL`, not theirs.
+test('a URL passed by the caller is never the object a hook rewrites', async () => {
+  const mine = new URL('http://localhost:3000/echo/items');
+
+  const extClient = client.extend({
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          (options.url as URL).searchParams.set('sig', 'abc');
+        },
+      ],
+    },
+  });
+
+  await extClient.get(mine);
+  await extClient.get(mine);
+
+  assert.strictEqual(mine.href, 'http://localhost:3000/echo/items');
+});
+
+/*
  * `extend()` used to hand the child the parent's own `handlers` array, `hooks` object and
  * `context` whenever the child supplied none of its own - the merge helpers returned `base`
  * unchanged. Writing through the child's `baseOptions` then mutated the parent, and every
@@ -1169,7 +1325,9 @@ test('beforeRequest can mutate headers and sees the resolved url and body', asyn
 
   const response = await extClient.post<Record<string, string>>('headers', {json: {a: 1}});
 
-  assert.strictEqual(seen.url, 'http://localhost:3000/headers');
+  // A `URL`, as got hands hooks - `.href` and friends have to work on it.
+  assert.ok(seen.url instanceof URL);
+  assert.strictEqual(seen.url.href, 'http://localhost:3000/headers');
   assert.strictEqual(seen.body, '{"a":1}');
   assert.strictEqual(seen.method, 'POST');
   assert.strictEqual(response.body['x-signature'], 'signed');
@@ -1242,6 +1400,88 @@ test('afterResponse can retry with merged options', async () => {
  * with `throwHttpErrors: false` and a new url still got an `HTTPError` naming the *old* url, as
  * long as the original request's own `throwHttpErrors` was left at its default `true`.
  */
+/*
+ * `handle()` resolves the url before the handlers, and `call()` resolved it again - laying
+ * `searchParams` over the query a handler had just built. got 16 sends both; this sent
+ * `/echo/items?a=1`. Pinned both with and without `searchParams`, since only one of the two was
+ * broken, and with a handler that changes `searchParams` instead, which must still win.
+ */
+test('a handler rewriting the url reaches the wire, whether or not the request has searchParams', async () => {
+  const signing = client.extend({
+    prefixUrl: 'http://localhost:3000/echo',
+    responseType: 'json',
+    handlers: [
+      (options, next) => {
+        (options.url as URL).searchParams.set('sig', 'abc');
+
+        return next(options);
+      },
+    ],
+  });
+
+  const withQuery = await signing.get<{url: string}>('items', {searchParams: {a: 1}});
+  const withoutQuery = await signing.get<{url: string}>('items?a=1');
+
+  assert.strictEqual(withQuery.body.url, '/echo/items?a=1&sig=abc');
+  assert.strictEqual(withoutQuery.body.url, '/echo/items?a=1&sig=abc');
+
+  const replacing = client.extend({
+    prefixUrl: 'http://localhost:3000/echo',
+    responseType: 'json',
+    handlers: [
+      (options, next) => {
+        options.searchParams = {b: 2};
+
+        return next(options);
+      },
+    ],
+  });
+
+  const replaced = await replacing.get<{url: string}>('items', {searchParams: {a: 1}});
+
+  assert.strictEqual(replaced.body.url, '/echo/items?b=2');
+});
+
+/*
+ * The first attempt's `searchParams` rode along into a retry that named a url of its own, and
+ * replaced its query - so a refresh hook putting a new token in the url sent the old query
+ * instead and got the same 401 back. got's `searchParams` is the url's own, so a new url
+ * replaces it; measured against got 16 for each row.
+ */
+test('an afterResponse retry with a url of its own does not inherit the first attempt’s searchParams', async () => {
+  const rows: [string, RequestOptions, string][] = [
+    ['a url with a query', {url: 'http://localhost:3000/echo/p?token=new'}, '/echo/p?token=new'],
+    ['a url with no query', {url: 'http://localhost:3000/echo/p'}, '/echo/p'],
+    ['a relative url under prefixUrl', {url: 'p?token=new'}, '/echo/p?token=new'],
+    [
+      'a url and searchParams of its own',
+      {url: 'http://localhost:3000/echo/p?token=new', searchParams: {b: 2}},
+      '/echo/p?b=2',
+    ],
+    ['no url, so the query is kept', {headers: {'x-retried': '1'}}, '/echo/first?a=1'],
+  ];
+
+  for (const [name, retryOptions, expected] of rows) {
+    const extClient = client.extend({
+      prefixUrl: 'http://localhost:3000/echo',
+      responseType: 'json',
+      hooks: {
+        afterResponse: [
+          (response, retryWithMergedOptions) =>
+            response.request.options.headers['x-retried'] === undefined &&
+            !String(response.request.options.url).includes('/echo/p')
+              ? retryWithMergedOptions({...retryOptions, headers: {'x-retried': '1'}})
+              : response,
+        ],
+      },
+    });
+
+    const response = await extClient.get<{url: string}>('first', {searchParams: {a: 1}});
+
+    assert.strictEqual(response.body.url, expected, name);
+  }
+});
+
 test('an afterResponse retry’s own throwHttpErrors and url settle the outcome, not the original request’s', async () => {
   const extClient = client.extend({
     responseType: 'json',
@@ -1596,7 +1836,7 @@ test('an afterResponse retry with throwHttpErrors undefined still throws on an e
  * that never fires - the very thing the unknown-key check exists to stop. That makes it a
  * behavioural divergence from got, so it is named as one in the message and in the README.
  */
-test('a got option gotlike does not implement is refused by name', () => {
+test('a got option gotlike does not implement is refused by name', async () => {
   // Cast at the boundary: these are got's option names, which `RequestOptions` deliberately
   // does not declare - a caller migrating from got is writing them in untyped or loosely typed
   // code, which is exactly the case the runtime check is here for.
@@ -1604,6 +1844,10 @@ test('a got option gotlike does not implement is refused by name', () => {
     {label: '`retry.calculateDelay` is not implemented', value: {retry: {calculateDelay: () => 0}}},
     {label: '`retry.noise` is not implemented', value: {retry: {noise: 100}}},
     {label: '`hooks.init` is not implemented', value: {hooks: {init: [() => {}]}}},
+    // got's per-phase timeouts, which a bare `request` check let through and then ignored.
+    {label: '`timeout.response` is not implemented', value: {timeout: {response: 10_000}}},
+    {label: '`timeout.connect` is not implemented', value: {timeout: {request: 5000, connect: 1000}}},
+    {label: '`timeout.lookup` is not implemented', value: {timeout: {lookup: 100}}},
   ];
 
   for (const {label: expected, value} of options) {
@@ -1620,6 +1864,14 @@ test('a got option gotlike does not implement is refused by name', () => {
 
   // A genuine typo is still a typo.
   assert.throws(() => createClient({retry: {limt: 0}} as RequestOptions), /Unknown option `retry.limt`/);
+  assert.throws(() => createClient({timeout: {reqest: 5000}} as RequestOptions), /Unknown option `timeout.reqest`/);
+
+  // And every route refuses it, not only construction: `extend()` is generic, so a caller's
+  // literal gets no excess-property check there, and a single call is where got code sets it too.
+  const response = {timeout: {response: 10_000}} as RequestOptions;
+
+  assert.throws(() => createClient().extend(response), /`timeout.response` is not implemented/);
+  await assert.rejects(createClient().get('http://localhost:3000/', response), /`timeout.response` is not implemented/);
 });
 
 /**
@@ -1717,6 +1969,90 @@ test('afterResponse retry with credentials in a new url replaces the stale Basic
 
   assert.strictEqual(response.body.url, '/echo');
   assert.strictEqual(response.body.headers['authorization'], 'Basic ' + Buffer.from('user2:pass2').toString('base64'));
+});
+
+/*
+ * The url and the Basic-auth header are derived before the `beforeRequest` hooks run, and were
+ * only derived again when a hook rewrote `options.url` - so a hook adding a query parameter or
+ * credentials through the options got 12 reads them from had its write dropped, silently, with
+ * nothing but a 401 from the upstream to say so. One row per shape a hook writes; each asserts the
+ * wire.
+ */
+test('a beforeRequest hook writing searchParams or credentials reaches the wire', async () => {
+  const basic = (credentials: string) => 'Basic ' + Buffer.from(credentials).toString('base64');
+  const rows: {
+    name: string;
+    hook: (options: FormedOptions) => void;
+    request?: RequestOptions;
+    url: string;
+    authorization?: string;
+  }[] = [
+    {
+      name: 'assigns searchParams',
+      hook: (options) => {
+        options.searchParams = {sig: 'abc'};
+      },
+      url: '/echo?sig=abc',
+    },
+    {
+      name: 'sets a parameter on the request searchParams in place',
+      hook: (options) => {
+        (options.searchParams as URLSearchParams).set('sig', 'abc');
+      },
+      request: {searchParams: new URLSearchParams('a=1')},
+      url: '/echo?a=1&sig=abc',
+    },
+    {
+      name: 'leaves searchParams alone',
+      hook: () => {},
+      request: {searchParams: {a: '1'}},
+      url: '/echo?a=1',
+    },
+    {
+      name: 'sets username and password',
+      hook: (options) => {
+        options.username = 'u';
+        options.password = 'p';
+      },
+      url: '/echo',
+      authorization: basic('u:p'),
+    },
+    {
+      name: 'replaces credentials the request carried',
+      hook: (options) => {
+        options.username = 'new';
+      },
+      request: {username: 'old', password: 'p'},
+      url: '/echo',
+      authorization: basic('new:p'),
+    },
+    {
+      name: 'sets credentials alongside an explicit authorization header',
+      hook: (options) => {
+        options.username = 'u';
+      },
+      request: {headers: {authorization: 'Bearer token'}},
+      url: '/echo',
+      authorization: 'Bearer token',
+    },
+    {
+      name: 'clears the credentials the request carried',
+      hook: (options) => {
+        options.username = undefined;
+        options.password = undefined;
+      },
+      request: {username: 'old', password: 'p'},
+      url: '/echo',
+    },
+  ];
+
+  for (const row of rows) {
+    const hooked = client.extend({responseType: 'json', hooks: {beforeRequest: [row.hook]}});
+    const response = await hooked.get<Echo>('http://localhost:3000/echo', row.request);
+
+    assert.strictEqual(response.body.url, row.url, row.name);
+    assert.strictEqual(response.body.headers['authorization'], row.authorization, row.name);
+  }
 });
 
 /*
@@ -2305,7 +2641,7 @@ test('http error carries the parsed body, timings and request options', async ()
   assert.deepStrictEqual(err.response?.body, {error: 'token expired'});
   assert.ok(typeof err.response?.timings.phases.total === 'number');
   assert.strictEqual(err.response?.request.options.context.brandId, 3);
-  assert.strictEqual(err.options.url, 'http://localhost:3000/unauthorized');
+  assert.strictEqual(String(err.options.url), 'http://localhost:3000/unauthorized');
 });
 
 test('parse failure error carries the raw body and preserves the cause', async () => {
@@ -2679,7 +3015,7 @@ test('prefixUrl joins without doubling slashes', async () => {
       hooks: {
         beforeRequest: [
           (options) => {
-            seen.push(options.url as string);
+            seen.push(String(options.url));
           },
         ],
       },
@@ -2706,7 +3042,7 @@ test('an absolute url overrides prefixUrl instead of being appended to it', asyn
 
   assert.strictEqual(response.statusCode, 200);
   assert.strictEqual(response.body.test, 'value');
-  assert.strictEqual(response.request.options.url, 'http://localhost:3000/json');
+  assert.strictEqual(String(response.request.options.url), 'http://localhost:3000/json');
 });
 
 test('context is shallow-merged over the instance context', async () => {
@@ -3128,6 +3464,207 @@ test('dedupe collapses concurrent identical GETs', async () => {
   ]);
 
   assert.strictEqual((requestCounts['/counted'] ?? 0) - before, 1);
+});
+
+/*
+ * undici's dedupe sends the first of a group and parks the rest on it, and only that first
+ * caller controls the shared dispatch - so its abort, and the error it aborted with, used to
+ * reach every request parked on it. Measured: one caller's `abort()` failed another with
+ * `AbortError`, and a 20ms deadline failed a request that had asked for 5s. One row per way a
+ * caller aborts, since each arrives through a different route.
+ */
+test('with dedupe, one caller aborting does not fail the requests collapsed onto it', async () => {
+  const aborts: [string, (controller: AbortController) => RequestOptions][] = [
+    ['its own signal', (controller) => ({signal: controller.signal})],
+    ['its own deadline', () => ({timeout: {request: 20}})],
+  ];
+
+  for (const [name, abortingOptions] of aborts) {
+    const before = requestCounts['/counted-slow'] ?? 0;
+    const extClient = new Gotlike({dedupe: true});
+    const controller = new AbortController();
+
+    const first = extClient.get('http://localhost:3000/counted-slow', abortingOptions(controller));
+    const second = extClient.get('http://localhost:3000/counted-slow', {timeout: {request: 5000}});
+
+    setTimeout(() => controller.abort(), 20);
+
+    const [firstOutcome, secondOutcome] = await Promise.allSettled([first, second]);
+
+    assert.strictEqual(firstOutcome.status, 'rejected', `${name}: the aborting request itself still fails`);
+    assert.ok(firstOutcome.reason instanceof RequestError, name);
+    assert.strictEqual(secondOutcome.status, 'fulfilled', `${name}: ${String((secondOutcome as any).reason)}`);
+    assert.strictEqual(secondOutcome.value.body, 'counted-slow', name);
+    assert.strictEqual((requestCounts['/counted-slow'] ?? 0) - before, 1, `${name}: still collapsed`);
+  }
+});
+
+// The other half: with nobody parked on it, an abort still tears the dispatch down rather than
+// leaving it running for no one.
+test('with dedupe, a lone aborted request still aborts its dispatch', async () => {
+  const before = abandonedResponses;
+  const extClient = new Gotlike({dedupe: true});
+
+  await failure(extClient.get('http://localhost:3000/counted-slow', {timeout: {request: 20}}));
+  await sleep(50);
+
+  assert.strictEqual(abandonedResponses - before, 1);
+});
+
+/*
+ * Who dedupe actually parked on the dispatch decides, not a guess at it. Isolation used to count
+ * requests by origin, method and path, which is coarser than dedupe's key - it compares headers
+ * too - so an aborted request that had a *different* `authorization` from a concurrent one was
+ * left running with nobody reading it. And a parked request's abort must leave the one it is
+ * parked on alone.
+ */
+test('with dedupe, an abort tears down exactly the dispatches nobody else is reading', async () => {
+  const rows: [string, RequestOptions, RequestOptions, {abandoned: number; sent: number}][] = [
+    // The first request aborts; the second is sent on its own, so the first's dispatch must go.
+    ['different headers', {headers: {authorization: 'a'}}, {headers: {authorization: 'b'}}, {abandoned: 1, sent: 2}],
+    // The second request is parked on the first and aborts; the first keeps its dispatch.
+    ['the parked request aborts', {}, {}, {abandoned: 0, sent: 1}],
+  ];
+
+  for (const [name, firstOptions, secondOptions, expected] of rows) {
+    const beforeAbandoned = abandonedResponses;
+    const beforeSent = requestCounts['/counted-slow'] ?? 0;
+    const extClient = new Gotlike({dedupe: true});
+    const controller = new AbortController();
+    const firstAborts = expected.sent === 2;
+
+    const first = extClient.get('http://localhost:3000/counted-slow', {
+      ...firstOptions,
+      ...(firstAborts && {signal: controller.signal}),
+    });
+    const second = extClient.get('http://localhost:3000/counted-slow', {
+      ...secondOptions,
+      ...(!firstAborts && {signal: controller.signal}),
+    });
+
+    setTimeout(() => controller.abort(), 20);
+
+    const outcomes = await Promise.allSettled([first, second]);
+    const [aborted, kept] = firstAborts ? outcomes : [outcomes[1], outcomes[0]];
+
+    await sleep(200);
+
+    assert.strictEqual(aborted.status, 'rejected', name);
+    assert.strictEqual(kept.status, 'fulfilled', `${name}: ${String((kept as any).reason)}`);
+    assert.deepStrictEqual(
+      {abandoned: abandonedResponses - beforeAbandoned, sent: (requestCounts['/counted-slow'] ?? 0) - beforeSent},
+      expected,
+      name,
+    );
+  }
+});
+
+/*
+ * dedupe stops parking requests on one whose body has started, and sends them on their own - so
+ * such a request must not count as parked. Counted as one, it kept the first request's dispatch
+ * alive after that caller aborted, draining a body nobody would read.
+ */
+test('with dedupe, a request sent after the body started does not keep an aborted dispatch alive', async () => {
+  const before = abandonedTrickles;
+  const extClient = new Gotlike({dedupe: true});
+  const controller = new AbortController();
+
+  const first = extClient.get('http://localhost:3000/trickle', {signal: controller.signal});
+
+  // `/trickle` writes its first byte at 250ms.
+  await sleep(400);
+
+  const second = extClient.get('http://localhost:3000/trickle', {timeout: {request: 200}});
+
+  controller.abort();
+
+  const outcomes = await Promise.allSettled([first, second]);
+
+  await sleep(100);
+
+  assert.deepStrictEqual(
+    outcomes.map((outcome) => outcome.status),
+    ['rejected', 'rejected'],
+  );
+  assert.strictEqual(abandonedTrickles - before, 2, 'both dispatches torn down');
+});
+
+/*
+ * The same isolation at the dispatcher level, where a caller holds the controller itself: it has
+ * to behave as the shared dispatch's own until the caller lets go, and letting go while paused
+ * must not leave the dispatch paused under the requests still reading it - that would stall them
+ * rather than fail them, which is the harder of the two to notice. A method dedupe does not group
+ * goes straight through.
+ */
+test('with dedupe, the controller a caller holds forwards to the shared dispatch until it lets go', async () => {
+  const extClient = new Gotlike({dedupe: true, decompress: false});
+  const origin = 'http://localhost:3000';
+  const letGo = new Error('first caller lets go');
+  const seen: Record<string, unknown> = {};
+
+  const dispatched = (onResponseStart?: (controller: Dispatcher.DispatchController) => void) =>
+    new Promise<{error?: Error; body: string}>((resolve) => {
+      const chunks: Buffer[] = [];
+      let controller: Dispatcher.DispatchController;
+
+      extClient.agent.dispatch(
+        {origin, path: '/counted-slow', method: 'GET'},
+        {
+          onRequestStart(started) {
+            controller = started;
+          },
+          onResponseStart() {
+            onResponseStart?.(controller);
+          },
+          onResponseData(_, chunk) {
+            chunks.push(chunk);
+          },
+          onResponseEnd() {
+            resolve({body: Buffer.concat(chunks).toString()});
+          },
+          onResponseError(_, error) {
+            resolve({error, body: Buffer.concat(chunks).toString()});
+          },
+        },
+      );
+    });
+
+  const first = dispatched((controller) => {
+    controller.pause();
+    seen.pausedWhilePaused = controller.paused;
+    controller.resume();
+    seen.pausedAfterResume = controller.paused;
+    seen.hasRawHeaders = Array.isArray(controller.rawHeaders);
+    seen.rawTrailers = controller.rawTrailers;
+    seen.abortedBefore = controller.aborted;
+    controller.pause();
+    controller.abort(letGo);
+    controller.abort(new Error('a second abort is a no-op'));
+    seen.abortedAfter = controller.aborted;
+    seen.reason = controller.reason;
+  });
+  const second = dispatched();
+
+  const [firstOutcome, secondOutcome] = await Promise.all([
+    first,
+    Promise.race([second, sleep(2000).then(() => ({error: new Error('stalled'), body: ''}))]),
+  ]);
+
+  assert.deepStrictEqual(seen, {
+    pausedWhilePaused: true,
+    pausedAfterResume: false,
+    hasRawHeaders: true,
+    rawTrailers: null,
+    abortedBefore: false,
+    abortedAfter: true,
+    reason: letGo,
+  });
+  assert.strictEqual(firstOutcome.error, letGo);
+  assert.deepStrictEqual(secondOutcome, {body: 'counted-slow'});
+
+  const posted = await extClient.post('http://localhost:3000/echo', {body: 'x', responseType: 'json'});
+
+  assert.strictEqual((posted.body as {method: string}).method, 'POST');
 });
 
 test('without dedupe every concurrent request reaches the server', async () => {

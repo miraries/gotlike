@@ -70,7 +70,7 @@ list of translations and their reasons is not optional background.
 `index.spec.ts` boots a real `http.createServer` on port 3000 with route-based behaviors; several suites are
 invariant *tables* rather than scenarios, which is deliberate. **Read the `testing` skill before adding or
 changing a test** — it carries the server's routes, the retry-test pitfalls (`backoffLimit`, per-`test-id`
-counters, why `mock.timers` is unusable here) and the coverage gate's four deliberately-uncovered branches.
+counters, why `mock.timers` is unusable here) and the coverage gate's five deliberately-uncovered branches.
 One rule worth repeating here because it makes a test pass while asserting nothing: `assert.rejects` returns
 a promise, so **always `await` it**. `npm run lint` now catches that via `typescript/no-floating-promises`.
 

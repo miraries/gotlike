@@ -38,6 +38,11 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   origin it was registered under and nothing finer. nock answers per scope. So does the shim's limit on
   *different* patterns matching one host — undici consults only the first — both documented in the README rather
   than worked around.
+- **`enableNetConnect()`/`disableNetConnect()` only govern *unmocked* hosts.** An origin with a scope fails closed
+  on a miss whatever they say, as in nock. Both used to switch the per-origin check off for the rest of the
+  process, so after the ordinary teardown `nock.enableNetConnect()` a typo'd path on a mocked host became a live
+  request — in every mocha file that ran afterwards. They now only record `netConnectPolicy`; the dispatch wrapper
+  applies "closed" for a mocked origin and the policy for any other. Covered in `nock-default.spec.ts`.
 - **Base paths.** `nock('https://host/base')` is legal; `mockAgent.get()` only takes an origin. `splitOrigin`
   separates them and every interceptor path gets the prefix folded in.
 - **String paths match the full request path including its query**, which is also nock's behaviour. `.query(true)`
@@ -98,7 +103,9 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   `nock(host).persist().get('/')` and `scope.done()`. `isDone()` filters `pendingInterceptors()` by the scope's
   origin; it used to ask about every origin at once, so an unrelated scope's pending mock made it answer `false`.
 - **Reply callbacks** are translated from undici's `(opts) => {statusCode, data, responseOptions}` to nock's
-  `function (uri, requestBody) => [status, body, headers]` with `this.req.headers`. The request body is
+  `function (uri, requestBody) => [status, body, headers]` with `this.req.headers`. `uri` is the request's
+  **whole** path — base path and query included, as nock 14 passes it; it used to be stripped of the scope's base
+  path, which made a signature check over the path (the aggregator's Spribe suite) compare the wrong string. The request body is
   JSON-parsed when the content-type says so, as nock does — and a `Buffer`/`Uint8Array` body is decoded to text
   first. nock stringifies the body before the callback ever sees it, so `post(url, {body: Buffer.from(json)})`
   handed the callback a raw `Buffer` here where nock gives the parsed object, and a callback reading

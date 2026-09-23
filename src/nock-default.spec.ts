@@ -178,3 +178,61 @@ test('consuming, restoring and persisting mocks never hands an origin back by ac
   assert.strictEqual((await client.get(`${origin}/persisted`)).body, 'live');
   assert.strictEqual(liveHits, 1);
 });
+
+/*
+ * `enableNetConnect()`/`disableNetConnect()` govern *unmocked* hosts, as they do in nock. Calling
+ * either used to switch the per-origin check off for the rest of the process, so after the
+ * ordinary teardown `nock.enableNetConnect()` a miss on a mocked origin went to the real server -
+ * and under mocha, in every file that ran after it.
+ */
+test('enableNetConnect never reopens an origin that has mocks', async (t) => {
+  let liveHits = 0;
+  const server = http.createServer((_request, response) => {
+    liveHits++;
+    response.end('live');
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        nock.cleanAll();
+        nock.enableNetConnect();
+        nock.restore();
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+
+  nock.activate();
+
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const origin = `http://127.0.0.1:${address.port}`;
+
+  for (const [policy, apply] of [
+    ['enableNetConnect()', () => nock.enableNetConnect()],
+    ['enableNetConnect(host)', () => nock.enableNetConnect(`127.0.0.1:${address.port}`)],
+  ] as const) {
+    nock.disableNetConnect();
+    apply();
+
+    nock(origin).get('/expected').reply(200, 'mocked');
+    assert.strictEqual(
+      (await failure(client.get(`${origin}/typo`))).code,
+      'UND_MOCK_ERR_MOCK_NOT_MATCHED',
+      `${policy}: a miss on a mocked origin`,
+    );
+    assert.strictEqual(liveHits, 0, `${policy}: the miss must not reach the server`);
+
+    // The policy still applies to an origin with no mocks.
+    nock.cleanAll();
+    assert.strictEqual((await client.get(`${origin}/live`)).body, 'live', policy);
+    assert.strictEqual(liveHits, 1, policy);
+    liveHits = 0;
+  }
+
+  // And disableNetConnect still closes an unmocked origin.
+  nock.disableNetConnect();
+  assert.strictEqual((await failure(client.get(`${origin}/live`))).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual(liveHits, 0);
+});

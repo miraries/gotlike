@@ -194,11 +194,42 @@ that triggers them. Reordering these breaks every provider auth flow in the aggr
 The URL is resolved and written back *before* hooks run because request signing needs the full URL
 (`igd-aggregator-api`'s N2d provider signs `options.url`).
 
+**It is a `URL`, as got's is (`asUrl`), and handlers get it too.** It used to be the raw string: a hook signing it
+signed `/a b/ü` while undici put `/a%20b/%C3%BC` on the wire (got's `URL` prints the encoded form, so the signature
+matched there and silently didn't here), the aggregator's `(options.url as URL).href` was `undefined`, and a got-style
+`options.url.searchParams.set('sig', …)` threw. And handlers ran before `call()` resolved anything: a handler read
+the bare `'items'` before `next` and the full url after it, because `call()` resolves onto the same object.
+`handle()` now resolves before the handler chain when there is one, and `call()` always parses a *fresh* `URL`, so a hook rewriting it in place can never reach a
+`URL` the caller passed in. Internally everything works on `url`, the local string, and a hook's rewrite is
+detected by **value** (`String(options.url) !== url`) - an in-place mutation keeps the object's identity, so the
+old identity check would have missed it. The edges that hand a url outward (`response.url`, `StreamHead.url`, the
+undici calls) take `String()` of it, so `response.url` stays a string, as got's is. `asUrl` is lenient - a url
+`new URL` rejects stays a string so it fails where it always did (the dispatch, or the stand-in stream). ~300ns a
+request, paid on every client so `options.url` doesn't change type with the hook set.
+
+**`call()` resolving a second time is only idempotent if no handler touched the url, and it used to assume it
+always was.** With `searchParams` set, the second resolve laid them over the query a handler had just built, so
+`options.url.searchParams.set('sig', …)` in a handler — the got way to sign — silently never reached the wire
+(got 16 sends both), while the identical handler worked on a request without `searchParams`. `handle()` now
+records the url it resolved on a symbol (`resolvedForHandlers`, same trick as `retryDepth`); `call()` reads it,
+clears it so a retry's spread cannot inherit it, and applies the `beforeRequest` rule: a url rewritten to an
+absolute one is taken as written, a relative one is resolved again. A handler that only changed `searchParams`
+leaves the url equal and gets the ordinary resolve, so that still wins.
+
 **And read back *after* they run.** The dispatch used a local captured before the hook loop, so a hook that
 rewrote `options.url` - which is what signing a url into the path looks like - was read by nothing and the
 original url went out anyway. A url the hook leaves absolute is taken verbatim: re-resolving it would lay
 `searchParams` back over the top and wipe the query it had just built. A relative one is resolved again, so a
 hook can still rewrite the path under `prefixUrl`.
+
+**A hook writing `options.searchParams`, `options.username` or `options.password` is read back too.** Both the url
+and the Basic-auth header are derived *before* the hooks, and were only derived again when a hook rewrote
+`options.url` — so `options.searchParams = {sig}`, `options.searchParams.set('sig', …)` and `options.username = 'u'`
+all reached nothing, silently, where got 12 reads each of them off its request url. `withQuery` compares the
+serialised `searchParams` against the query the url already carries (an in-place `.set()` is invisible to any
+accessor) and rebuilds it only when they differ; a hook that rewrote `options.url` still wins over it.
+`applyHookCredentials` re-derives the header when the credentials changed, but only over the header derived from
+the old ones — an `authorization` set explicitly, by the caller or the hook, still wins, as node's `auth` does.
 
 Four things `resolveUrl` has to get right, each of which was silently wrong:
 - **An empty `url` resolves to the prefix *with* its trailing slash.** got normalises `prefixUrl` to end in `/`
@@ -319,6 +350,24 @@ they must be composed onto a dispatcher up front. The `agent` getter does this:
 - when nothing needs composing, `agent` returns the base dispatcher untouched;
 - the composition is memoised against the base dispatcher's identity (`#composedFrom`), so the chain is built
   once per dispatcher rather than once per request.
+- **`dedupe` is wrapped by `isolateDedupedAborts`**, one interceptor either side of it. undici's deduplicate
+  interceptor sends the first of a group and parks the rest on it, and only that first caller controls the shared
+  dispatch: its `abort` tore the request down and the reason was handed to every parked request. Every request
+  here with a `timeout.request` or a `signal` aborts through its own controller, so — measured — one caller's
+  `abort()` failed an unrelated caller with `AbortError`, and a 20ms deadline failed a request that had asked
+  for 5s. The outer interceptor hands each caller its own `IsolatedController`: an abort fails that caller alone
+  and leaves the dispatch running (resuming it if that caller had paused it) *while something is parked on it*,
+  and aborts it for real otherwise, exactly as before. A parked request's controller is dedupe's per-waiter one,
+  so its abort never needs isolating. A consumer destroying a response body goes through the same `abort`.
+  **"Something is parked on it" is counted through dedupe itself, not guessed from a key.** The inner
+  interceptor sees the `DeduplicationHandler` dedupe wraps a group's first request in (the outer one names which
+  request that is, via a variable set around its synchronous dispatch), and `lead()` wraps that handler's
+  `addWaitingHandler` to count each request it actually parks. The count used to be by origin, method and path —
+  coarser than dedupe's key, which also compares headers, and blind to dedupe sending a request on its own once
+  the first one's body has started. Two concurrent GETs with different `authorization` counted 2, so aborting
+  one detached instead of aborting, and the real request kept its socket, draining a body nobody read, until
+  undici's 300s default without a `timeout.request`. If undici renames `addWaitingHandler` nothing is counted,
+  which degrades to the original shared-abort bug rather than a leak — the dedupe tests fail on it;
 
 **undici follows a `300`, and got 15 stopped.** `redirectableStatusCodes` in undici's
 `lib/handler/redirect-handler.js` includes 300, so a client with `followRedirect: true` follows a
@@ -436,6 +485,13 @@ to `options` now, which is the right answer for a response that names none.
 **`prefixUrl` comes back when the hook supplies a `url`.** It was cleared unconditionally, on the reasoning that
 `options.url` had already been resolved against it - true, but a `url` the hook supplies has *not* been, so a
 relative path was dispatched as-is and failed as an invalid url. An absolute one ignores the prefix anyway.
+
+**And the first attempt's `searchParams` do not come with it.** `call()` lays `searchParams` over whatever query
+the url carries, so `retry({url: 'https://h/p?token=new'})` after a call made with `searchParams: {a: 1}` put
+`/p?a=1` on the wire — the new token dropped, and the refresh failing with the same 401 it was meant to fix. got's
+`searchParams` is the url's own, so a new url replaces it (measured against got 16: `/p?token=new`, and a new url
+with no query sends none). Only `searchParams` the hook names itself go over the new url; a retry naming no
+`url` still merges its query into the first attempt's as before.
 
 **New credentials on the retry drop the stale `authorization`.** `call()` only derives a Basic-auth header when
 none is present yet, so the first attempt's header survived the merge and was read as "already set" — the hook's
@@ -1088,6 +1144,14 @@ excluded values and each then misbehaved silently:
   both out now, so neither reaches the timer.
 
 Leaving the option off is how you get no timeout.
+
+**Every other key in `timeout` is a `ValidationError`.** got's per-phase keys (`lookup`, `connect`,
+`secureConnect`, `socket`, `send`, `response`, `read`) used to pass validation — only `request` was checked — and
+then did nothing, since `request` is the only one read. The aggregator writes `extend({timeout: {response: n}})`,
+and `extend()` is generic, so TypeScript's excess-property check never sees the literal. Those requests fell back
+to the client's `timeout.request`, or to undici's 300s default. They are in `unimplementedOptions`, so the message
+says "not implemented" and points at `timeout.request` (or `connectTimeout` for the connection phases); anything
+else is "Unknown option", the same as `retry` and `hooks`.
 
 # extend()
 

@@ -531,7 +531,8 @@ test('reply(function) sees a streamed upload larger than a stream buffer', async
   assert.strictEqual(capturedLength, payload.length);
 });
 
-test('reply(function) uri is relative to the base path and keeps the query', async () => {
+// Measured against nock 14.0.17: the whole request path, base path and query included.
+test('reply(function) uri is the full request path, base path and query included', async () => {
   let capturedUri: string | undefined;
 
   nock('http://mock.test/api/v2')
@@ -545,7 +546,7 @@ test('reply(function) uri is relative to the base path and keeps the query', asy
 
   await client.get('http://mock.test/api/v2/thing', {searchParams: {a: '1'}});
 
-  assert.strictEqual(capturedUri, '/thing?a=1');
+  assert.strictEqual(capturedUri, '/api/v2/thing?a=1');
 });
 
 test('reply(status, function) computes just the body', async () => {

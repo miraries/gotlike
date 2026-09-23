@@ -95,7 +95,7 @@ Supports:
 | `hooks`, `handlers`, `retry`, `agent`, `http2`, `pipelining`, `dnsCache`, `dnsLookup`, `decompress` | per request or per client | **create/extend only** - passing them per request is a `ValidationError` |
 | option merging | per-option merge table, every request | **one shallow spread**; `headers`, `context`, `searchParams` and `timeout` merge one level deep, everything else is replaced |
 | `response.rawBody` | always materialised | **computed on first access** - the bytes as received, so a `json` response still hands back the original text. On a `text`/`json` response it is a UTF-8 encoding of the decoded body, which is byte-exact for the UTF-8 that JSON and `charset=utf-8` guarantee; a response in some *other* charset is already mojibake by then, so read it with `responseType: 'buffer'` if the exact bytes matter |
-| `options.url` | normalised to a `URL` | **left a string**, rewritten to the full `prefixUrl`-resolved URL before handlers and hooks see it. Use `String(options.url)`, not `options.url.href` |
+| `options.url` | normalised to a `URL` | **same** - a `URL` resolved against `prefixUrl` and `searchParams` before handlers and hooks see it, so `.href`, `.pathname` and an in-place `options.url.searchParams.set(...)` all work, and `String(options.url)` is exactly what goes on the wire (`/a b/ü` → `/a%20b/%C3%BC`). A hook may also assign a string or a new `URL`. The one difference: a url `new URL` rejects stays a string, and the request then fails with `ERR_INVALID_URL` as usual |
 | `response.url` | the final url | **same** - the last hop's url when redirects were followed, and the requested one otherwise. `options.url` stays the url that was *requested*, so a retry from a hook goes back through the redirect |
 | `options.context` | fresh `{}` per request | a **shared frozen** `{}` when unset - reads are safe, writes throw rather than leak. Pass a `context` to get a writable one |
 | `validate` | n/a | client-only, like the options above - it is read from the instance, so a per-request value would do nothing |
@@ -110,6 +110,7 @@ Supports:
 | `url` as an option - `gotlike({ url, ... })` | **rejected since got 15** - a `TypeError` for a `url` key in any options object, `extend()` included; got 12 and 14 accepted it | **kept** - the callable form is built on it. Passing a url as an argument *and* as an option is rejected on both sides |
 | `responseType: 'buffer'` | a `Uint8Array` since got 15 | a real **`Buffer`**. `Buffer` extends `Uint8Array`, so it satisfies anything typed for one, and callers feeding `sharp()` and friends need the subclass. `response.rawBody` likewise |
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
+| `timeout.lookup`, `.connect`, `.secureConnect`, `.socket`, `.send`, `.response`, `.read` | per-phase bounds | a **`ValidationError`** naming the option. Only `timeout.request` is implemented, and it bounds every phase; accepting the others meant a `timeout: {response: 10000}` that silently bounded nothing. Use `timeout.request`, or the client-level `connectTimeout` for the connection phase |
 | `retry.calculateDelay`, `retry.noise`, `hooks.init` | accepted | a **`ValidationError`** naming the option - "not implemented", not "unknown". Ignoring them would mean a backoff tuning that silently never applies and an `init` hook that silently never fires, which is the failure the unknown-key check exists to stop. Drop them, or cap the backoff with `retry.backoffLimit` and move `init` work into `beforeRequest` |
 | an unknown key in `retry` or `hooks` | accepted and ignored | a **`ValidationError`**. `retry: { limt: 0 }` used to leave the *default* two retries in place, and a misspelled hook name simply never fired |
 | an agent-level option alongside an explicit `agent`, or on a client built with one | n/a - got's `agent` is per-protocol | a **`ValidationError`** either way round. A `ProxyAgent` or `H2CClient` cannot be rebuilt from `connections`, so the option can only be silently ignored (named beside the agent) or silently replace your dispatcher with a plain `undici.Agent` (named on a client that already has one) - and for a proxy agent, that means every request going direct. Pass a new `agent` configured the way you want instead |
@@ -272,6 +273,8 @@ const client = gotlike.extend({
 
 A `beforeRequest` hook may rewrite `options.url`, and the request goes to the url it left. An absolute one is
 used exactly as written, so a signed query survives; a relative one is resolved against `prefixUrl` again.
+A hook may equally write `options.searchParams` (assigned or changed in place) or `options.username`/`password`,
+as in got; an `authorization` header set explicitly still wins over credentials.
 
 To change the body from a hook, **write `options.body`** - `json` and `form` have already been serialised into it
 by the time hooks run, as they have in got, so assigning `options.json` there has no effect. `content-length` is
