@@ -10,7 +10,7 @@ the client resolves the global dispatcher per request, import order no longer ma
 their own agent are routed through it too (`OwnAgentRoute`): they used to bypass the mock outright, so a
 `connections`-tuned client skipped every interceptor and ignored `disableNetConnect()` — a live request from a test
 that looked mocked. A request goes to the mock for a mocked origin or one net connect closes, and through the
-client's own agent otherwise, as nock would; `netConnectAllows` mirrors undici's host matching for that. A caller's
+client's own agent otherwise, as nock would; `netConnectAllows` applies nock's own host matching for that (see the net-connect bullet below). A caller's
 own `MockAgent` is never rerouted. Covered in `nock-default.spec.ts`.
 
 The shim is a translation layer over `MockAgent`, and the translations that are easy to get wrong:
@@ -46,6 +46,15 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   process, so after the ordinary teardown `nock.enableNetConnect()` a typo'd path on a mocked host became a live
   request — in every mocha file that ran afterwards. They now only record `netConnectPolicy`; the dispatch wrapper
   applies "closed" for a mocked origin and the policy for any other. Covered in `nock-default.spec.ts`.
+- **`enableNetConnect(host)` is nock's, not undici's.** It used to be handed to MockAgent's own
+  `enableNetConnect(host)`, which differs from nock 14 (`lib/intercept.js`) three ways: a string is compared
+  exactly where nock builds a `RegExp` from it, the host loses a default port where nock tests
+  `hostname:port` with 80/443 filled in, and each call *adds* to an allow-list where nock's *replaces* the
+  matcher. The last failed open — `enableNetConnect('a')` then `enableNetConnect('b')` kept `a` reachable,
+  a live request nock would have refused — and the first two failed closed (`enableNetConnect('127.0.0.1')`
+  blocked `127.0.0.1:3000`). The dispatch wrapper now makes the whole decision itself from the full origin
+  (`netConnectAllows`) and only flips MockAgent open or closed. Pinned against real nock in
+  `nock-parity.spec.ts`, including the host string a function matcher is handed.
 - **Base paths.** `nock('https://host/base')` is legal; `mockAgent.get()` only takes an origin. `splitOrigin`
   separates them and every interceptor path gets the prefix folded in.
 - **String paths match the full request path including its query**, which is also nock's behaviour. `.query(true)`

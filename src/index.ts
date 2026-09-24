@@ -2816,17 +2816,80 @@ export type GotlikeUploadStream = GotlikeStream & Duplex;
  * itself makes on `method`.
  */
 export type StreamClient = {
+  (options: RequestOptions & {method: BodyMethod}): Promise<GotlikeUploadStream>;
+  (options: RequestOptions): Promise<GotlikeStream>;
   (url: string | URL, options: RequestOptions & {method: BodyMethod}): Promise<GotlikeUploadStream>;
   (url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
-  get(url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
-  head(url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
-  options(url: string | URL, options?: RequestOptions): Promise<GotlikeStream>;
-  post(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
-  put(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
-  patch(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
-  delete(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
-  query(url: string | URL, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  /** Each verb also takes an options object in place of the url, as got's do. */
+  get(url: RequestInput, options?: RequestOptions): Promise<GotlikeStream>;
+  head(url: RequestInput, options?: RequestOptions): Promise<GotlikeStream>;
+  options(url: RequestInput, options?: RequestOptions): Promise<GotlikeStream>;
+  post(url: RequestInput, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  put(url: RequestInput, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  patch(url: RequestInput, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  delete(url: RequestInput, options?: RequestOptions): Promise<GotlikeUploadStream>;
+  query(url: RequestInput, options?: RequestOptions): Promise<GotlikeUploadStream>;
 };
+
+/** A verb's first argument, as got takes it: a url, or an options object standing in for one. */
+type RequestInput = string | URL | RequestOptions;
+
+/**
+ * Route a verb call to `handle()`, with the first argument read the way got reads it.
+ *
+ * got's `got.post(options)` is ordinary - `igd-aggregator-api` fetches its GamesGlobal token that
+ * way - and every verb here took its first argument as the url. The object went into
+ * `options.url`, `String()` made it `[object Object]`, and the request went out as `POST
+ * <prefixUrl>/[object Object]` with its `json`, headers and query dropped: no error, and a 4xx
+ * from the upstream that looked like its fault. Without a `prefixUrl` it did at least fail, as
+ * `Invalid URL`. got 12 and 16 both send `POST <prefixUrl>/` with the body (measured); the callable
+ * form already had this rule, and now shares it.
+ *
+ * A second options object merges over the first, as got 12's `Options` constructor does - headers
+ * (case-insensitively), `context` and `searchParams` one level deep, like every other merge here.
+ * The url comes from the first object only; naming one in the second as well is the "url given
+ * twice" mistake `formOptions` already rejects. got 12 kept the first and got 16 refuses a `url`
+ * key in an options object at all.
+ */
+function handleInput(
+  instance: Gotlike<any>,
+  input: RequestInput | undefined,
+  options: RequestOptions | undefined,
+  method?: Dispatcher.HttpMethod,
+  isStream?: true,
+): Promise<any> {
+  if (input === null || typeof input !== 'object' || input instanceof URL) {
+    return instance.handle(isStream ? {...options, isStream} : (options ?? {}), input, method);
+  }
+
+  let merged = input;
+
+  if (options !== undefined) {
+    if (instance.validate && options.url !== undefined) {
+      return Promise.reject(new ValidationError('`url` cannot be given both as an argument and as an option'));
+    }
+
+    merged = mergeOptions(input, options);
+
+    if (input.headers !== undefined && options.headers !== undefined) {
+      merged.headers = mergeHeaders(lowercaseHeaders(input.headers), options.headers);
+    }
+
+    if (input.context !== undefined && options.context !== undefined) {
+      merged.context = {...input.context, ...options.context};
+    }
+
+    if (input.searchParams !== undefined && options.searchParams !== undefined) {
+      try {
+        merged.searchParams = mergeSearchParams(input.searchParams, options.searchParams);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+    }
+  }
+
+  return instance.handle(isStream ? {...merged, isStream} : merged, undefined, method);
+}
 
 /** The verbs `stream` carries, each dispatching through `handle()` like the client's own. */
 const streamVerbs = ['get', 'head', 'options', 'post', 'put', 'patch', 'delete', 'query'] as const;
@@ -2838,8 +2901,8 @@ const streamVerbs = ['get', 'head', 'options', 'post', 'put', 'patch', 'delete',
  * a prototype method is shared by every client and has nowhere to put them.
  */
 function makeStreamClient(instance: Gotlike<any>): StreamClient {
-  const stream = ((url: string | URL, options: RequestOptions = {}) =>
-    instance.handle({...options, isStream: true}, url)) as unknown as StreamClient;
+  const stream = ((input?: RequestInput, options?: RequestOptions) =>
+    handleInput(instance, input, options, undefined, true)) as unknown as StreamClient;
 
   for (const verb of streamVerbs) {
     const method = verb.toUpperCase();
@@ -2847,8 +2910,8 @@ function makeStreamClient(instance: Gotlike<any>): StreamClient {
     // Through an index signature: `stream[verb]` with `verb` a union of the eight names asks
     // TypeScript to satisfy all eight return types with one function. The declared
     // `StreamClient` above is what keeps the call sites honest.
-    (stream as unknown as Record<string, unknown>)[verb] = (url: string | URL, options: RequestOptions = {}) =>
-      instance.handle({...options, isStream: true}, url, method);
+    (stream as unknown as Record<string, unknown>)[verb] = (input?: RequestInput, options?: RequestOptions) =>
+      handleInput(instance, input, options, method, true);
   }
 
   return stream;
@@ -5507,6 +5570,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     return (this.#stream ??= makeStreamClient(this));
   }
 
+  get(options: RequestOptions & IsStream): Promise<GotlikeStream>;
+  get(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  get(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  get(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  get(options: TextCall & BodyOnly): Promise<string>;
+  get(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  get(options: BufferCall & BodyOnly): Promise<Buffer>;
+  get<T>(options: RequestOptions & BodyOnly): Promise<T>;
+  get<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
   get(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeStream>;
   get(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   get(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
@@ -5516,10 +5588,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   get(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   get<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
   get<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
-  get<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
-    return this.handle<T>(options, url, 'GET');
+  get(url: RequestInput, options?: RequestOptions): Promise<any> {
+    return handleInput(this, url, options, 'GET');
   }
 
+  post(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
+  post(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  post(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  post(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  post(options: TextCall & BodyOnly): Promise<string>;
+  post(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  post(options: BufferCall & BodyOnly): Promise<Buffer>;
+  post<T>(options: RequestOptions & BodyOnly): Promise<T>;
+  post<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
   post(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   post(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   post(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
@@ -5529,10 +5610,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   post(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   post<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
   post<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
-  post<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
-    return this.handle<T>(options, url, 'POST');
+  post(url: RequestInput, options?: RequestOptions): Promise<any> {
+    return handleInput(this, url, options, 'POST');
   }
 
+  delete(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
+  delete(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  delete(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  delete(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  delete(options: TextCall & BodyOnly): Promise<string>;
+  delete(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  delete(options: BufferCall & BodyOnly): Promise<Buffer>;
+  delete<T>(options: RequestOptions & BodyOnly): Promise<T>;
+  delete<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
   delete(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   delete(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   delete(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
@@ -5542,8 +5632,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   delete(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   delete<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
   delete<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
-  delete<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
-    return this.handle<T>(options, url, 'DELETE');
+  delete(url: RequestInput, options?: RequestOptions): Promise<any> {
+    return handleInput(this, url, options, 'DELETE');
   }
 
   /*
@@ -5552,6 +5642,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * `client(url, {method: 'HEAD'})` - so a drop-in caller writing `client.head(url)` got a
    * TypeError. Found by the parity suite, which could not run its HEAD scenario at all.
    */
+  head(options: RequestOptions & IsStream): Promise<GotlikeStream>;
+  head(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  head(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  head(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  head(options: TextCall & BodyOnly): Promise<string>;
+  head(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  head(options: BufferCall & BodyOnly): Promise<Buffer>;
+  head<T>(options: RequestOptions & BodyOnly): Promise<T>;
+  head<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
   head(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeStream>;
   head(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   head(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
@@ -5561,10 +5660,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   head(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   head<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
   head<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
-  head<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
-    return this.handle<T>(options, url, 'HEAD');
+  head(url: RequestInput, options?: RequestOptions): Promise<any> {
+    return handleInput(this, url, options, 'HEAD');
   }
 
+  put(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
+  put(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  put(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  put(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  put(options: TextCall & BodyOnly): Promise<string>;
+  put(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  put(options: BufferCall & BodyOnly): Promise<Buffer>;
+  put<T>(options: RequestOptions & BodyOnly): Promise<T>;
+  put<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
   put(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   put(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   put(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
@@ -5574,10 +5682,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   put(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   put<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
   put<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
-  put<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
-    return this.handle<T>(options, url, 'PUT');
+  put(url: RequestInput, options?: RequestOptions): Promise<any> {
+    return handleInput(this, url, options, 'PUT');
   }
 
+  patch(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
+  patch(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  patch(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  patch(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  patch(options: TextCall & BodyOnly): Promise<string>;
+  patch(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  patch(options: BufferCall & BodyOnly): Promise<Buffer>;
+  patch<T>(options: RequestOptions & BodyOnly): Promise<T>;
+  patch<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
   patch(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   patch(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   patch(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
@@ -5587,10 +5704,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   patch(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   patch<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
   patch<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
-  patch<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
-    return this.handle<T>(options, url, 'PATCH');
+  patch(url: RequestInput, options?: RequestOptions): Promise<any> {
+    return handleInput(this, url, options, 'PATCH');
   }
 
+  query(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
+  query(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
+  query(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
+  query(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
+  query(options: TextCall & BodyOnly): Promise<string>;
+  query(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
+  query(options: BufferCall & BodyOnly): Promise<Buffer>;
+  query<T>(options: RequestOptions & BodyOnly): Promise<T>;
+  query<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
   query(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
   query(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
   query(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
@@ -5600,8 +5726,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   query(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
   query<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
   query<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
-  query<T>(url: string | URL, options: RequestOptions = {}): Promise<any> {
-    return this.handle<T>(options, url, 'QUERY');
+  query(url: RequestInput, options?: RequestOptions): Promise<any> {
+    return handleInput(this, url, options, 'QUERY');
   }
 }
 
@@ -5647,21 +5773,10 @@ export type CallableClient<O extends ClientOptions = ClientOptions> = Omit<Gotli
  * All of this happens once per client; the per-request path is untouched.
  */
 function asCallable<O extends ClientOptions>(instance: Gotlike<O>): CallableClient<O> {
-  const callable = function callableClient<T>(
-    urlOrOptions: string | URL | RequestOptions,
-    options: RequestOptions = {},
-  ) {
-    // `client({url: ...})` as well as `client(url, options)` - got's export takes both. A
-    // `URL` is an object too, so it has to be excluded explicitly, and `null` reaches the
-    // url path where it fails as a bad url rather than as a confusing property read.
-    if (urlOrOptions !== null && typeof urlOrOptions === 'object' && !(urlOrOptions instanceof URL)) {
-      // The url stays in the options rather than being passed alongside them: `formOptions`
-      // spreads it in either way, so handing it over a second time was redundant - and now
-      // that giving both is rejected, it would reject this perfectly legal form.
-      return instance.handle<T>(urlOrOptions);
-    }
-
-    return instance.handle<T>(options, urlOrOptions);
+  // `client({url: ...})` as well as `client(url, options)` - got's export takes both, and so do
+  // the verbs. See `handleInput`, which is the one place that tells the two apart.
+  const callable = function callableClient(urlOrOptions: RequestInput, options?: RequestOptions) {
+    return handleInput(instance, urlOrOptions, options);
   } as unknown as CallableClient<O>;
 
   for (const key of Object.getOwnPropertyNames(Gotlike.prototype)) {

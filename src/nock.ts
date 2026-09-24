@@ -104,83 +104,76 @@ function hasMockedOrigin(requestOrigin: string): boolean {
 type NetConnectMatcher = string | RegExp | ((host: string) => boolean);
 
 /**
- * What `nock.enableNetConnect()`/`disableNetConnect()` asked for: every host, none, or the listed
- * ones. In nock this governs *unmocked* hosts only - an origin with a scope fails closed on a miss
- * whatever it says.
+ * What `nock.enableNetConnect()`/`disableNetConnect()` asked for: every host, none, or the ones one
+ * matcher accepts. In nock this governs *unmocked* hosts only - an origin with a scope fails closed
+ * on a miss whatever it says.
  *
  * It used to be applied to mocked origins as well: calling either function switched the
  * per-origin check below off for the rest of the process, so after the ordinary teardown
  * `nock.enableNetConnect()` a typo'd path on a mocked host became a live request to the real
  * one - silently, and in every test file mocha ran after it.
+ *
+ * **One matcher, and nock's.** This used to hand each call to undici's own `enableNetConnect(host)`,
+ * which differs from nock's in all three ways that matter (nock 14, `lib/intercept.js`): nock turns
+ * a string into a `RegExp` where undici compares it exactly, nock tests it against `host:port` with
+ * the default port filled in where undici drops a default port, and each nock call *replaces* the
+ * matcher where undici's add to a list. The last is the one that failed open - `enableNetConnect('a')`
+ * then `enableNetConnect('b')` still let `a` through, a live request nock would have refused - and
+ * the first two failed closed, so `enableNetConnect('127.0.0.1')` blocked `127.0.0.1:3000`, which nock
+ * allows. `netConnectAllows` now answers for every request itself.
  */
-let netConnectPolicy: boolean | NetConnectMatcher[] = true;
+let netConnectPolicy: boolean | {test: (host: string) => boolean} = true;
 
 /** Which setting MockAgent currently holds, so a dispatch only switches it when it has to. */
-let appliedNetConnect: 'closed' | 'policy' | undefined;
-
-function applyNetConnectPolicy(): void {
-  if (netConnectPolicy === true) {
-    mockAgent.enableNetConnect();
-
-    return;
-  }
-
-  mockAgent.disableNetConnect();
-
-  if (netConnectPolicy !== false) {
-    for (const matcher of netConnectPolicy) {
-      mockAgent.enableNetConnect(matcher as string);
-    }
-  }
-}
+let appliedNetConnect: boolean | undefined;
 
 /*
- * MockAgent's public network matcher receives only `host`, which loses the scheme and cannot
- * distinguish `http://example.test` from `https://example.test`. Choose its fallback policy
- * synchronously at dispatch time instead, while the complete origin is still available: closed
- * for an origin with registered mocks, the caller's `netConnectPolicy` for any other. The mock
- * match (or miss) is decided before `dispatch()` returns, so another request cannot observe the
- * temporary setting between these two calls.
+ * MockAgent's public network matcher receives only `host`, which loses the scheme - so it cannot
+ * tell `http://example.test` from `https://example.test`, nor fill in the default port nock matches
+ * on. The whole decision is made here instead, synchronously at dispatch time while the complete
+ * origin is still available, and MockAgent is simply switched open or closed to match: closed for an
+ * origin with registered mocks, `netConnectAllows` for any other. The mock match (or miss) is decided
+ * before `dispatch()` returns, so another request cannot observe the temporary setting between these
+ * two calls.
  */
 const mockDispatch = mockAgent.dispatch.bind(mockAgent);
 
 mockAgent.dispatch = (options, handler) => {
-  const wanted = hasMockedOrigin(String(options.origin)) ? 'closed' : 'policy';
+  const origin = String(options.origin);
+  const open = !hasMockedOrigin(origin) && netConnectAllows(origin);
 
-  if (appliedNetConnect !== wanted) {
-    if (wanted === 'closed') {
-      mockAgent.disableNetConnect();
+  if (appliedNetConnect !== open) {
+    if (open) {
+      mockAgent.enableNetConnect();
     } else {
-      applyNetConnectPolicy();
+      mockAgent.disableNetConnect();
     }
 
-    appliedNetConnect = wanted;
+    appliedNetConnect = open;
   }
 
   return mockDispatch(options, handler);
 };
 
-/** undici's own net-connect test, which `netConnectPolicy` matchers are written against. */
+/**
+ * nock's net-connect test: the matcher is asked about `hostname:port`, lower-cased, with the port
+ * filled in (80 for http, 443 otherwise) - `normalizeRequestOptions` in nock's `lib/common.js`. An
+ * IPv6 literal is matched without its brackets, since that is how got hands nock the hostname.
+ */
 function netConnectAllows(origin: string): boolean {
   if (netConnectPolicy === true || netConnectPolicy === false) {
     return netConnectPolicy;
   }
 
-  const host = new URL(origin).host;
+  const url = new URL(origin);
+  const hostname = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname;
+  const port = url.port === '' ? (url.protocol === 'http:' ? '80' : '443') : url.port;
 
-  return netConnectPolicy.some((matcher) => {
-    if (typeof matcher === 'string') {
-      return matcher === host;
-    }
+  if (netConnectPolicy instanceof RegExp) {
+    netConnectPolicy.lastIndex = 0;
+  }
 
-    if (typeof matcher === 'function') {
-      return matcher(host);
-    }
-
-    matcher.lastIndex = 0;
-
-    return matcher.test(host);
-  });
+  return netConnectPolicy.test(`${hostname}:${port}`.toLowerCase());
 }
 
 /**
@@ -1202,14 +1195,18 @@ Object.assign(nock, {
   // Both only record the policy; the next dispatch applies it. See `netConnectPolicy`.
   disableNetConnect() {
     netConnectPolicy = false;
-    appliedNetConnect = undefined;
   },
   enableNetConnect(host?: NetConnectMatcher) {
-    // A host adds to the allow-list, as undici's own `enableNetConnect(host)` does; no host
-    // allows everything.
+    // Replaces whatever was allowed before, as nock's does - a string is a pattern, not a literal
+    // host, and no argument allows everything.
     netConnectPolicy =
-      host === undefined ? true : Array.isArray(netConnectPolicy) ? [...netConnectPolicy, host] : [host];
-    appliedNetConnect = undefined;
+      typeof host === 'string'
+        ? new RegExp(host)
+        : host instanceof RegExp
+          ? host
+          : typeof host === 'function'
+            ? {test: host}
+            : true;
   },
   pendingMocks() {
     return mockAgent.pendingInterceptors();

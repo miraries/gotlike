@@ -307,7 +307,8 @@ test('a client with its own agent is mocked like any other', async (t) => {
 
   assert.strictEqual(ownDispatches, 1, 'only the allowed live request goes through the caller agent');
 
-  // A host-scoped policy is matched the way undici matches it: on `host:port`, by each shape.
+  // A host-scoped policy is matched the way nock matches it: on `host:port`, by each shape. The nock
+  // parity suite compares the rest of nock's rules against real nock.
   const tuned = createClient({agent: own});
   const host = `127.0.0.1:${address.port}`;
 

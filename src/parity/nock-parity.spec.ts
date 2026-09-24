@@ -1,3 +1,11 @@
+import test from 'node:test';
+import assert from 'node:assert';
+import http from 'node:http';
+import realNock from 'nock';
+import realGot from 'got';
+import gotlike from '../index.ts';
+import shimNock from '../nock.ts';
+import type {ParityClient} from './harness.ts';
 import {captureMatch, nockParityTest, reportNockDivergences, setupNockParity} from './nock-harness.ts';
 
 setupNockParity();
@@ -334,4 +342,100 @@ nockParityTest('isDone reports whether the scope’s interceptors were consumed'
 
     return {before, hit};
   },
+});
+
+/* ---------------------------------------------------------------------------- net connect */
+
+/*
+ * Outside `nockParityTest`, because what is compared is whether a request reached a *real* server,
+ * and that harness runs every scenario against a fake origin with net connect off.
+ *
+ * The shim used to hand each `enableNetConnect(host)` to undici's MockAgent, which differs from
+ * nock in three ways: an exact string where nock builds a `RegExp`, the host without its default
+ * port where nock fills one in, and an allow-list that each call *added* to where nock's call
+ * replaces the matcher. The last failed open - a host a test had moved on from stayed reachable.
+ */
+test('enableNetConnect allows exactly the hosts nock allows', async (t) => {
+  let hits = 0;
+  const server = http.createServer((_request, response) => {
+    hits++;
+    response.end('live');
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    realNock.disableNetConnect();
+    shimNock.disableNetConnect();
+
+    return new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const live = `http://127.0.0.1:${address.port}/live`;
+
+  /* oxlint-disable typescript/no-unnecessary-type-assertion */
+  const sides: [string, typeof shimNock, ParityClient][] = [
+    ['nock', realNock as unknown as typeof shimNock, realGot as unknown as ParityClient],
+    ['shim', shimNock, gotlike as unknown as ParityClient],
+  ];
+  /* oxlint-enable typescript/no-unnecessary-type-assertion */
+
+  const cases: [string, (nock: typeof shimNock) => void][] = [
+    ['a host without its port', (nock) => nock.enableNetConnect('127.0.0.1')],
+    ['host:port', (nock) => nock.enableNetConnect(`127.0.0.1:${address.port}`)],
+    ['a string is a pattern', (nock) => nock.enableNetConnect('127.0.0.')],
+    ['a regex over host:port', (nock) => nock.enableNetConnect(/^127\.0\.0\.1:\d+$/)],
+    ['another host', (nock) => nock.enableNetConnect('localhost')],
+    [
+      'a later call replaces the earlier one',
+      (nock) => {
+        nock.enableNetConnect('127.0.0.1');
+        nock.enableNetConnect('elsewhere.test');
+      },
+    ],
+    [
+      'disable after enable',
+      (nock) => {
+        nock.enableNetConnect('127.0.0.1');
+        nock.disableNetConnect();
+      },
+    ],
+  ];
+
+  for (const [name, apply] of cases) {
+    const observed: Record<string, unknown> = {};
+
+    for (const [label, nock, client] of sides) {
+      nock.disableNetConnect();
+      apply(nock);
+      hits = 0;
+      observed[label] = {...((await captureMatch(() => client.get(live))) as object), hits};
+    }
+
+    assert.deepStrictEqual(observed['shim'], observed['nock'], name);
+  }
+
+  // What a function matcher is asked about: `hostname:port`, with the default port filled in.
+  for (const origin of [
+    'http://netconnect.test/p',
+    'https://netconnect.test/p',
+    `http://127.0.0.1:${address.port}/p`,
+  ]) {
+    const seen: Record<string, string[]> = {};
+
+    for (const [label, nock, client] of sides) {
+      const hosts: string[] = [];
+
+      nock.enableNetConnect((host: string) => {
+        hosts.push(host);
+
+        return false;
+      });
+      await captureMatch(() => client.get(origin));
+      seen[label] = [...new Set(hosts)];
+    }
+
+    assert.deepStrictEqual(seen['shim'], seen['nock'], origin);
+  }
 });

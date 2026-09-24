@@ -88,6 +88,7 @@ Supports:
 - [x] Pipelining
 - [x] Options validation
 - [x] Callable client - `gotlike(url, options)` and `gotlike({ url, ... })`
+- [x] An options object in place of the url on every verb - `client.post({ json })`, `client.stream.post({ body })`, as got takes it
 
 ## Differences from got
 

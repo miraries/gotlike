@@ -1,4 +1,5 @@
 import {text} from 'node:stream/consumers';
+import type {Readable} from 'node:stream';
 import {
   capture,
   parityTest,
@@ -833,6 +834,44 @@ parityTest('a url given only as an option', {
       message: 'The `url` option is not supported in options objects. Pass it as the first argument instead.',
     },
     gotlike: {outcome: 'resolved', statusCode: 204},
+  },
+});
+
+/**
+ * A verb given an options object where the url goes - `got.post({json})`, which is how the
+ * aggregator's GamesGlobal client fetches its token. gotlike took the object *as* the url and sent
+ * `POST <prefixUrl>/[object Object]` with no body. No `url` in the object, since got 16 refuses one
+ * there (the scenario above); what is compared is the prefix root, the body and a second options
+ * object merged over the first.
+ */
+parityTest('a verb given an options object in place of the url', {
+  claim: 'README: every verb takes an options object in place of the url, as got’s do.',
+  run: async (client, base) => {
+    const scoped = client.extend({prefixUrl: `${base}/echo/token`, responseType: 'json'});
+    type Verb = (input: Record<string, unknown>, options?: Record<string, unknown>) => Promise<AnyResponse>;
+
+    const posted = await (scoped.post as unknown as Verb)({json: {apiKey: 'k'}});
+    const merged = await (scoped.put as unknown as Verb)(
+      {json: {a: 1}, headers: {'x-a': '1'}},
+      {headers: {'x-b': '2'}},
+    );
+    const fetched = await (scoped.get as unknown as Verb)({searchParams: {q: 'x'}});
+    const streamed = await text(
+      (await (scoped.stream.post as unknown as Verb)({body: 'streamed'})) as unknown as Readable,
+    );
+
+    const echo = (body: unknown) => {
+      const {
+        method,
+        path,
+        headers,
+        body: sent,
+      } = body as {method: string; path: string; headers: Record<string, string>; body: string};
+
+      return {method, path, body: sent, a: headers['x-a'], b: headers['x-b']};
+    };
+
+    return [echo(posted.body), echo(merged.body), echo(fetched.body), echo(JSON.parse(streamed))];
   },
 });
 

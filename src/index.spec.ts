@@ -4236,6 +4236,108 @@ test('a callable client keeps every method and stays callable through extend', a
   assert.strictEqual(viaMethod.body.headers['x-twice'], '1');
 });
 
+/*
+ * got takes an options object in place of the url on every verb - `got.post({json})` - and the
+ * aggregator's GamesGlobal token call is written exactly that way. Every verb here took its first
+ * argument as the url, so the object became `[object Object]` and the request went out as
+ * `POST <prefixUrl>/[object Object]` with its body dropped, silently. A table over every verb and
+ * both stream forms, because the bug was one entry point per verb and a scenario naming one verb
+ * would pass while the others stayed broken.
+ */
+test('every verb takes an options object in place of the url, as got does', async () => {
+  const prefixed = createClient({prefixUrl: 'http://localhost:3000/echo/token', responseType: 'json'});
+  const bodyless = ['get', 'head', 'options'];
+  const read = async (stream: Readable) => JSON.parse(Buffer.concat(await stream.toArray()).toString()) as Echo;
+
+  for (const verb of ['get', 'head', 'post', 'put', 'patch', 'delete', 'query'] as const) {
+    const withBody = !bodyless.includes(verb);
+    const options = {headers: {'x-verb': verb}, ...(withBody ? {json: {verb}} : {})};
+    const response = await prefixed[verb]<Echo>(options);
+
+    assert.strictEqual(response.statusCode, 200, verb);
+
+    if (verb === 'head') {
+      continue;
+    }
+
+    assert.strictEqual(response.body.url, '/echo/token/', verb);
+    assert.strictEqual(response.body.method, verb.toUpperCase(), verb);
+    assert.strictEqual(response.body.headers['x-verb'], verb, verb);
+    assert.strictEqual(response.body.body, withBody ? JSON.stringify({verb}) : '', verb);
+  }
+
+  // The stream verbs, the upload path with a body from the options and the bodyless one.
+  const uploaded = await read(await prefixed.stream.post({body: 'streamed'}));
+  const downloaded = await read(await prefixed.stream.get({headers: {'x-verb': 'stream'}}));
+  const direct = await read(await prefixed.stream({headers: {'x-verb': 'direct'}}));
+
+  assert.deepStrictEqual([uploaded.url, uploaded.method, uploaded.body], ['/echo/token/', 'POST', 'streamed']);
+  assert.deepStrictEqual([downloaded.url, downloaded.headers['x-verb']], ['/echo/token/', 'stream']);
+  assert.deepStrictEqual([direct.url, direct.headers['x-verb']], ['/echo/token/', 'direct']);
+
+  // A url carried in the object is the request's, on the verbs as on the callable form.
+  const absolute = await client.get<Echo>({url: 'http://localhost:3000/echo/absolute', responseType: 'json'});
+
+  assert.strictEqual(absolute.body.url, '/echo/absolute');
+
+  // A second options object merges over the first, headers case-insensitively, as got 12 does.
+  // Untyped there as here - both declare the options-first form with one argument - so it is
+  // reached through a loose signature.
+  type TwoObjects = (input: RequestOptions, options: RequestOptions) => Promise<GotlikeResponse<Echo>>;
+  const merged = await (prefixed.post as TwoObjects)(
+    {json: {a: 1}, headers: {'X-First': '1', 'x-both': 'first'}, searchParams: {a: '1'}},
+    {headers: {'x-second': '2', 'X-Both': 'second'}, searchParams: {b: '2'}},
+  );
+
+  assert.strictEqual(merged.body.url, '/echo/token/?a=1&b=2');
+  assert.strictEqual(merged.body.body, '{"a":1}');
+  assert.deepStrictEqual(
+    [merged.body.headers['x-first'], merged.body.headers['x-second'], merged.body.headers['x-both']],
+    ['1', '2', 'second'],
+  );
+
+  const viaCallable = await (client as unknown as TwoObjects)(
+    {url: 'http://localhost:3000/echo/c', responseType: 'json'},
+    {method: 'PUT'},
+  );
+
+  assert.strictEqual(viaCallable.body.method, 'PUT');
+
+  // `context` merges one level deep too, as it does on every other route.
+  let seen: unknown;
+  const hooked = createClient({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) => {
+          seen = options.context;
+        },
+      ],
+    },
+  });
+
+  await (hooked.get as TwoObjects)({url: 'http://localhost:3000/echo', context: {a: 1}}, {context: {b: 2}});
+  assert.deepStrictEqual(seen, {a: 1, b: 2});
+
+  // A bad query value in the merge rejects, as it would on a single object.
+  await assert.rejects(
+    (client.get as TwoObjects)(
+      {url: 'http://localhost:3000/echo', searchParams: {a: '1'}},
+      {searchParams: {b: {} as unknown as string}},
+    ),
+    {name: 'ValidationError'},
+  );
+
+  // Naming the url in both is the same mistake as naming it as an argument and an option.
+  await assert.rejects(
+    (client.get as TwoObjects)({url: 'http://localhost:3000/echo/a'}, {url: 'http://localhost:3000/echo/b'}),
+    {name: 'ValidationError'},
+  );
+
+  // Validation still reads the object itself, not the empty options it used to be paired with.
+  await assert.rejects(prefixed.post({responseType: 'jsn' as 'json'}), {name: 'ValidationError'});
+});
+
 /**
  * The `agent` getter reads private `#composed` fields, so methods have to stay bound to the
  * real instance rather than to the wrapping function.
@@ -8640,6 +8742,18 @@ async function typeAssertions() {
   expectType<GotlikeUploadStream>()(await client.query('u', {isStream: true}));
   expectType<GotlikeStream | GotlikeUploadStream>()(await client('u', {isStream: true}));
   expectType<GotlikeStream | GotlikeUploadStream>()(await client({url: 'u', isStream: true}));
+
+  // An options object in place of the url types the same way the url form does.
+  expectType<Thing>()((await client.post<Thing>({json: {a: 1}})).body);
+  expectType<string>()((await client.get({url: 'u'})).body);
+  expectType<Buffer>()((await client.get({url: 'u', responseType: 'buffer'})).body);
+  expectType<string>()(await client.put({resolveBodyOnly: true}));
+  expectType<unknown>()((await jsonClient.patch({})).body);
+  expectType<GotlikeStream>()(await client.get({isStream: true}));
+  expectType<GotlikeUploadStream>()(await client.post({isStream: true}));
+  expectType<GotlikeUploadStream>()(await client.stream.post({body: 'x'}));
+  expectType<GotlikeUploadStream>()(await client.stream({method: 'POST'}));
+  expectType<GotlikeStream>()(await client.stream({url: 'u'}));
 }
 
 void typeAssertions;
