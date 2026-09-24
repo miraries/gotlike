@@ -7,8 +7,11 @@ description: The nock-compatible mocking shim in src/nock.ts — every translati
 
 `nock.ts` calls `setGlobalDispatcher(new MockAgent())` at import time (skipped when `NOCK_OFF=true`). Because
 the client resolves the global dispatcher per request, import order no longer matters. Instances built with
-their own agent still bypass the mock — `retry` no longer does, since it is an interceptor rather than a
-separate `RetryAgent`.
+their own agent are routed through it too (`OwnAgentRoute`): they used to bypass the mock outright, so a
+`connections`-tuned client skipped every interceptor and ignored `disableNetConnect()` — a live request from a test
+that looked mocked. A request goes to the mock for a mocked origin or one net connect closes, and through the
+client's own agent otherwise, as nock would; `netConnectAllows` mirrors undici's host matching for that. A caller's
+own `MockAgent` is never rerouted. Covered in `nock-default.spec.ts`.
 
 The shim is a translation layer over `MockAgent`, and the translations that are easy to get wrong:
 

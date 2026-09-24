@@ -195,7 +195,7 @@ parityTest('an unparseable body on an error status resolves when throwHttpErrors
 /* ------------------------------------------------------------------------ afterResponse */
 
 parityTest('a retry re-runs only the afterResponse hooks before the one that retried', {
-  claim: 'CLAUDE.md: measured against got-cjs - `[h1, h2]` with `h2` retrying gives `h1, h2, h1`.',
+  claim: 'CLAUDE.md: measured against got-cjs - `[h1, h2, h3]` with `h2` retrying gives `h1, h2, h1`; `h3` never runs.',
   run: async (client, base) => {
     const order: string[] = [];
     let retried = false;
@@ -216,6 +216,11 @@ parityTest('a retry re-runs only the afterResponse hooks before the one that ret
 
               return retry({headers: {authorization: 'Bearer refreshed'}});
             }
+
+            return response;
+          },
+          (response: {statusCode: number}) => {
+            order.push(`h3:${response.statusCode}`);
 
             return response;
           },

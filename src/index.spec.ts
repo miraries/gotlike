@@ -1553,6 +1553,9 @@ test('retryWithMergedOptions increments retryCount and fires beforeRetry', async
  * when one retry happens inside another - so two hooks retrying in sequence reported one
  * retry between them, and a nested pair reported three for two. Both shapes are pinned here
  * against the dispatches a `beforeRequest` hook counts, which is the only unarguable number.
+ *
+ * The sequential shape is now one retry, not two: as in got, a hook that retries ends the loop,
+ * and the retried request runs only the hooks before it - so the second hook never runs at all.
  */
 test('retryCount counts every afterResponse retry, nested or in sequence', async () => {
   const counted = {dispatches: 0};
@@ -1581,7 +1584,7 @@ test('retryCount counts every afterResponse retry, nested or in sequence', async
   assert.strictEqual(counted.dispatches, 3, 'expected the original request plus two retries');
   assert.strictEqual(nestedResponse.retryCount, 2);
 
-  /** The same two retries, but each hook retrying on its own rather than one inside the other. */
+  /** Each hook retrying on its own: the first one's retry means the second never gets a turn. */
   counted.dispatches = 0;
 
   let firstRetried = false;
@@ -1617,8 +1620,9 @@ test('retryCount counts every afterResponse retry, nested or in sequence', async
 
   const sequentialResponse = await sequential.get('http://localhost:3000/json');
 
-  assert.strictEqual(counted.dispatches, 3, 'expected the original request plus two retries');
-  assert.strictEqual(sequentialResponse.retryCount, 2);
+  assert.strictEqual(counted.dispatches, 2, 'expected the original request plus one retry');
+  assert.strictEqual(sequentialResponse.retryCount, 1);
+  assert.strictEqual(secondRetried, false, 'the hook after the retrying one must not run');
 });
 
 /**
@@ -4264,7 +4268,15 @@ test('a callable client forwards fields that were left unset at construction', a
 
   callable.ownAgent = agent;
 
-  assert.strictEqual(callable.agent, agent, 'the agent getter should see the assignment');
+  // This file imports `./nock`, which routes an own agent through the mock while it is active -
+  // with it restored, the getter hands back the agent itself.
+  nock.restore();
+
+  try {
+    assert.strictEqual(callable.agent, agent, 'the agent getter should see the assignment');
+  } finally {
+    nock.activate();
+  }
 
   await agent.close();
 });
@@ -5638,9 +5650,10 @@ test('an afterResponse hook that always retries cannot recurse', async () => {
 });
 
 /*
- * The ordering got actually produces, measured: with `[h1, h2]` and `h2` retrying, got runs
+ * The ordering got actually produces, measured: with `[h1, h2, h3]` and `h2` retrying, got runs
  * `h1, h2` on the first response and `h1` alone on the retried one. `h2` never sees its own
- * retry, and `h1` runs again because it ran before the retry was decided.
+ * retry, `h1` runs again because it ran before the retry was decided, and `h3` never runs at
+ * all - the retry abandons the loop it was in.
  */
 test('a retry re-runs only the afterResponse hooks before the one that retried', async () => {
   const order: string[] = [];
@@ -5662,6 +5675,11 @@ test('a retry re-runs only the afterResponse hooks before the one that retried',
 
             return retryWithMergedOptions({headers: {authorization: 'Bearer refreshed'}});
           }
+
+          return response;
+        },
+        (response) => {
+          order.push(`h3:${response.statusCode}`);
 
           return response;
         },

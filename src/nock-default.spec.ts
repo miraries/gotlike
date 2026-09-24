@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert';
 import http from 'node:http';
 import nock from './nock.ts';
-import client, {type RequestError} from './index.ts';
+import {Agent, MockAgent} from 'undici';
+import client, {createClient, type RequestError} from './index.ts';
 
 async function failure(promise: Promise<unknown>): Promise<RequestError> {
   try {
@@ -235,4 +236,110 @@ test('enableNetConnect never reopens an origin that has mocks', async (t) => {
   nock.disableNetConnect();
   assert.strictEqual((await failure(client.get(`${origin}/live`))).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
   assert.strictEqual(liveHits, 0);
+});
+
+/*
+ * A client with its own dispatcher - built from `connections` and friends, or handed an `agent` -
+ * used to dispatch straight through it, so the mock never saw its requests: a matching interceptor
+ * was skipped, `disableNetConnect()` did nothing, and the request went live. Real nock sits under
+ * every agent. An allowed live request still has to leave through the client's own agent, since
+ * that is what it was configured with.
+ */
+test('a client with its own agent is mocked like any other', async (t) => {
+  let liveHits = 0;
+  const server = http.createServer((_request, response) => {
+    liveHits++;
+    response.end('live');
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        nock.cleanAll();
+        nock.enableNetConnect();
+        nock.restore();
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+
+  nock.activate();
+
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const origin = `http://127.0.0.1:${address.port}`;
+
+  const own = new Agent();
+  const ownDispatch = own.dispatch.bind(own);
+  let ownDispatches = 0;
+  own.dispatch = (options, handler) => {
+    ownDispatches++;
+
+    return ownDispatch(options, handler);
+  };
+
+  for (const [shape, tuned] of [
+    ['connections', createClient({connections: 2})],
+    ['agent', createClient({agent: own})],
+  ] as const) {
+    nock(origin).get('/expected').reply(200, 'mocked');
+    assert.strictEqual((await tuned.get(`${origin}/expected`)).body, 'mocked', `${shape}: a matching mock`);
+    assert.strictEqual(
+      (await failure(tuned.get(`${origin}/typo`))).code,
+      'UND_MOCK_ERR_MOCK_NOT_MATCHED',
+      `${shape}: a miss on a mocked origin`,
+    );
+
+    nock.cleanAll();
+    nock.disableNetConnect();
+    assert.strictEqual(
+      (await failure(tuned.get(`${origin}/live`))).code,
+      'UND_MOCK_ERR_MOCK_NOT_MATCHED',
+      `${shape}: an unmocked origin under disableNetConnect`,
+    );
+    assert.strictEqual(liveHits, 0, `${shape}: nothing may reach the server`);
+
+    nock.enableNetConnect();
+    assert.strictEqual((await tuned.get(`${origin}/live`)).body, 'live', `${shape}: an allowed live request`);
+    assert.strictEqual(liveHits, 1, shape);
+    liveHits = 0;
+  }
+
+  assert.strictEqual(ownDispatches, 1, 'only the allowed live request goes through the caller agent');
+
+  // A host-scoped policy is matched the way undici matches it: on `host:port`, by each shape.
+  const tuned = createClient({agent: own});
+  const host = `127.0.0.1:${address.port}`;
+
+  for (const matcher of [host, /^127\.0\.0\.1:/, (candidate: string) => candidate === host]) {
+    nock.disableNetConnect();
+    nock.enableNetConnect(matcher);
+    assert.strictEqual((await tuned.get(`${origin}/live`)).body, 'live', String(matcher));
+  }
+
+  nock.disableNetConnect();
+  nock.enableNetConnect('elsewhere.test');
+  assert.strictEqual((await failure(tuned.get(`${origin}/live`))).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual(liveHits, 3);
+  assert.strictEqual(ownDispatches, 4);
+  nock.enableNetConnect();
+
+  // A caller's own MockAgent is already a mock and is never rerouted; closing the route closes
+  // the agent behind it.
+  const theirs = new MockAgent();
+  assert.strictEqual(createClient({agent: theirs, decompress: false}).agent, theirs);
+  await theirs.close();
+
+  const closing = new Agent();
+  await createClient({agent: closing, decompress: false}).agent.close();
+  assert.strictEqual(closing.closed, true);
+
+  const destroying = new Agent();
+  await createClient({agent: destroying, decompress: false}).agent.destroy();
+  assert.strictEqual(destroying.destroyed, true);
+
+  // With the mock restored the client's own agent is used directly again.
+  nock.restore();
+  assert.strictEqual((await createClient({agent: own}).get(`${origin}/live`)).body, 'live');
+  assert.strictEqual(ownDispatches, 5);
 });

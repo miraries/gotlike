@@ -391,6 +391,14 @@ on top of whatever is passed, so a future h3 dispatcher plugs in with no changes
 Resolving lazily is what lets a `setGlobalDispatcher` call made *after* the client was constructed take effect —
 which is exactly what `./nock` does, and why import order no longer matters (there's a regression test for it).
 
+**An `ownAgent` is routed through the mock while `./nock` is the global dispatcher.** It used to bypass it
+entirely, so a `connections`-tuned client ignored every interceptor and `disableNetConnect()`, and a test that
+looked mocked went live — reproduced against a real server. The shim hangs a `routeOwnAgent` function on its
+`MockAgent` under `Symbol.for('gotlike.nock.routeOwnAgent')`; the getter looks for it on the global dispatcher
+and, when present, composes over the route it returns instead of over `ownAgent`. The route is memoised per agent,
+so `#composedFrom` still matches from one request to the next. A registry symbol keeps this module from importing
+the shim, and a client with no `ownAgent` pays nothing for it.
+
 Both interceptors read per-request overrides off the dispatch options at runtime (`maxRedirections`,
 `retryOptions` — see `lib/interceptor/{redirect,retry}.js`) even though undici's typings don't declare them;
 `InterceptorOptions` in `index.ts` re-adds them. That's what keeps `followRedirect` a per-request option without
@@ -399,6 +407,12 @@ rebuilding a dispatcher per call.
 Retry support is whatever undici's `RetryHandler` provides; got's `calculateDelay`/`noise` are not implemented,
 and `maxRetryAfter` is degraded to a boolean `retryAfter`. `retryOptions.throwOnError` is forced to `false` so
 that exhausted retries resolve to the last response (got's behaviour) instead of throwing `RequestRetryError`.
+
+**Retrying at all is opt-in: a client without a `retry` object composes no retry interceptor and makes one
+attempt**, where got retries twice by default. It is the `followRedirect` trade again — `countAttempts` and
+undici's `RetryHandler` cost per request whether or not anything is retried — and `retry: {}` gets got's defaults.
+The README used to say only "`limit` defaults to got's 2", which read as the client default and was only true inside
+a `retry` object; it states the opt-in outright now. Everything below is about a client that has one.
 
 Three defaults are deliberately *not* undici's, because undici's diverge from got in ways nobody would go looking
 for: `limit` defaults to **2** (undici's is 5, which triples the load a failing upstream sees), `retryAfter`
@@ -461,7 +475,10 @@ retry/`formOptions` invariant table is what holds it there.
 **The retried request runs only the hooks *before* the one that retried** (`afterResponseLimit`, a symbol on the
 options, same trick as `retryDepth`). Re-running the whole array meant a refreshed request re-fired every earlier
 hook and let the retrying hook see its own retry. got does `hooks.afterResponse.slice(0, index)` for the same
-reason — measured against got-cjs: `[h1, h2]` with `h2` retrying gives `h1, h2, h1`. A side effect worth knowing:
+reason — measured against got-cjs: `[h1, h2]` with `h2` retrying gives `h1, h2, h1`. **The hooks *after* the
+retrying one never run, on either response**: got's retry throws a `RetryError` that abandons the loop, so the
+outer loop here stops once a hook has called `retryWithMergedOptions` (the `retried` flag). Carrying on ran them on
+the retried response — `[h1, h2, h3]` gave `h1, h2, h1, h3` against got's `h1, h2, h1`. A side effect worth knowing:
 each retry has strictly fewer hooks left than the last, so the chain is bounded by the array's own length and
 `ERR_TOO_MANY_RETRIES` is now unreachable through the hook path. `maxAfterResponseRetries` is kept as a guard on
 `retryWithMergedOptions` being driven directly.
@@ -838,6 +855,10 @@ exact would mean reading `bytes()` instead of `text()` on *every* response — u
 in place with no copy, while `bytes()` copies the body first — measured at +160ns for 250 bytes, +2.2µs for 100KB,
 paid by every caller to serve the few who read `rawBody` on a non-UTF-8 response. Don't make that trade without
 a reason to.
+
+The same `text()` call **strips a UTF-8 BOM**, where got 16 keeps it (`body` starts with U+FEFF, `rawBody` with
+`ef bb bf`, and a BOM-prefixed JSON body is a `ParseError` there but parses here). Measured against got 16, and
+kept for the same cost reason; it is a README divergence row, not a bug.
 
 # Streams
 

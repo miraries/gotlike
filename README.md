@@ -60,6 +60,9 @@ where it doesn't cost anything at runtime - see [Differences](#differences-from-
 > **Redirects are not followed by default**, unlike got. undici allocates a redirect handler on
 > every request once its interceptor is in play, which measured at ~80% of this client's entire
 > per-request overhead - so it is opt-in: `gotlike.extend({ followRedirect: true })`.
+>
+> **Retries are off by default** too, for the same reason: a client without a `retry` object makes
+> one attempt where got makes up to three. `gotlike.extend({ retry: {} })` gets got's defaults.
 
 Supports:
 - [x] Extendable client
@@ -67,7 +70,7 @@ Supports:
 - [x] Hooks *(arrays, instance-level only)*
 - [x] `afterResponse` retries via `retryWithMergedOptions`
 - [x] `context`
-- [x] Retries *(partial - maps onto undici's `retry` interceptor; honours `Retry-After`)*
+- [x] Retries *(partial, opt-in with a `retry` object - maps onto undici's `retry` interceptor; honours `Retry-After`)*
 - [x] `searchParams`, `form`
 - [x] Decompression - gzip, deflate, br, zstd, compress
 - [x] Basic auth - `username` / `password`, or credentials in the url (`https://user:pass@host`)
@@ -95,6 +98,7 @@ Supports:
 | `hooks`, `handlers`, `retry`, `agent`, `http2`, `pipelining`, `dnsCache`, `dnsLookup`, `decompress` | per request or per client | **create/extend only** - passing them per request is a `ValidationError` |
 | option merging | per-option merge table, every request | **one shallow spread**; `headers`, `context`, `searchParams` and `timeout` merge one level deep, everything else is replaced |
 | `response.rawBody` | always materialised | **computed on first access** - the bytes as received, so a `json` response still hands back the original text. On a `text`/`json` response it is a UTF-8 encoding of the decoded body, which is byte-exact for the UTF-8 that JSON and `charset=utf-8` guarantee; a response in some *other* charset is already mojibake by then, so read it with `responseType: 'buffer'` if the exact bytes matter |
+| a UTF-8 BOM on a `text`/`json` response | kept - `body` starts with U+FEFF, `rawBody` starts `ef bb bf`, and a BOM-prefixed JSON body is a `ParseError` | **stripped** - undici's `text()` drops it, so `body` and `rawBody` both lack it, and a BOM-prefixed JSON body *parses*. Use `responseType: 'buffer'` if the BOM matters |
 | `options.url` | normalised to a `URL` | **same** - a `URL` resolved against `prefixUrl` and `searchParams` before handlers and hooks see it, so `.href`, `.pathname` and an in-place `options.url.searchParams.set(...)` all work, and `String(options.url)` is exactly what goes on the wire (`/a b/ü` → `/a%20b/%C3%BC`). A hook may also assign a string or a new `URL`. The one difference: a url `new URL` rejects stays a string, and the request then fails with `ERR_INVALID_URL` as usual |
 | `response.url` | the final url | **same** - the last hop's url when redirects were followed, and the requested one otherwise. `options.url` stays the url that was *requested*, so a retry from a hook goes back through the redirect |
 | `options.context` | fresh `{}` per request | a **shared frozen** `{}` when unset - reads are safe, writes throw rather than leak. Pass a `context` to get a writable one |
@@ -112,7 +116,7 @@ Supports:
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
 | `timeout.lookup`, `.connect`, `.secureConnect`, `.socket`, `.send`, `.response`, `.read` | per-phase bounds | a **`ValidationError`** naming the option. Only `timeout.request` is implemented, and it bounds every phase; accepting the others meant a `timeout: {response: 10000}` that silently bounded nothing. Use `timeout.request`, or the client-level `connectTimeout` for the connection phase |
 | `retry.calculateDelay`, `retry.noise`, `hooks.init` | accepted | a **`ValidationError`** naming the option - "not implemented", not "unknown". Ignoring them would mean a backoff tuning that silently never applies and an `init` hook that silently never fires, which is the failure the unknown-key check exists to stop. Drop them, or cap the backoff with `retry.backoffLimit` and move `init` work into `beforeRequest` |
-| an unknown key in `retry` or `hooks` | accepted and ignored | a **`ValidationError`**. `retry: { limt: 0 }` used to leave the *default* two retries in place, and a misspelled hook name simply never fired |
+| an unknown key in `retry` or `hooks` | accepted and ignored | a **`ValidationError`**. `retry: { limt: 0 }` used to leave the `retry` object's default of two retries in place, and a misspelled hook name simply never fired |
 | an agent-level option alongside an explicit `agent`, or on a client built with one | n/a - got's `agent` is per-protocol | a **`ValidationError`** either way round. A `ProxyAgent` or `H2CClient` cannot be rebuilt from `connections`, so the option can only be silently ignored (named beside the agent) or silently replace your dispatcher with a plain `undici.Agent` (named on a client that already has one) - and for a proxy agent, that means every request going direct. Pass a new `agent` configured the way you want instead |
 | `form: { a: null }`, `form: { a: undefined }` | `a=null`, `a=undefined` - got serialises `form` with `new URLSearchParams(form)`, which stringifies both | `a=` and **dropped**, the same rule `searchParams` uses. got's is a serialisation artefact rather than an intent - it is not what got itself does with those values in `searchParams`, and no server wants the four characters `null` in a form field |
 | `form: { a: [1, 2] }` | `a=1%2C2` - the same `new URLSearchParams(form)` artefact | `a=1&a=2`, **repeating the key**, which is how a multi-valued form field is actually carried. A silent wire difference for an identical call, so check any `form` you are porting that passes an array |
@@ -123,7 +127,7 @@ Supports:
 | | behaviour |
 | --- | --- |
 | `timeout.request` | a cap on a whole **attempt**, as got's is - it covers every phase, and it starts over for each retry rather than being a budget for the sequence. undici's own `headersTimeout`/`bodyTimeout` are per-phase and `bodyTimeout` restarts on every chunk, so a slowly trickling response would never trip them - a deadline signal enforces the total on top. That also sidesteps undici's coarse 1s timer wheel, so sub-second timeouts fire on time. See the retry rows below for the one case where the deadline waits before it fires |
-| `retry` | maps onto undici's `retry` interceptor. `limit` defaults to got's 2, and `Retry-After` is honoured, but `calculateDelay`/`noise` are not implemented (and are *rejected* rather than ignored - see the table above) and `maxRetryAfter` degrades to "honour the header or don't". The retried **status codes and methods are undici's defaults**, not got's - set `statusCodes`/`methods` explicitly if that matters. `errorCodes` defaults to undici's list *plus* the two codes it raises for a timeout, since got retries a timeout by default; got's own spelling, `ETIMEDOUT`, is accepted in the list and translated |
+| `retry` | **off unless the client is given a `retry` object** - got retries twice by default; here a client without one makes exactly one attempt, and `retry: {}` turns on got's default. The interceptor costs per request whether or not a retry happens, the same trade as `followRedirect`. Maps onto undici's `retry` interceptor. Within a `retry` object `limit` defaults to got's 2, and `Retry-After` is honoured, but `calculateDelay`/`noise` are not implemented (and are *rejected* rather than ignored - see the table above) and `maxRetryAfter` degrades to "honour the header or don't". The retried **status codes and methods are undici's defaults**, not got's - set `statusCodes`/`methods` explicitly if that matters. `errorCodes` defaults to undici's list *plus* the two codes it raises for a timeout, since got retries a timeout by default; got's own spelling, `ETIMEDOUT`, is accepted in the list and translated |
 | a timed-out attempt | **retried**, as got retries one - but only for a `timeout.request` of **1s or more**. undici cannot report a timeout of its own any sooner than that (`RESOLUTION_MS` in its timer wheel), and a timeout the *deadline signal* reports is one undici will never retry - an aborted dispatch is the one failure its `RetryHandler` propagates outright. So above 1s the deadline waits up to 700ms past `timeout.request` for undici's own, retryable, timeout to fire, and below it the deadline stays exact and the attempt is not retried: failing at 1.7s for a caller who asked for 100ms is the worse of the two trades. Only the *failure* of an attempt is ever delayed, never a request that succeeds, and the waiting stops as soon as a response head has arrived - so a trickling body keeps its exact bound |
 | `beforeRedirect`, `beforeRetry` | **cannot delay or cancel** - undici decides both inside a synchronous dispatch interceptor, so a returned promise is not awaited |
 | `300 Multiple Choices` | **followed** when `followRedirect` is on, because undici's redirect interceptor counts 300 as redirectable. got 15 stopped following it (RFC 9110 makes it a SHOULD for user agents) and hands the 300 back instead. 304 is not followed by either |
@@ -380,6 +384,12 @@ individual scope, as they already do for two scopes on one string origin.
 Body matchers take a string, a RegExp, a predicate, or an object/array compared against the
 request body parsed as JSON (a RegExp or function as a leaf value matches that field), as nock's
 do. An object reply body is sent as `application/json`, again as nock sends it.
+
+A client with its own dispatcher - `agent`, or any of `connections`, `keepAliveTimeout`,
+`http2` and the other agent options - is mocked too, as nock mocks every agent: a request to a
+mocked origin, or to one `disableNetConnect()` closes, goes to the mock, and an allowed live
+request still leaves through the client's own dispatcher. An `agent` that is itself a `MockAgent`
+is left alone.
 
 ## Streams
 

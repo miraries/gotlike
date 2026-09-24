@@ -1,8 +1,8 @@
 import type {Url} from 'node:url';
 import {Readable} from 'node:stream';
-import {getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
+import {Dispatcher, getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
 import type {MockInterceptor} from 'undici/types/mock-interceptor.js';
-import type {Dispatcher, Interceptable} from 'undici';
+import type {Interceptable} from 'undici';
 
 const mockAgent = new MockAgent();
 
@@ -159,6 +159,90 @@ mockAgent.dispatch = (options, handler) => {
 
   return mockDispatch(options, handler);
 };
+
+/** undici's own net-connect test, which `netConnectPolicy` matchers are written against. */
+function netConnectAllows(origin: string): boolean {
+  if (netConnectPolicy === true || netConnectPolicy === false) {
+    return netConnectPolicy;
+  }
+
+  const host = new URL(origin).host;
+
+  return netConnectPolicy.some((matcher) => {
+    if (typeof matcher === 'string') {
+      return matcher === host;
+    }
+
+    if (typeof matcher === 'function') {
+      return matcher(host);
+    }
+
+    matcher.lastIndex = 0;
+
+    return matcher.test(host);
+  });
+}
+
+/**
+ * A client built with its own agent - `agent`, `connections`, `keepAliveTimeout` and the rest -
+ * dispatches through that agent, never through the global one this module replaced. So the mock
+ * never saw its requests: a matching interceptor was skipped and `disableNetConnect()` did nothing,
+ * and a test that looked mocked made a live request with the real credentials. Real nock sits under
+ * every agent, so it never had this gap.
+ *
+ * The client asks for this route whenever the global dispatcher is the mock. A request goes to the
+ * mock when nock would have a say in it - a mocked origin, or one net connect doesn't allow - and
+ * through the client's own agent otherwise, so an allowed live request keeps the pool it was
+ * configured with, as it would under nock.
+ */
+class OwnAgentRoute extends Dispatcher {
+  #own: Dispatcher;
+
+  constructor(own: Dispatcher) {
+    super();
+    this.#own = own;
+  }
+
+  override dispatch(options: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+    const origin = String(options.origin);
+
+    if (hasMockedOrigin(origin) || !netConnectAllows(origin)) {
+      return mockAgent.dispatch(options, handler);
+    }
+
+    return this.#own.dispatch(options, handler);
+  }
+
+  override close(...args: unknown[]): any {
+    return (this.#own.close as (...args: unknown[]) => unknown)(...args);
+  }
+
+  override destroy(...args: unknown[]): any {
+    return (this.#own.destroy as (...args: unknown[]) => unknown)(...args);
+  }
+}
+
+/** One route per agent, so the client's memoised interceptor chain survives across requests. */
+const routes = new WeakMap<Dispatcher, OwnAgentRoute>();
+
+function routeOwnAgent(own: Dispatcher): Dispatcher {
+  // Someone else's MockAgent is already a mock; routing it here would second-guess it.
+  if (own instanceof MockAgent) {
+    return own;
+  }
+
+  let route = routes.get(own);
+
+  if (route === undefined) {
+    route = new OwnAgentRoute(own);
+    routes.set(own, route);
+  }
+
+  return route;
+}
+
+// Found by `Symbol.for` from `index.ts`, which never imports this module.
+Object.defineProperty(mockAgent, Symbol.for('gotlike.nock.routeOwnAgent'), {value: routeOwnAgent});
 
 /**
  * undici's per-pool dispatch list, if this version still keeps it where we expect.

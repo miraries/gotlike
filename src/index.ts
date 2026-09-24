@@ -3137,6 +3137,9 @@ const agentOptions = [
  */
 const inheritedAgent = Symbol('gotlike.inheritedAgent');
 
+/** Set on the nock shim's MockAgent; a registry symbol, so this module never imports the shim. */
+const routeOwnAgent = Symbol.for('gotlike.nock.routeOwnAgent');
+
 /**
  * Refuse an agent-level option that an explicit `agent` would silently swallow.
  *
@@ -3758,7 +3761,19 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * base dispatcher rather than once per request.
    */
   get agent(): Dispatcher {
-    const base = this.ownAgent ?? getGlobalDispatcher();
+    const global = getGlobalDispatcher();
+    let base = this.ownAgent ?? global;
+
+    // While `./nock` is the global dispatcher, a client's own agent has to be routed through it
+    // too, or mocks and `disableNetConnect()` never see that client's requests - see
+    // `OwnAgentRoute` there. The route is memoised per agent, so the composition below still is.
+    if (this.ownAgent !== undefined) {
+      const route = (global as {[routeOwnAgent]?: (own: Dispatcher) => Dispatcher})[routeOwnAgent];
+
+      if (route !== undefined) {
+        base = route(this.ownAgent);
+      }
+    }
 
     if (this.#composedFrom !== base) {
       const options = this.baseOptions;
@@ -4673,8 +4688,17 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
        * skipping the `RequestError` wrapper and the `beforeError` hooks entirely, so a caller
        * matching on `instanceof RequestError` missed it. got wraps this same loop.
        */
+      /*
+       * Set once a hook asks for a retry, which ends the loop: the hooks after it never run.
+       * got's `retryWithMergedOptions` throws a `RetryError` that abandons this loop and
+       * restarts the request with the cut array, so its later hooks see neither response.
+       * Carrying on here ran them on the retried one - `[h1, h2, h3]` with `h2` retrying gave
+       * `h1, h2, h1, h3` where got gives `h1, h2, h1`.
+       */
+      let retried = false;
+
       try {
-        for (let index = 0; index < limit; index++) {
+        for (let index = 0; index < limit && !retried; index++) {
           const hook = hooks[index]!;
           const triggerStatusCode = response.statusCode;
           /*
@@ -4684,9 +4708,11 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
            * and the counter is the only thing a caller has to see that.
            */
           const retriesSoFar = response.retryCount;
-          const returned = await hook(response, (newOptions) =>
-            this.retryWithMergedOptions<T>(options, newOptions, index, triggerStatusCode, retriesSoFar),
-          );
+          const returned = await hook(response, (newOptions) => {
+            retried = true;
+
+            return this.retryWithMergedOptions<T>(options, newOptions, index, triggerStatusCode, retriesSoFar);
+          });
 
           if (!isResponseLike(returned)) {
             throw new TypeError('The `afterResponse` hook returned an invalid value');
