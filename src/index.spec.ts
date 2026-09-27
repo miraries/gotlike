@@ -18,6 +18,7 @@ import client, {
   type GotlikeStream,
   type GotlikeUploadStream,
   type FormedOptions,
+  type Got,
   type HandlerFunction,
   Gotlike,
   HTTPError,
@@ -8894,6 +8895,38 @@ async function typeAssertions() {
   // ...and it survives another extend.
   expectType<unknown>()((await jsonClient.extend({prefixUrl: 'p'}).get('u')).body);
   expectType<string>()((await jsonClient.extend({responseType: 'text'}).get('u')).body);
+
+  // A `Got`-typed field takes any callable client, whatever its `responseType` - the aggregator
+  // types its provider clients that way. CLAUDE.md claimed this held and nothing checked it: a
+  // json client's quiet `delete()` resolves to `Response<unknown>`, which `Got` - typed as the
+  // default client, with a `string` body - would not accept.
+  const clients: Got[] = [
+    client,
+    jsonClient,
+    bufferClient,
+    client.extend({responseType: 'text'}),
+    jsonClient.extend({prefixUrl: 'p'}),
+    createClient({prefixUrl: 'p'}),
+    createClient({responseType: 'json'}),
+  ];
+  const anyClient = clients[0]!;
+
+  // A bare `createClient()` is the default client's type; options that may be absent still compile.
+  const maybeOptions = undefined as RequestOptions | undefined;
+  expectType<string>()((await createClient().get('u')).body);
+  expectType<unknown>()((await createClient(maybeOptions).get('u')).body);
+  // A class type parameter can't default one way for inference and another for annotations, so a
+  // bare `new Gotlike()` is the any-client type. Pinned because it changed: this was `string`.
+  expectType<unknown>()((await new Gotlike().get('u')).body);
+
+  // Through one, a quiet call's body is `unknown` - it could be any of them - and an explicit
+  // type argument or per-call `responseType` still settles it.
+  expectType<unknown>()((await anyClient.get('u')).body);
+  expectType<unknown>()((await anyClient.delete('u')).body);
+  expectType<Thing>()((await anyClient.get<Thing>('u')).body);
+  expectType<string>()((await anyClient.get('u', {responseType: 'text'})).body);
+  expectType<Buffer>()((await anyClient.post('u', {responseType: 'buffer'})).body);
+  expectType<unknown>()((await anyClient.extend({prefixUrl: 'p'}).get('u')).body);
 
   // `responseType` settles it when the caller doesn't.
   expectType<string>()((await client.get('u')).body);

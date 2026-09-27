@@ -1319,7 +1319,23 @@ implementation signatures return `Promise<any>`.
 
 The overload set is asserted at the bottom of `index.spec.ts` (`typeAssertions`), which is never
 invoked — type stripping doesn't check types, so those assertions are enforced by
-`npm run typecheck`, not by `npm test`. Keeping a generic `<T>(url, options?)` arm in the set is
-what keeps an extended client assignable to a plain `Got`-typed field; drop it and
-`const c: Got = gotlike.extend({responseType: 'json'})` stops compiling.
+`npm run typecheck`, not by `npm test`.
+
+**`Got` is any callable client, and that takes two things.** This used to claim the generic
+`<T>(url, options?)` arm was enough for `const c: Got = gotlike.extend({responseType: 'json'})` to
+compile. It didn't, and nothing asserted it: `Got` was `CallableClient<ClientOptions>`, and
+`ClientBody` fell back to `string` for any `O` that wasn't json or buffer - so `Got` was the type of
+a *text* client, a json client's quiet `delete()` (`Response<unknown>`) was not assignable to its
+`Response<string>`, and the aggregator had to type its provider fields around it. Now:
+
+- `ClientBody` answers `string` only when `responseType` is known to be text or absent, and
+  `unknown` when it could be anything - which is exactly what `ClientOptions`, and so `Got`, says.
+- The *default* client needs the opposite, so it gets its own options type, `NoClientOptions`, via a
+  no-argument `createClient()` overload. It is an overload rather than a default for `O` because a
+  default is also what TypeScript contextually types a callback from when every property of the
+  argument is context-sensitive - an empty default left `hooks`/`handlers` parameters implicitly `any`.
+
+A bare `new Gotlike()` can't be given the same treatment - a class type parameter has one default
+for inference and annotations alike - so its quiet body is `unknown`. `typeAssertions` pins all of
+it, including the assignments that were never checked.
 

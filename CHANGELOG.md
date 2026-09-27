@@ -4,6 +4,23 @@ All notable changes to this project are documented here. This project adheres to
 [semantic versioning](https://semver.org/spec/v2.0.0.html); while the major version is `0`, a
 minor bump is where breaking changes land.
 
+## Unreleased
+
+### Fixed
+
+- **Any callable client is now assignable to `Got`.** `Got` was typed as a *text* client, so
+  `const c: Got = gotlike.extend({responseType: 'json'})` - and the same for a `buffer` client -
+  did not compile: a json client's quiet `delete()` resolves to `Response<unknown>` and `Got`'s
+  claimed `Response<string>`. The docs said it worked and nothing checked it. A quiet call through a
+  `Got`-typed value now reads `unknown`, since it could be any client; a type argument or a per-call
+  `responseType` still settles it. The default client and `createClient()` still read `string`.
+
+### Changed
+
+- A bare `new Gotlike()`, with no options, types a quiet call's body as `unknown` rather than
+  `string` - its type parameter is the any-client one. Pass options, or use `createClient()`, to
+  keep `string`. Runtime behaviour is unchanged.
+
 ## 0.5.0 - 2026-09-27
 
 ### Added

@@ -2996,12 +2996,28 @@ export type IsStream = {isStream: true};
 /**
  * The body type a client's own `responseType` implies, for a call that doesn't name one.
  * `json` lands on `unknown` rather than `any`, so it still has to be narrowed somewhere.
+ *
+ * `string` only when the client is known to read text - `responseType: 'text'`, or none at all.
+ * A client whose `responseType` could be anything, which is what `ClientOptions` itself and so
+ * `Got` describe, gets `unknown`. That fallback used to be `string`, which made `Got` the type of
+ * a *text* client rather than of any client: a json client's quiet `delete()` resolves to
+ * `Response<unknown>`, `Got`'s to `Response<string>`, so `const c: Got = client.extend({
+ * responseType: 'json'})` did not compile - the aggregator's provider fields are typed that way.
  */
 export type ClientBody<O> = O extends {responseType: 'json'}
   ? unknown
   : O extends {responseType: 'buffer'}
     ? Buffer
-    : string;
+    : O extends {responseType?: 'text' | undefined}
+      ? string
+      : unknown;
+
+/**
+ * The options type of a client built with none. Distinct from `ClientOptions`, which describes a
+ * client that could have been built with *any* options - so the default client and a bare
+ * `createClient()` still read text on a quiet call, where a `Got`-typed value can't say.
+ */
+export type NoClientOptions = Record<never, never>;
 
 /** A whole `Response`, or the bare body when the *client* was built with `resolveBodyOnly`. */
 export type ClientResult<O, Body> = O extends {resolveBodyOnly: true} ? Body : Response<Body>;
@@ -5949,8 +5965,16 @@ function asCallable<O extends ClientOptions>(instance: Gotlike<O>): CallableClie
   return callable;
 }
 
-/** Create a callable client. `new Gotlike(options)` gives the plain, non-callable form. */
-export function createClient<O extends ClientOptions = ClientOptions>(options?: O): CallableClient<O> {
+/**
+ * Create a callable client. `new Gotlike(options)` gives the plain, non-callable form.
+ *
+ * Overloaded rather than defaulting `O` to `NoClientOptions`: when every property of the options
+ * is context-sensitive - a `hooks` or `handlers` literal - TypeScript contextually types the
+ * callbacks from `O`'s *default*, and an empty default left their parameters implicitly `any`.
+ */
+export function createClient(): CallableClient<NoClientOptions>;
+export function createClient<O extends ClientOptions = ClientOptions>(options?: O): CallableClient<O>;
+export function createClient<O extends ClientOptions>(options?: O): CallableClient<O> {
   return asCallable(new Gotlike<O>(options));
 }
 
@@ -5970,5 +5994,6 @@ export const gotlike = defaultClient;
 
 // For easier replacement
 export const got = defaultClient;
+/** Any callable client, whatever it was built with - see `ClientBody` for what a quiet call reads. */
 export type Got = CallableClient;
 export type ExtendOptions = RequestOptions;
