@@ -534,7 +534,15 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
   res.end();
 });
 
-test.before(() => new Promise<void>((resolve) => server.listen(3000, resolve)));
+// Rejects on a listen error: with port 3000 taken, `listen` never calls back, and the whole file
+// used to hang until node reported "Promise resolution is still pending".
+test.before(
+  () =>
+    new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(3000, resolve);
+    }),
+);
 
 test.after(() => {
   server.close();
@@ -8575,6 +8583,7 @@ test('every failure path reports a RequestError or a ValidationError, never a ra
         hooked({
           beforeRequest: [
             () => {
+              // oxlint-disable-next-line no-throw-literal, typescript/only-throw-error
               throw 'hook';
             },
           ],

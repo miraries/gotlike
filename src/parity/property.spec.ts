@@ -184,7 +184,7 @@ propertyTest('searchParams reaches the wire the same way whatever shape it is gi
     pairs: Array.from({length: 1 + rng.int(3)}, (_, index) => [
       `${rng.string(queryKeyChars, 1 + rng.int(4))}${index}`,
       rng.string(fragileQueryValueChars, rng.int(6)),
-    ]) as [string, string][],
+    ]),
     // Half the cases put a query on the url as well, which `searchParams` has to replace.
     urlQuery: rng.bool(),
   }),
