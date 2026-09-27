@@ -1250,6 +1250,18 @@ alongside `hooks`/`handlers`/`cloneSearchParams`. Shallow, as `mergeRecords` is 
 key-level writes that were reaching through.
 
 
+**`defaults.options.merge()` is `extend()` applied in place** (`#mergeDefaults`). It builds the child `extend()`
+would and adopts the two fields that child derived for requests - `baseOptions` and `defaultHeaders` - so the
+merge rules cannot drift from `extend()`'s and nothing is added to the request path, which already reads both.
+That is only correct because **every other field a constructor derives comes from an option the merge refuses**
+(`unmergeableDefaults`: the client-only set, `followRedirect`, the body options, `url`, `isStream`,
+`responseType`, `resolveBodyOnly`). Adding a derived field that depends on a request-level option means adopting
+it in `#mergeDefaults` as well, or the merge updates `baseOptions` and silently leaves the field stale. The
+dispatcher needs nothing: `extend()` hands its own on, so the child shares it. `mutableDefaults` is cleared off
+`baseOptions` in the constructor - assigned `undefined`, not `delete`d, since `baseOptions` is spread per request
+and a delete can drop it out of V8's fast mode - which is also what makes it not inherited, as in got 16. got
+ignores a merge into an immutable client silently; here it is a `ValidationError`, pinned as a divergence.
+
 # Performance notes
 
 Measured against a null dispatcher (median of 3 runs, **each in a fresh process** — comparing

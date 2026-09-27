@@ -63,7 +63,7 @@ than they look:
   sides stay pinned, so the test fails if gotlike drifts *and* if a got upgrade changes got. A `skip`
   would catch neither.
 
-The suite prints the full inventory when it finishes: **four request headers and ten behaviours**
+The suite prints the full inventory when it finishes: **four request headers and eleven behaviours**
 against got 16, and three against nock. It started at five and seven; what closed the gap was fixing what
 the suite found rather than recording it (the seventh behaviour is the stream-upload framing below,
 which arrived with the stream scenarios rather than from anything changing here, the eighth is the

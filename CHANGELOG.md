@@ -6,6 +6,15 @@ minor bump is where breaking changes land.
 
 ## Unreleased
 
+### Added
+
+- **`mutableDefaults` and `client.defaults.options.merge()`**, as in got - for merging a refreshed
+  credential into a client from a hook. Request-level options only; merging into a client without
+  `mutableDefaults`, or merging an option the client consumed when it was built (`hooks`, `retry`,
+  `agent`, ...), is a `ValidationError` where got silently does nothing. Not inherited by
+  `extend()`, matching got. No per-request cost: measured against a null dispatcher, 3682ns before
+  and 3659ns after (median of 15 interleaved runs).
+
 ### Fixed
 
 - **A function body matcher is handed the parsed body, as nock hands it.** undici passes a body

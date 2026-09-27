@@ -18,6 +18,7 @@ export type ParityClient = {
   delete: (url: string, options?: Record<string, unknown>) => Promise<AnyResponse>;
   head: (url: string, options?: Record<string, unknown>) => Promise<AnyResponse>;
   extend: (options: Record<string, unknown>) => ParityClient;
+  defaults: {mutableDefaults: boolean; options: {merge: (options: Record<string, unknown>) => unknown}};
   /**
    * got returns a stream synchronously; gotlike resolves to one, because its `beforeRequest`
    * hooks are async and awaiting them is worth more than the sync return (a documented

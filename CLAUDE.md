@@ -96,5 +96,5 @@ rule-by-rule "why it's off" rationale is the **`lint-config` skill**; read it be
 `index.ts` exports the class plus pre-built singletons for drop-in replacement: `default`, `gotlike`, `got`
 (all one `createClient()` — the defaults come from the constructor now, so passing `defaultOptions` here would be
 redundant), and types `Got`, `ExtendOptions`, `RequestOptions`, `Response`,
-`HandlerFunction`, `RequestError`. Keep all of these working when changing the entry point — the README documents
+`HandlerFunction`, `RequestError`, `ClientDefaults`, `DefaultsMergeOptions`. Keep all of these working when changing the entry point — the README documents
 requiring/importing any of them.

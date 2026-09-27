@@ -2598,6 +2598,18 @@ export type RequestOptions<T = unknown> = {
   parseUserinfo?: boolean;
 
   /**
+   * Allow `client.defaults.options.merge(...)` to change this client's defaults after it has
+   * been built - got's option, for the token-refresh pattern of merging a new `authorization`
+   * into the client from a hook.
+   *
+   * Client-only, and **not inherited by `extend()`**, as in got: a child is only mutable when
+   * its own options say so.
+   *
+   * @default false
+   */
+  mutableDefaults?: boolean;
+
+  /**
    * Decompress `gzip`, `deflate`, `br` and `zstd` responses, and advertise support for them
    * via `accept-encoding`.
    *
@@ -3245,6 +3257,8 @@ const clientOnlyOptions = new Set<keyof RequestOptions>([
   // do nothing.
   'validate',
   'parseUserinfo',
+  // Decides what `client.defaults` allows, which is fixed when the client is built.
+  'mutableDefaults',
 ]);
 
 /**
@@ -3273,6 +3287,7 @@ const knownOptionMap = {
   context: true,
   validate: true,
   parseUserinfo: true,
+  mutableDefaults: true,
   agent: true,
   retry: true,
   http2: true,
@@ -3305,6 +3320,71 @@ export class ValidationError extends Error {
 function invalid(message: string): never {
   throw new ValidationError(message);
 }
+
+/**
+ * The options `client.defaults.options.merge()` refuses, with why. Only what a *request* merges
+ * can be merged into a built client. The rest was consumed when the client was built - the
+ * dispatcher, the hook arrays, the retry handler, the interceptor chain - so merging it would
+ * change `baseOptions` and nothing else, which is a silent no-op; or it belongs to one request;
+ * or it decides the client's response type, which a merge cannot change the way `extend()` does.
+ */
+const unmergeableDefaults = new Map<string, string>([
+  ...[...clientOnlyOptions, 'followRedirect'].map((key): [string, string] => [
+    key,
+    'is built into the client when it is created - use `extend()` instead',
+  ]),
+  ...['json', 'body', 'form', 'url', 'isStream'].map((key): [string, string] => [
+    key,
+    'belongs to a single request, not to the client',
+  ]),
+  ...['responseType', 'resolveBodyOnly'].map((key): [string, string] => [
+    key,
+    'decides the type of every response the client returns - use `extend()` instead',
+  ]),
+]);
+
+/** The options `client.defaults.options.merge()` takes - see `unmergeableDefaults`. */
+export type DefaultsMergeOptions = Omit<
+  RequestOptions,
+  | (typeof agentOptions)[number]
+  | 'agent'
+  | 'retry'
+  | 'dnsCache'
+  | 'cache'
+  | 'dedupe'
+  | 'decompress'
+  | 'handlers'
+  | 'hooks'
+  | 'validate'
+  | 'parseUserinfo'
+  | 'mutableDefaults'
+  | 'followRedirect'
+  | 'json'
+  | 'body'
+  | 'form'
+  | 'url'
+  | 'isStream'
+  | 'responseType'
+  | 'resolveBodyOnly'
+>;
+
+/** `client.defaults`, the part of got's that the token-refresh pattern uses. */
+export type ClientDefaults = {
+  /** Whether `options.merge()` may change the client. Fixed when the client is built. */
+  readonly mutableDefaults: boolean;
+  readonly options: {
+    /**
+     * Merge options into the client's defaults, by the rules `extend()` merges by - headers
+     * case-insensitively, `context`/`timeout`/`searchParams` one level deep, everything else
+     * replaced. Every request made afterwards sees them; one already in flight does not, and
+     * neither does a client extended from this one earlier.
+     *
+     * A `ValidationError` on a client built without `mutableDefaults: true` - got ignores the
+     * merge silently there - and for an option only `extend()` can apply.
+     */
+    merge(options: DefaultsMergeOptions): void;
+  };
+};
 
 /**
  * Catches the option mistakes that otherwise fail confusingly much later - a misspelled
@@ -3555,6 +3635,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   /** Whether anything runs between `formOptions` and the dispatch that could write a header. */
   mayRewriteHeaders: boolean;
 
+  /** got's `client.defaults` - see `mutableDefaults`. */
+  readonly defaults: ClientDefaults;
+
   decompressOptions?: DecompressOptions;
 
   /**
@@ -3630,6 +3713,23 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // symbol keys, so left in place it would travel into `baseOptions`, into every formed
     // options object, and into whatever `extend()` is handed next.
     delete (merged as Record<symbol, unknown>)[inheritedAgent];
+
+    /*
+     * Read and then cleared rather than deleted, so it is not inherited: `extend()` spreads
+     * `baseOptions`, and got builds every child immutable unless the child's own options say
+     * otherwise. Not `delete`, which can drop an object V8 would otherwise keep in fast mode -
+     * and `baseOptions` is spread on every request.
+     */
+    const mutableDefaults = merged.mutableDefaults === true;
+
+    if (merged.mutableDefaults !== undefined) {
+      merged.mutableDefaults = undefined;
+    }
+
+    this.defaults = Object.freeze({
+      mutableDefaults,
+      options: Object.freeze({merge: (extension: DefaultsMergeOptions) => this.#mergeDefaults(extension)}),
+    });
 
     // Folded once here so `formOptions` only has to look at a per-call method.
     if (merged.method !== undefined) {
@@ -5457,6 +5557,36 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     result.retryCount += retryCount;
 
     return result;
+  }
+
+  /**
+   * `defaults.options.merge()`. The merge itself is `extend()`'s, so the two cannot drift: this
+   * builds the child `extend()` would and adopts the request-level state it derived - the merged
+   * `baseOptions` and the folded `defaultHeaders`. Everything else a constructor derives comes
+   * from an option `unmergeableDefaults` refuses, so it is already right on this client, and the
+   * dispatcher is the same object (`extend()` passes it on). Nothing is added to the request
+   * path: `formOptions` already reads both fields per request, and a merge only replaces them.
+   */
+  #mergeDefaults(options: DefaultsMergeOptions): void {
+    if (!this.defaults.mutableDefaults) {
+      invalid(
+        '`defaults.options.merge()` needs a client built with `mutableDefaults: true` - got ignores the ' +
+          'merge silently here, which leaves a refreshed token unused with nothing to say so',
+      );
+    }
+
+    for (const key in options) {
+      const reason = Object.hasOwn(options, key) ? unmergeableDefaults.get(key) : undefined;
+
+      if (reason !== undefined && (options as Record<string, unknown>)[key] !== undefined) {
+        invalid(`\`${key}\` cannot be merged into a client's defaults: it ${reason}`);
+      }
+    }
+
+    const merged = this.extend(options);
+
+    this.baseOptions = merged.baseOptions;
+    this.defaultHeaders = merged.defaultHeaders;
   }
 
   extend<E extends RequestOptions>(options: E): Gotlike<MergeClientOptions<O, E>> {

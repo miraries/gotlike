@@ -3730,6 +3730,177 @@ test('pool options build a dedicated agent', async () => {
  * get the dispatcher its options describe, rather than the inherited one winning because it is
  * now sitting on `baseOptions`.
  */
+/*
+ * `mutableDefaults` - got's `client.defaults.options.merge(...)`. The aggregator's ThrillTech
+ * provider refreshes a token inside an `afterResponse` hook and merges it into the client, so
+ * every later request carries it without the call sites knowing.
+ */
+test('mutableDefaults lets defaults.options.merge change later requests', async () => {
+  const mutable = createClient({mutableDefaults: true, headers: {authorization: 'Bearer stale'}});
+
+  mutable.defaults.options.merge({headers: {Authorization: 'Bearer fresh'}, context: {tenant: 'a'}});
+
+  const response = await mutable.get<Record<string, string>>('http://localhost:3000/headers', {responseType: 'json'});
+
+  // Case-insensitively, as every other header merge is: the stale one is replaced, not joined.
+  assert.strictEqual(response.body['authorization'], 'Bearer fresh');
+  assert.deepStrictEqual(response.request.options.context, {tenant: 'a'});
+  assert.strictEqual(mutable.defaults.mutableDefaults, true);
+});
+
+test('a merge into the defaults from an afterResponse hook reaches every later request', async () => {
+  let refreshes = 0;
+  const api = createClient({
+    prefixUrl: 'http://localhost:3000',
+    responseType: 'json',
+    mutableDefaults: true,
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) => {
+          if (response.request.options.context.unauthorized && !response.request.options.context.retried) {
+            refreshes++;
+            const updated = {headers: {authorization: `Bearer token-${refreshes}`}};
+
+            api.defaults.options.merge(updated);
+
+            return retryWithMergedOptions({...updated, context: {retried: true}});
+          }
+
+          return response;
+        },
+      ],
+    },
+  });
+
+  const first = await api.get<Record<string, string>>('headers', {context: {unauthorized: true}});
+  const second = await api.get<Record<string, string>>('headers');
+
+  assert.strictEqual(first.body['authorization'], 'Bearer token-1');
+  assert.strictEqual(second.body['authorization'], 'Bearer token-1');
+  assert.strictEqual(refreshes, 1);
+});
+
+test('merging into the defaults of a client without mutableDefaults is a ValidationError', () => {
+  const frozen = createClient({headers: {a: '1'}});
+
+  assert.strictEqual(frozen.defaults.mutableDefaults, false);
+  assert.throws(() => frozen.defaults.options.merge({headers: {b: '2'}}), ValidationError);
+  assert.deepStrictEqual(frozen.baseOptions.headers, {a: '1'});
+});
+
+test('mutableDefaults is not inherited by extend, as in got', () => {
+  const parent = createClient({mutableDefaults: true});
+
+  assert.strictEqual(parent.extend({headers: {a: '1'}}).defaults.mutableDefaults, false);
+  assert.strictEqual(parent.extend({mutableDefaults: true}).defaults.mutableDefaults, true);
+  assert.strictEqual(client.extend({mutableDefaults: true}).defaults.mutableDefaults, true);
+});
+
+test('mutableDefaults is client-only', async () => {
+  await assert.rejects(
+    client.get('http://localhost:3000/headers', {mutableDefaults: true} as RequestOptions),
+    /`mutableDefaults` can only be set when creating or extending a client/,
+  );
+});
+
+/*
+ * Only what a request merges can be merged. Everything else is either built into the client when
+ * it is constructed - the dispatcher, the hook arrays, the retry handler - and a merge would
+ * silently do nothing, or belongs to one request (a body, a url), or decides the client's type.
+ */
+test('defaults.options.merge refuses what it cannot apply', () => {
+  const mutable = createClient({mutableDefaults: true});
+  const refused: RequestOptions[] = [
+    {hooks: {beforeRequest: []}},
+    {handlers: []},
+    {retry: {limit: 1}},
+    {agent: new Agent()},
+    {connections: 4},
+    {decompress: false},
+    {followRedirect: true},
+    {validate: false},
+    {mutableDefaults: false},
+    {json: {a: 1}},
+    {body: 'x'},
+    {form: {a: 1}},
+    {url: 'http://localhost:3000'},
+    {isStream: true},
+    {responseType: 'json'},
+    {resolveBodyOnly: true},
+  ];
+
+  for (const options of refused) {
+    assert.throws(() => mutable.defaults.options.merge(options), ValidationError, JSON.stringify(Object.keys(options)));
+  }
+
+  // And the ordinary validation a request's options get.
+  assert.throws(() => mutable.defaults.options.merge({timeout: 5000} as unknown as RequestOptions), ValidationError);
+  assert.throws(
+    () => mutable.defaults.options.merge({searchParams: {a: {}}} as unknown as RequestOptions),
+    ValidationError,
+  );
+  assert.throws(() => mutable.defaults.options.merge({nope: 1} as unknown as RequestOptions), /Unknown option `nope`/);
+});
+
+test('defaults.options.merge merges timeout, searchParams and context as extend does', async () => {
+  const mutable = createClient({
+    mutableDefaults: true,
+    prefixUrl: 'http://localhost:3000',
+    timeout: {request: 5000},
+    searchParams: {a: '1'},
+    context: {keep: true},
+  });
+
+  mutable.defaults.options.merge({timeout: {}, searchParams: {b: '2'}, context: {added: true}});
+
+  assert.deepStrictEqual(mutable.baseOptions.timeout, {request: 5000});
+  assert.deepStrictEqual(mutable.baseOptions.context, {keep: true, added: true});
+
+  const response = await mutable.get('headers');
+
+  assert.strictEqual(new URL(response.url).search, '?a=1&b=2');
+});
+
+test('defaults.options.merge copies what it is given and leaves clients extended earlier alone', async () => {
+  const mutable = createClient({mutableDefaults: true});
+  const earlier = mutable.extend({});
+  const headers = {authorization: 'Bearer one'};
+
+  mutable.defaults.options.merge({headers});
+  headers.authorization = 'Bearer two';
+
+  const fromMutable = await mutable.get<Record<string, string>>('http://localhost:3000/headers', {
+    responseType: 'json',
+  });
+  const fromEarlier = await earlier.get<Record<string, string>>('http://localhost:3000/headers', {
+    responseType: 'json',
+  });
+
+  assert.strictEqual(fromMutable.body['authorization'], 'Bearer one');
+  assert.strictEqual(fromEarlier.body['authorization'], undefined);
+});
+
+test('defaults.options.merge keeps the client’s dispatcher and accept-encoding', () => {
+  const agent = new Agent();
+  const mutable = createClient({mutableDefaults: true, agent});
+
+  mutable.defaults.options.merge({headers: {a: '1'}});
+
+  assert.strictEqual(mutable.ownAgent, agent);
+  assert.strictEqual(mutable.explicitAgent, true);
+  assert.ok(mutable.defaultHeaders['accept-encoding']);
+  assert.strictEqual(mutable.defaultHeaders['a'], '1');
+});
+
+test('defaults is reachable on a plain Gotlike as well as the callable form', () => {
+  const plain = new Gotlike({mutableDefaults: true});
+
+  plain.defaults.options.merge({headers: {a: '1'}});
+
+  assert.strictEqual(plain.defaultHeaders['a'], '1');
+  assert.ok(Object.isFrozen(plain.defaults));
+});
+
 test('extend reuses the parent’s dispatcher unless the extension names one', async () => {
   const parent = new Gotlike({responseType: 'json', connections: 1, keepAliveTimeout: 1000});
 

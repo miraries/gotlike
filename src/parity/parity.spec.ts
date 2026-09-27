@@ -51,6 +51,74 @@ parityTest('a per-call header replaces an instance header of different case', {
   },
 });
 
+/* ----------------------------------------------------------------------- mutableDefaults */
+
+parityTest('a merge into a mutableDefaults client reaches every later request', {
+  claim:
+    'README: `mutableDefaults` - `client.defaults.options.merge()` changes the client, headers case-insensitively.',
+  run: async (client, base) => {
+    const scoped = client.extend({
+      prefixUrl: base,
+      responseType: 'json',
+      headers: {authorization: 'Bearer stale'},
+      mutableDefaults: true,
+    });
+
+    scoped.defaults.options.merge({headers: {Authorization: 'Bearer fresh'}});
+
+    const response = await scoped.get('echo');
+
+    return (response.body as {headers: Record<string, string>}).headers['authorization'];
+  },
+});
+
+parityTest('mutableDefaults is not inherited by extend', {
+  claim: 'README: a child is only mutable when its own options say so.',
+  run: async (client) => {
+    const parent = client.extend({mutableDefaults: true});
+
+    return {
+      parent: parent.defaults.mutableDefaults,
+      child: parent.extend({headers: {a: '1'}}).defaults.mutableDefaults,
+      explicit: parent.extend({mutableDefaults: true}).defaults.mutableDefaults,
+    };
+  },
+});
+
+parityTest('a merge into a client without mutableDefaults', {
+  claim: 'README: merging into an immutable client is a ValidationError rather than a silent no-op.',
+  run: async (client, base) => {
+    const scoped = client.extend({prefixUrl: base, responseType: 'json'});
+    const merge = await capture(async () => {
+      scoped.defaults.options.merge({headers: {authorization: 'Bearer fresh'}});
+    });
+    const response = await scoped.get('echo');
+
+    return {merge, authorization: (response.body as {headers: Record<string, string>}).headers['authorization']};
+  },
+  divergence: {
+    reason:
+      'got freezes an immutable client’s defaults and its `merge()` then changes nothing and says nothing - ' +
+      'so a token refresh written against a client that forgot `mutableDefaults: true` retries once with ' +
+      'the new token and goes on sending the old one. gotlike refuses the merge instead, the same call it ' +
+      'makes everywhere an option would otherwise be quietly dropped.',
+    got: {merge: {outcome: 'resolved', value: undefined}, authorization: undefined},
+    gotlike: {
+      merge: {
+        outcome: 'rejected',
+        name: 'ValidationError',
+        code: 'ERR_INVALID_OPTION',
+        message:
+          '`defaults.options.merge()` needs a client built with `mutableDefaults: true` - got ignores the ' +
+          'merge silently here, which leaves a refreshed token unused with nothing to say so',
+        responseStatus: undefined,
+        responseBody: undefined,
+      },
+      authorization: undefined,
+    },
+  },
+});
+
 /* ---------------------------------------------------------------------------- basic auth */
 
 parityTest('credentials in the url become Basic auth', {

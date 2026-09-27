@@ -70,6 +70,7 @@ Supports:
 - [x] Hooks *(arrays, instance-level only)*
 - [x] `afterResponse` retries via `retryWithMergedOptions`
 - [x] `context`
+- [x] `mutableDefaults` - `client.defaults.options.merge(...)`, for request-level options
 - [x] Retries *(partial, opt-in with a `retry` object - maps onto undici's `retry` interceptor; honours `Retry-After`)*
 - [x] `searchParams`, `form`
 - [x] Decompression - gzip, deflate, br, zstd, compress
@@ -104,6 +105,7 @@ Supports:
 | `response.url` | the final url | **same** - the last hop's url when redirects were followed, and the requested one otherwise. `options.url` stays the url that was *requested*, so a retry from a hook goes back through the redirect |
 | `options.context` | fresh `{}` per request | a **shared frozen** `{}` when unset - reads are safe, writes throw rather than leak. Pass a `context` to get a writable one |
 | `validate` | n/a | client-only, like the options above - it is read from the instance, so a per-request value would do nothing |
+| `mutableDefaults` / `defaults.options.merge()` | merges any option; on a client without `mutableDefaults` the merge **silently does nothing** | only what a request merges can be merged - `hooks`, `handlers`, `retry`, `agent` and the other create/extend-only options, a body, a `url`, `responseType` and `resolveBodyOnly` are a `ValidationError`, since the client consumed them when it was built. On a client without `mutableDefaults` the merge is a `ValidationError` too. Not inherited by `extend()`, as in got |
 | `parseUserinfo` | n/a | client-only, same reasoning as `validate`. Turns `user:pass@host` in a url into a Basic-auth header - on by default; turn it off if no url you pass ever carries credentials, to skip the scan (~300-400ns/request, measured) |
 | `followRedirect` | `true` | **`false`** - redirects cost ~2µs/request to support, whether or not one happens. Enable per client with `extend({ followRedirect: true })`; a per-request `true` is a `ValidationError`, since composing the interceptor is a create/extend-time decision |
 | `maxRedirects` | configurable | **fixed at 10**, got's own default. A chain longer than that is an `HTTPError` carrying the 3xx, as it is in got - not a success whose body is the redirect page |
@@ -237,6 +239,44 @@ gotlike.extend({ agent: new EnvHttpProxyAgent() });
 `agent` takes any undici `Dispatcher`, including one you write yourself. gotlike never looks
 inside it, and its own interceptor chain composes on top - so a new transport needs no changes
 here.
+
+## Mutable defaults
+
+got's `mutableDefaults`, for the token refresh that merges a new credential into the client from a
+hook so every later request carries it:
+
+```ts
+const api = gotlike.extend({
+  prefixUrl,
+  responseType: 'json',
+  mutableDefaults: true,
+  hooks: {
+    afterResponse: [async (response, retryWithMergedOptions) => {
+      if (response.statusCode === 401 && !response.request.options.context.skipAuthRefresh) {
+        const updated = { headers: { authorization: `Bearer ${await refresh()}` } };
+
+        api.defaults.options.merge(updated);
+
+        return retryWithMergedOptions(updated);
+      }
+
+      return response;
+    }],
+  },
+});
+```
+
+`merge()` uses `extend()`'s rules - headers case-insensitively, `context`, `timeout` and
+`searchParams` one level deep, the rest replaced - and costs nothing per request: it replaces what
+every request already reads. A request already in flight keeps the defaults it started with, and a
+client extended from this one *before* the merge keeps its own. `mutableDefaults` is not inherited
+by `extend()`; name it on the client you mean to merge into.
+
+Two differences from got, both so that a merge cannot silently do nothing. On a client built
+without `mutableDefaults` it is a `ValidationError` - got freezes the defaults and ignores the
+merge, so a refreshed token was retried once and then dropped. And only request-level options can
+be merged: `hooks`, `retry`, `agent` and the rest are built into the client when it is created, so
+they are `ValidationError`s here too - use `extend()`.
 
 ## Hooks
 
