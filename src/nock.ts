@@ -270,7 +270,7 @@ type PathMatcher = string | RegExp | ((path: string) => boolean);
  * matched anything - and because an unmatched interceptor falls through to the real network,
  * a test written that way quietly made a live outbound request.
  */
-type BodyMatcher = string | RegExp | Record<string, any> | unknown[] | ArrayBufferView | ((body: string) => boolean);
+type BodyMatcher = string | RegExp | Record<string, any> | unknown[] | ArrayBufferView | ((body: any) => boolean);
 
 /**
  * `true` matches any query string, an object matches those exact params.
@@ -479,6 +479,14 @@ function bodyValueMatches(expected: unknown, actual: unknown): boolean {
  * Strings, RegExps and functions are already shapes undici understands, so they pass through.
  */
 function toBodyMatcher(body?: BodyMatcher): string | RegExp | ((body: string) => boolean) | undefined {
+  // undici would hand a predicate the body as it arrived - a Buffer, or nothing at all - where
+  // nock hands it the parsed body. So `(body) => body.method === 'x'`, the most natural way to
+  // match one JSON-RPC call among several on the same path, read `undefined` and never matched.
+  if (typeof body === 'function') {
+    // Typed as undici types it; see the Buffer branch below for what actually arrives.
+    return (requestBody: string) => Boolean(body(predicateBody(requestBody as string | ArrayBufferView | undefined)));
+  }
+
   if (body === null || body === undefined || typeof body !== 'object' || body instanceof RegExp) {
     return body;
   }
@@ -512,6 +520,32 @@ function toBodyMatcher(body?: BodyMatcher): string | RegExp | ((body: string) =>
 
     return bodyValueMatches(body, parsed);
   };
+}
+
+/**
+ * The body a nock predicate is handed (`lib/match_body.js`): parsed as JSON if it parses, else the
+ * text itself - `''` for a request with no body.
+ *
+ * nock also parses an urlencoded body into an object when the content-type says it is one. That
+ * half is not done here: undici hands a body matcher the body alone, and it applies the matcher a
+ * second time after `dispatch()` has returned (`matchKey`, removing the consumed interceptor), so
+ * there is no moment the content-type could be read from that covers both calls. A predicate that
+ * answered differently on the two would match and then never be consumed. Pinned as a divergence
+ * in `nock-parity.spec.ts`.
+ */
+function predicateBody(requestBody: string | ArrayBufferView | undefined): unknown {
+  const text =
+    requestBody === undefined
+      ? ''
+      : typeof requestBody === 'string'
+        ? requestBody
+        : Buffer.from(requestBody.buffer, requestBody.byteOffset, requestBody.byteLength).toString('utf8');
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
 }
 
 /** Whether a reply body is one nock would label `application/json`. */

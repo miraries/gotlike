@@ -214,6 +214,60 @@ nockParityTest('a RegExp leaf in a body matcher tests the value', {
   }),
 });
 
+nockParityTest('a function body matcher is handed the parsed body', {
+  claim: 'nock JSON-parses the body before calling a predicate; the aggregator reads `body.method` off it.',
+  register: (nock, origin) => {
+    nock(origin)
+      .post('/p', (body: {method?: string}) => body?.method === 'games.list')
+      .reply(200, 'matched');
+    nock(origin)
+      .post('/q', (body: {method?: string}) => body?.method === 'games.list')
+      .reply(200, 'matched');
+  },
+  run: async (client, origin) => ({
+    hit: await captureMatch(() => client.post(`${origin}/p`, {json: {method: 'games.list'}, responseType: 'text'})),
+    miss: await captureMatch(() => client.post(`${origin}/q`, {json: {method: 'freebets.add'}, responseType: 'text'})),
+  }),
+});
+
+nockParityTest('a function body matcher is handed a non-JSON body as the raw string', {
+  claim: 'nock only substitutes the parsed body when it parses; anything else reaches the predicate as text.',
+  register: (nock, origin) => {
+    nock(origin)
+      .post('/p', (body: unknown) => body === 'plain text')
+      .reply(200, 'matched');
+  },
+  run: async (client, origin) =>
+    captureMatch(() => client.post(`${origin}/p`, {body: 'plain text', responseType: 'text'})),
+});
+
+nockParityTest('a function body matcher is handed a form body as text', {
+  claim: 'A predicate sees the parsed JSON body, or the text when it is not JSON.',
+  register: (nock, origin) => {
+    nock(origin)
+      .post('/p', (body: Record<string, unknown>) => body?.a === '1' && Array.isArray(body?.b))
+      .reply(200, 'matched');
+  },
+  run: async (client, origin) =>
+    captureMatch(() =>
+      client.post(`${origin}/p`, {
+        body: 'a=1&b=2&b=3',
+        headers: {'content-type': 'application/x-www-form-urlencoded'},
+        responseType: 'text',
+      }),
+    ),
+  divergence: {
+    reason:
+      'nock parses an urlencoded body into an object for a predicate when the content-type says it is ' +
+      'one; the shim hands it the text. undici gives a body matcher no headers, and applies it again after ' +
+      'dispatch() returns to consume the interceptor, so the content-type cannot be read for both calls - ' +
+      'and a predicate answering differently on the two would match and then never be consumed. Parse it ' +
+      'in the predicate (`new URLSearchParams(body)`), which works under both.',
+    nock: {matched: true, statusCode: 200, body: 'matched'},
+    shim: {matched: false},
+  },
+});
+
 /* ------------------------------------------------------------------------------- replying */
 
 nockParityTest('an object reply body is labelled application/json', {

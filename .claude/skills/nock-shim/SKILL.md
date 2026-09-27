@@ -100,6 +100,15 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   live outbound request. `toBodyMatcher` JSON-parses the request body and `bodyValueMatches` deep-compares it,
   with nock's leaf matchers (a RegExp tests the value, a function is asked about it) and nock's exactness (every
   field named, nothing besides).
+- **A function body matcher is handed the parsed body, not undici's.** undici passes the matcher the body as it
+  arrived - a `Buffer`, or `undefined` for none - so `(body) => body.method === 'x'`, the aggregator's way of telling
+  JSON-RPC calls on one path apart, never matched. `predicateBody` gives it what nock's `lib/match_body.js` does: the
+  JSON-parsed body if it parses, else the text, `''` for none. **Whatever it computes must not depend on the moment
+  of the call**: undici applies a body matcher once to find the interceptor inside `dispatch()` and again *after* it
+  returns (`matchKey`, from `deleteMockDispatch`) to consume it, so a predicate that answers differently the second
+  time matches and then stays pending forever. That is why nock's urlencoded case - parse a form body when the
+  content-type says so - is not reproduced: the headers never reach the matcher, and stashing the content-type
+  around `mockDispatch` (tried) only covers the first call. Pinned as a divergence in `nock-parity.spec.ts`.
 - **An object reply body is labelled `application/json`** (`replyOptions`). nock sets that header; undici's
   MockAgent serialises the body but sets no content-type at all, so anything under test that branches on the
   response's content-type behaved differently against the mock than against the real server — which is the one

@@ -4,6 +4,20 @@ All notable changes to this project are documented here. This project adheres to
 [semantic versioning](https://semver.org/spec/v2.0.0.html); while the major version is `0`, a
 minor bump is where breaking changes land.
 
+## Unreleased
+
+### Fixed
+
+- **A function body matcher is handed the parsed body, as nock hands it.** undici passes a body
+  matcher the body as it arrived - a `Buffer`, or nothing at all - so a predicate reading a field,
+  `nock(host).post('/rpc', (body) => body.method === 'games.list')`, read `undefined` and never
+  matched. Since an unmatched interceptor on a mocked origin fails closed, that surfaced as a mock
+  that looked right and a request that errored. The predicate now gets the body parsed as JSON when
+  it parses, and the text otherwise (`''` for no body), which is nock 14's `lib/match_body.js`.
+  nock's third case - an urlencoded body parsed into an object - is not reproduced and is pinned as a
+  divergence: undici gives a body matcher no headers and applies it a second time after dispatch
+  returns, so the content-type cannot be read consistently for both calls.
+
 ## 0.4.0 - 2026-09-27
 
 ### Security

@@ -64,7 +64,7 @@ than they look:
   would catch neither.
 
 The suite prints the full inventory when it finishes: **four request headers and ten behaviours**
-against got 16, and two against nock. It started at five and seven; what closed the gap was fixing what
+against got 16, and three against nock. It started at five and seven; what closed the gap was fixing what
 the suite found rather than recording it (the seventh behaviour is the stream-upload framing below,
 which arrived with the stream scenarios rather than from anything changing here, the eighth is the
 `form` nullish rule above, which arrived the way the rule says one should — as the recorded half of a fix,

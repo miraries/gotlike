@@ -384,7 +384,10 @@ individual scope, as they already do for two scopes on one string origin.
 
 Body matchers take a string, a RegExp, a predicate, or an object/array compared against the
 request body parsed as JSON (a RegExp or function as a leaf value matches that field), as nock's
-do. An object reply body is sent as `application/json`, again as nock sends it.
+do. A predicate is handed the body parsed as JSON when it parses and the text otherwise (`''` for
+no body), as nock hands it - except that nock also parses an urlencoded form body into an object,
+and the shim hands that over as text: parse it in the predicate with `new URLSearchParams(body)`,
+which works under both. An object reply body is sent as `application/json`, again as nock sends it.
 
 A client with its own dispatcher - `agent`, or any of `connections`, `keepAliveTimeout`,
 `http2` and the other agent options - is mocked too, as nock mocks every agent: a request to a

@@ -642,6 +642,55 @@ test('body matcher constrains matching', async () => {
 });
 
 /*
+ * nock JSON-parses the body before handing it to a predicate, and only falls back to the raw
+ * text when it doesn't parse. undici hands the matcher a Buffer (or nothing, for a bodyless
+ * request), so a predicate reading `body.method` - the aggregator's nolimit and operator
+ * mocks - saw `undefined` and never matched.
+ */
+test('a function body matcher is handed the parsed JSON body', async () => {
+  const scope = nock('http://mock.test')
+    .post('/fn-body', (body: {method?: string}) => body?.method === 'games.list')
+    .reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/fn-body', {json: {method: 'games.list'}});
+
+  assert.strictEqual(response.body, 'matched');
+  // undici applies the matcher again to consume the interceptor, after dispatch has returned -
+  // a predicate that answered differently there would match and stay pending.
+  assert.strictEqual(scope.isDone(), true);
+});
+
+test('a function body matcher is handed a non-JSON body as text', async () => {
+  let seen: unknown;
+  nock('http://mock.test')
+    .post('/fn-text', (body: unknown) => {
+      seen = body;
+
+      return true;
+    })
+    .reply(200, 'matched');
+
+  await client.post('http://mock.test/fn-text', {body: 'a=1&b=2'});
+
+  assert.strictEqual(seen, 'a=1&b=2');
+});
+
+test('a function body matcher is handed an empty string for a bodyless request', async () => {
+  let seen: unknown;
+  nock('http://mock.test')
+    .get('/fn-empty', (body: unknown) => {
+      seen = body;
+
+      return true;
+    })
+    .reply(200, 'matched');
+
+  await client.get('http://mock.test/fn-empty');
+
+  assert.strictEqual(seen, '');
+});
+
+/*
  * Exact means the field has to be *there*, not merely read back the same. `{a: undefined}`
  * matched a body of `{b: 'foo'}`: the key counts agreed, and `actual.a` was `undefined` for
  * the same reason any absent property is. An unmatched interceptor falls through to the real
