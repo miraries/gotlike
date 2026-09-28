@@ -712,13 +712,110 @@ test('a header requirement compares an array, a number and host as nock does', a
   assert.strictEqual(response.body, 'ok');
 });
 
-// Accepted and not applied: both fail closed, so a suite written with them still runs.
+// `filteringScope` is accepted and not applied - it fails closed, so a suite written with it still
+// runs. `allowUnmocked` is applied, and a matched request is still answered by the mock; the
+// fall-through itself is in `nock-default.spec.ts`, since it needs a real server.
 test('allowUnmocked and filteringScope are accepted', async () => {
   nock('http://mock.test', {allowUnmocked: true, filteringScope: () => true})
     .get('/lenient')
     .reply(200, 'ok');
 
   assert.strictEqual((await client.get('http://mock.test/lenient')).body, 'ok');
+});
+
+/*
+ * nock names its interceptors `METHOD proto://host:port/path`, and suites print or compare those
+ * names - `expect(nock.pendingMocks()).to.deep.equal([...])`. `pendingMocks()` returned undici's
+ * dispatch objects, and `nock.isDone()`/`activeMocks()` did not exist.
+ */
+test('pendingMocks, activeMocks and isDone answer with nock keys, optional interceptors aside', async () => {
+  const scope = nock('http://mock.test/v1')
+    .get('/users')
+    .reply(200, [])
+    .get(/orders\/\d+/)
+    .reply(200, {})
+    .post('/audit?source=test')
+    .optionally()
+    .reply(201)
+    .get('/health')
+    .times(2)
+    .reply(200, 'ok');
+
+  nock('https://secure.test').persist().get('/token').reply(200, 'token');
+
+  assert.deepStrictEqual(nock.pendingMocks(), [
+    'GET http://mock.test:80/v1/users',
+    'GET http://mock.test:80/v1//orders\\/\\d+/',
+    'GET http://mock.test:80/v1/health',
+    'GET https://secure.test:443/token',
+  ]);
+  assert.deepStrictEqual(scope.pendingMocks().length, 3, 'the scope answers for its own origin');
+  assert.strictEqual(nock.activeMocks().length, 5, 'the optional one is active, not pending');
+  assert.strictEqual(nock.isDone(), false);
+
+  await client.get('http://mock.test/v1/users');
+  await client.get('http://mock.test/v1/orders/7');
+  await client.get('http://mock.test/v1/health');
+  await client.get('https://secure.test/token');
+
+  // One of two `times` calls made: still pending. A persisted one, once called, is not.
+  assert.deepStrictEqual(nock.pendingMocks(), ['GET http://mock.test:80/v1/health']);
+
+  await client.get('http://mock.test/v1/health');
+
+  assert.deepStrictEqual(nock.pendingMocks(), []);
+  assert.strictEqual(nock.isDone(), true);
+  assert.strictEqual(scope.isDone(), true);
+  scope.done();
+  // The optional interceptor never ran, and the persisted one never runs out.
+  assert.deepStrictEqual(nock.activeMocks(), [
+    'POST http://mock.test:80/v1/audit',
+    'GET https://secure.test:443/token',
+  ]);
+  assert.throws(
+    () =>
+      nock('http://mock.test')
+        .get('/')
+        .optionally('yes' as never),
+    /argument should be a boolean/,
+  );
+});
+
+test('basicAuth and a scope matchHeader are required, including a scope matcher added later', async () => {
+  const scope = nock('http://mock.test').get('/late').reply(200, 'late');
+
+  // After the interceptor, as nock allows: its matchers are checked on every match.
+  scope.matchHeader('X-Api-Key', 'k1');
+  scope.get('/secured').basicAuth({user: 'user', pass: 'secret'}).reply(200, 'secured');
+
+  assertUnmatched(await failure(client.get('http://mock.test/late')), 'the scope matcher, added after');
+  assert.strictEqual((await client.get('http://mock.test/late', {headers: {'x-api-key': 'k1'}})).body, 'late');
+
+  assertUnmatched(
+    await failure(client.get('http://mock.test/secured', {headers: {'x-api-key': 'k1'}})),
+    'no credentials',
+  );
+  assertUnmatched(
+    await failure(
+      client.get('http://mock.test/secured', {headers: {'x-api-key': 'k1'}, username: 'user', password: 'wrong'}),
+    ),
+    'the wrong password',
+  );
+
+  const response = await client.get('http://mock.test/secured', {
+    headers: {'x-api-key': 'k1'},
+    username: 'user',
+    password: 'secret',
+  });
+
+  assert.strictEqual(response.body, 'secured');
+
+  // `pass` defaults to empty, as in nock.
+  nock('http://mock.test').get('/user-only').basicAuth({user: 'user'}).reply(200, 'user only');
+  assert.strictEqual(
+    (await client.get('http://mock.test/user-only', {headers: {authorization: `Basic ${btoa('user:')}`}})).body,
+    'user only',
+  );
 });
 
 /*
@@ -941,7 +1038,8 @@ test('done throws while the scope has interceptors left', async () => {
 
   scope.get('/expected').reply(200, 'ok');
 
-  assert.throws(() => scope.done(), /not all/i);
+  // nock's message, naming what is left.
+  assert.throws(() => scope.done(), /^Error: Mocks not yet satisfied:\nGET http:\/\/mock\.test:80\/expected$/);
 
   await client.get('http://mock.test/expected');
 
@@ -1217,29 +1315,49 @@ test('cleanAll clears a regex origin too', async () => {
 });
 
 /*
- * Scopes on one regex origin share an answer, exactly as two scopes on one string origin do:
- * a pending interceptor reports the origin it was registered under and nothing finer, so
- * `isDone()` can only answer for the origin. nock answers per scope. Documented rather than
- * fixed - the alternative is tracking every interceptor we hand to undici.
+ * Each scope answers for itself, as in nock - regex origin or string. A pending interceptor used to
+ * report only the origin it was registered under, so two scopes on one origin shared an answer and
+ * `mine.isDone()` stayed false until *theirs* was consumed too. Each scope now keeps the dispatches
+ * it registered.
  */
-test('isDone on a regex origin answers for the origin, not the scope', async () => {
-  const mine = nock(/answered\.test/)
-    .get('/mine')
-    .reply(200, 'mine');
-  const theirs = nock(/answered\.test/)
-    .get('/theirs')
-    .reply(200, 'theirs');
+test('isDone and pendingMocks answer per scope, on a regex origin or a string one', async () => {
+  for (const origin of [/answered\.test/, 'http://answered.test']) {
+    const mine = nock(origin).get('/mine').reply(200, 'mine');
+    const theirs = nock(origin).get('/theirs').reply(200, 'theirs');
 
-  assert.strictEqual(mine.isDone(), false, 'nothing has been consumed yet');
+    assert.strictEqual(mine.isDone(), false, 'nothing has been consumed yet');
 
-  await client.get('http://answered.test/mine');
+    await client.get('http://answered.test/mine');
 
-  assert.strictEqual(mine.isDone(), false, 'the other scope on this origin is still pending');
+    assert.strictEqual(mine.isDone(), true, 'the other scope on this origin does not count');
+    assert.strictEqual(theirs.isDone(), false);
+    assert.deepStrictEqual(theirs.pendingMocks().length, 1);
 
-  await client.get('http://answered.test/theirs');
+    await client.get('http://answered.test/theirs');
 
-  assert.strictEqual(mine.isDone(), true);
-  assert.strictEqual(theirs.isDone(), true);
+    assert.strictEqual(theirs.isDone(), true);
+    nock.cleanAll();
+  }
+});
+
+/*
+ * nock applies `persist()` to the interceptors already on the scope - `nock(host).get('/').reply(200)
+ * .persist()` is a common spelling - and the shim applied it only to ones added afterwards, so the
+ * interceptor answered once and the next request was a miss.
+ */
+test('persist after reply persists the interceptors already registered', async () => {
+  const scope = nock('http://mock.test').get('/again').reply(200, 'again').persist();
+
+  assert.strictEqual((await client.get('http://mock.test/again')).body, 'again');
+  assert.strictEqual((await client.get('http://mock.test/again')).body, 'again');
+  assert.deepStrictEqual(nock.activeMocks(), ['GET http://mock.test:80/again']);
+  assert.strictEqual(scope.isDone(), true, 'a persisted interceptor that ran is done');
+  assert.throws(() => scope.persist('yes' as never), /argument should be a boolean/);
+
+  // `persist(false)` turns it off again, for what is registered and what comes after.
+  scope.persist(false);
+  assert.strictEqual((await client.get('http://mock.test/again')).body, 'again');
+  assertUnmatched(await failure(client.get('http://mock.test/again')), 'no longer persisted');
 });
 
 // An unrelated origin's pending mocks must not be counted, regex or not.

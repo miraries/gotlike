@@ -1,11 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert';
+import dns from 'node:dns';
 import http from 'node:http';
+import https from 'node:https';
 import zlib from 'node:zlib';
 import {clearInterval} from 'node:timers';
 import {getEventListeners, once} from 'node:events';
 import {setTimeout as sleep} from 'node:timers/promises';
-import {Readable, Writable} from 'node:stream';
+import {PassThrough, Readable, Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
 import {text} from 'node:stream/consumers';
 import {randomUUID} from 'node:crypto';
@@ -25,7 +27,11 @@ import client, {
   MaxRedirectsError,
   ParseError,
   ReadError,
+  UploadError,
   RequestError,
+  type HttpsOptions,
+  type InitHook,
+  type ResponseLike,
   type RequestOptions,
   type Response as GotlikeResponse,
   type RetryWithMergedOptions,
@@ -1985,9 +1991,9 @@ test('an afterResponse retry with throwHttpErrors undefined still throws on an e
 /**
  * A got option this does not implement says so, rather than reading as a misspelling.
  *
- * got accepts `retry.calculateDelay`, `retry.noise` and `hooks.init`; gotlike refuses all three,
- * because silently ignoring them means a backoff tuning that never applies and an `init` hook
- * that never fires - the very thing the unknown-key check exists to stop. That makes it a
+ * got accepts `retry.calculateDelay`, `retry.noise` and `https.alpnProtocols`; gotlike refuses
+ * them, because silently ignoring them means a backoff tuning that never applies or a protocol
+ * list nobody offers - the very thing the unknown-key check exists to stop. That makes it a
  * behavioural divergence from got, so it is named as one in the message and in the README.
  */
 test('a got option gotlike does not implement is refused by name', async () => {
@@ -1997,7 +2003,7 @@ test('a got option gotlike does not implement is refused by name', async () => {
   const options: {label: string; value: unknown}[] = [
     {label: '`retry.calculateDelay` is not implemented', value: {retry: {calculateDelay: () => 0}}},
     {label: '`retry.noise` is not implemented', value: {retry: {noise: 100}}},
-    {label: '`hooks.init` is not implemented', value: {hooks: {init: [() => {}]}}},
+    {label: '`https.alpnProtocols` is not implemented', value: {https: {alpnProtocols: ['h2']}}},
     // got's per-phase timeouts, which a bare `request` check let through and then ignored.
     {label: '`timeout.response` is not implemented', value: {timeout: {response: 10_000}}},
     {label: '`timeout.connect` is not implemented', value: {timeout: {request: 5000, connect: 1000}}},
@@ -3948,6 +3954,88 @@ test('mutableDefaults lets defaults.options.merge change later requests', async 
   assert.strictEqual(mutable.defaults.mutableDefaults, true);
 });
 
+/**
+ * got's callers read settings back off `client.defaults.options` - to build a url from
+ * `prefixUrl`, or log a timeout. It held only `merge()`, so every read was a silent `undefined`.
+ */
+test('defaults.options reads the client options back, and a mutable client takes writes as merges', () => {
+  const params = new URLSearchParams('a=1');
+  const api = createClient({
+    prefixUrl: 'http://localhost:3000/api',
+    headers: {'X-Tenant': 'a'},
+    timeout: {request: 500},
+    searchParams: params,
+    mutableDefaults: true,
+  });
+  const options = api.defaults.options;
+
+  assert.strictEqual(options.prefixUrl, 'http://localhost:3000/api');
+  // What a request starts from: folded to lower case, with the accept-encoding it adds.
+  assert.deepStrictEqual({...options.headers}, {'x-tenant': 'a', 'accept-encoding': 'gzip, deflate, br, zstd'});
+  assert.deepStrictEqual({...options.timeout}, {request: 500});
+  assert.strictEqual(options.mutableDefaults, true);
+  assert.ok(options.searchParams instanceof URLSearchParams, 'a class instance is handed out as it is');
+  assert.strictEqual(options.searchParams.get('a'), params.get('a'));
+  assert.strictEqual(options.json, undefined);
+  assert.ok(!('json' in options));
+  assert.ok('prefixUrl' in options && 'merge' in options);
+  assert.ok(!Object.keys(options).includes('merge'));
+  // `context` is always there, as got's is, and non-enumerable, so it stays out of a logged object.
+  assert.ok(!Object.keys(options).includes('context') && !JSON.stringify(options).includes('context'));
+  assert.deepStrictEqual({...createClient().defaults.options.context}, {});
+  assert.strictEqual(options.timeout, options.timeout, 'the same view on every read');
+
+  options.merge({prefixUrl: 'http://localhost:3000/v2', headers: {authorization: 'Bearer b'}});
+
+  assert.strictEqual(options.prefixUrl, 'http://localhost:3000/v2');
+  assert.strictEqual(options.headers['authorization'], 'Bearer b');
+  assert.strictEqual(api.defaults.options, options);
+
+  // got's `mutableDefaults` also takes an assignment: each one is a `merge()` of that option.
+  options.prefixUrl = 'http://localhost:3000/v3';
+  options.headers['x-tenant'] = 'b';
+  delete options.headers['authorization'];
+  options.context = {tenant: 'b'};
+  options.context['region'] = 'eu';
+
+  assert.strictEqual(options.prefixUrl, 'http://localhost:3000/v3');
+  assert.strictEqual(options.headers['x-tenant'], 'b');
+  assert.ok(!('authorization' in options.headers));
+  assert.deepStrictEqual({...options.context}, {tenant: 'b', region: 'eu'});
+  // ...and so refused for what `merge()` refuses, with its reason.
+  assert.throws(
+    () => (options.followRedirect = true),
+    (err: Error) => err instanceof ValidationError && err.message.includes('use `extend()` instead'),
+  );
+  assert.throws(
+    () => Object.defineProperty(options, 'json', {value: {}}),
+    (err: Error) => err instanceof ValidationError && err.message.includes('read-only'),
+  );
+
+  // On a client without `mutableDefaults` every write is refused, nested or not.
+  const fixed = createClient({prefixUrl: 'http://localhost:3000', headers: {'x-a': '1'}, context: {a: 1}});
+  const writes: [string, (view: Record<string, any>) => void][] = [
+    ['assign', (view) => (view['prefixUrl'] = 'http://elsewhere')],
+    ['header', (view) => (view['headers']['x-a'] = '2')],
+    ['context', (view) => (view['context']['a'] = 2)],
+    ['delete', (view) => delete view['prefixUrl']],
+    ['nested array', (view) => (view['hooks'] = {})],
+  ];
+
+  for (const [label, write] of writes) {
+    assert.throws(
+      () => write(fixed.defaults.options),
+      (err: Error) => err instanceof ValidationError && err.message.includes('read-only'),
+      label,
+    );
+  }
+
+  assert.strictEqual(fixed.defaults.options.headers['x-a'], '1');
+  assert.deepStrictEqual({...fixed.defaults.options.context}, {a: 1});
+  assert.strictEqual(createClient().defaults.options.followRedirect, false);
+  assert.strictEqual(createClient().defaults.options.mutableDefaults, false);
+});
+
 test('a merge into the defaults from an afterResponse hook reaches every later request', async () => {
   let refreshes = 0;
   const api = createClient({
@@ -5561,6 +5649,72 @@ test('followRedirect true per request is rejected, false is allowed', async () =
   });
 
   assert.strictEqual(response.statusCode, 302);
+});
+
+/**
+ * got's `followRedirect` function is asked about each redirect before it is followed. It used to
+ * be accepted on a client and never called - and since only `true` turned redirects on, every
+ * redirect came back unfollowed whatever the function said.
+ */
+test('a followRedirect function is asked about each hop, and a declined redirect is the response', async () => {
+  const asked: [number, unknown, string, string][] = [];
+  const upToSecondHop = client.extend({
+    followRedirect: (redirect) => {
+      asked.push([redirect.statusCode, redirect.headers.location, redirect.url, String(redirect.requestUrl)]);
+
+      return redirect.url.endsWith('/redirect-chain');
+    },
+  });
+
+  const response = await upToSecondHop.get('http://localhost:3000/redirect-chain');
+
+  assert.deepStrictEqual(asked, [
+    [302, '/redirect-chain-2', 'http://localhost:3000/redirect-chain', 'http://localhost:3000/redirect-chain'],
+    [301, '/echo', 'http://localhost:3000/redirect-chain-2', 'http://localhost:3000/redirect-chain'],
+  ]);
+  // A success, as in got: the function chose this response.
+  assert.strictEqual(response.statusCode, 301);
+  assert.strictEqual(response.url, 'http://localhost:3000/redirect-chain-2');
+  assert.deepStrictEqual(response.redirectUrls.map(String), ['http://localhost:3000/redirect-chain-2']);
+
+  const following = client.extend({followRedirect: () => true, responseType: 'json'});
+  const followed = await following.get<{test: string}>('http://localhost:3000/redirect');
+
+  assert.deepStrictEqual(followed.body, {test: 'value'});
+
+  // Per request on a client that follows, as a narrowing: a function, or `false`.
+  const declined = await following.get('http://localhost:3000/redirect', {followRedirect: () => false});
+
+  assert.strictEqual(declined.statusCode, 302);
+
+  const stream = await client.extend({followRedirect: () => false}).stream('http://localhost:3000/redirect');
+  const head = await stream.response;
+
+  stream.resume();
+  assert.strictEqual(head.statusCode, 302);
+});
+
+test('a followRedirect function is refused where it cannot apply, and its throw fails the request', async () => {
+  await assert.rejects(
+    () => client.get('http://localhost:3000/redirect', {followRedirect: () => true}),
+    (err: Error) => err instanceof ValidationError && err.message.includes('creating or extending'),
+  );
+
+  assert.throws(
+    () => client.extend({followRedirect: 'yes' as unknown as boolean}),
+    (err: Error) => err instanceof ValidationError && err.message.includes('boolean or a function'),
+  );
+
+  const throwing = client.extend({
+    followRedirect: () => {
+      throw new Error('no redirects here');
+    },
+  });
+
+  await assert.rejects(
+    () => throwing.get('http://localhost:3000/redirect'),
+    (err: Error) => err instanceof RequestError && err.message === 'no redirects here',
+  );
 });
 
 test('a client without redirects composes no redirect interceptor', () => {
@@ -9160,6 +9314,31 @@ test('every failure path reports a RequestError or a ValidationError, never a ra
       'beforeError returns a non-Error',
       () => hooked({beforeError: [(() => 'nope') as never]}).get('http://localhost:3000/status?code=500'),
     ],
+    [
+      // Only on the call: `extend()` runs the hook on its own options too, as got does.
+      'init throws',
+      () =>
+        hooked({
+          init: [
+            (plain) => {
+              if ('fail' in plain) {
+                throw new Error('hook');
+              }
+            },
+          ],
+        }).get('http://localhost:3000/json', {fail: true} as RequestOptions),
+    ],
+    [
+      'a followRedirect function throws',
+      () =>
+        client
+          .extend({
+            followRedirect: () => {
+              throw new Error('predicate');
+            },
+          })
+          .get('http://localhost:3000/redirect'),
+    ],
     // Configuration mistakes, on both routes into `call()`.
     ['a bad option on the call', () => client.get('http://localhost:3000/json', {responseType: 'jsn' as never})],
     [
@@ -9339,3 +9518,328 @@ async function typeAssertions() {
 }
 
 void typeAssertions;
+
+/**
+ * got's `init` hook: it sees the options a call was handed before they are validated, which is
+ * what lets a client accept an option of its own. It was refused as not implemented.
+ */
+test('init hooks turn a made-up option into real ones before validation', async () => {
+  const seen: unknown[] = [];
+  const api = client.extend({
+    responseType: 'json',
+    hooks: {
+      init: [
+        (plain, options) => {
+          seen.push({...plain});
+
+          if ('tenant' in plain) {
+            options.context['tenant'] = plain['tenant'];
+            options.headers['x-tenant'] = String(plain['tenant']);
+            delete plain['tenant'];
+          }
+        },
+      ],
+    },
+  });
+  const call = {tenant: 'acme', context: {trace: 't1'}, headers: {'x-call': 'yes'}} as RequestOptions;
+
+  const response = await api.get<Record<string, string>>('http://localhost:3000/headers', call);
+
+  assert.strictEqual(response.body['x-tenant'], 'acme');
+  assert.strictEqual(response.body['x-call'], 'yes');
+  assert.deepStrictEqual(response.request.options.context, {trace: 't1', tenant: 'acme'});
+  assert.deepStrictEqual(
+    call,
+    {tenant: 'acme', context: {trace: 't1'}, headers: {'x-call': 'yes'}},
+    "the caller's object, and the objects inside it, are left alone",
+  );
+  // The streaming route forms its options the same way.
+  const stream = await api.stream('http://localhost:3000/headers', {tenant: 'b'} as RequestOptions);
+
+  assert.strictEqual(JSON.parse(await text(stream))['x-tenant'], 'b');
+  // Once for `extend()`'s own options, as got runs it, and once per call.
+  assert.strictEqual(seen.length, 3);
+
+  // Without the hook, the same call is the unknown option it always was.
+  await assert.rejects(
+    () => client.get('http://localhost:3000/headers', {tenant: 'acme'} as RequestOptions),
+    (err: Error) => err instanceof ValidationError && err.message.includes('Unknown option `tenant`'),
+  );
+});
+
+test('init hooks run on extend and createClient options, as got runs them on every merge', async () => {
+  const renaming: InitHook = (plain) => {
+    if ('followRedirects' in plain) {
+      plain.followRedirect = Boolean(plain['followRedirects']);
+      delete plain['followRedirects'];
+    }
+  };
+  const created = createClient({hooks: {init: [renaming]}, followRedirects: true} as RequestOptions);
+
+  assert.strictEqual(created.defaults.options.followRedirect, true, "the options' own hook");
+  assert.strictEqual(
+    created.extend({followRedirects: false} as RequestOptions).defaults.options.followRedirect,
+    false,
+    "the parent's hook, on the extension",
+  );
+  assert.strictEqual(
+    client.extend({hooks: {init: [renaming]}, followRedirects: true} as RequestOptions).defaults.options.followRedirect,
+    true,
+    "the extension's own hook",
+  );
+  await assert.rejects(
+    () => client.get('http://localhost:3000/json', {hooks: {init: [renaming]}}),
+    (err: Error) => err instanceof ValidationError,
+  );
+});
+
+/**
+ * got lets a `beforeRequest` hook answer the request itself - a cache, a stub - by returning a
+ * response. The return value was ignored and the request went out anyway. The url here refuses
+ * connections, so anything that reached the network would fail the test.
+ */
+test('a beforeRequest hook returning a response answers the request without sending it', async () => {
+  const later: string[] = [];
+  const cached = client.extend({
+    responseType: 'json',
+    hooks: {
+      beforeRequest: [
+        (options) =>
+          options.headers['x-miss'] === undefined
+            ? {statusCode: 200, headers: {'Content-Type': 'application/json'}, body: Buffer.from('{"cached":true}')}
+            : undefined,
+        () => {
+          later.push('skipped hook ran');
+        },
+      ],
+      afterResponse: [
+        (response) => {
+          later.push(`afterResponse ${response.statusCode}`);
+
+          return response;
+        },
+      ],
+    },
+  });
+
+  const response = await cached.get<{cached: boolean}>('http://127.0.0.1:1/');
+
+  assert.deepStrictEqual(response.body, {cached: true});
+  assert.strictEqual(response.headers['content-type'], 'application/json');
+  assert.deepStrictEqual(later, ['afterResponse 200'], 'the remaining beforeRequest hooks are skipped');
+
+  // Read by `responseType`, and judged by `throwHttpErrors`, like one from the wire.
+  const answering = (answer: ResponseLike) => client.extend({hooks: {beforeRequest: [() => answer]}});
+
+  assert.strictEqual((await answering({statusCode: 200, body: 'plain'}).get('http://127.0.0.1:1/')).body, 'plain');
+  assert.deepStrictEqual(
+    (await answering({statusCode: 200}).get('http://127.0.0.1:1/', {responseType: 'buffer'})).body,
+    Buffer.alloc(0),
+  );
+  await assert.rejects(
+    () => answering({statusCode: 503, body: 'down'}).get('http://127.0.0.1:1/'),
+    (err: Error) => err instanceof HTTPError && err.response?.body === 'down',
+  );
+  await assert.rejects(
+    () => answering({statusCode: 200, body: 'x'}).stream('http://127.0.0.1:1/'),
+    (err: Error) => err instanceof RequestError && err.message.includes('cannot answer a stream request'),
+  );
+});
+
+/** got reports a request body that fails part-way as an `UploadError`, on both of its APIs. */
+test('a body stream that fails is an UploadError on both paths', async () => {
+  const failingBody = (): [PassThrough, Error] => {
+    const body = new PassThrough();
+    const error = Object.assign(new Error('disk gone'), {code: 'EIO'});
+
+    body.write('partial');
+    setImmediate(() => body.destroy(error));
+
+    return [body, error];
+  };
+
+  const [promiseBody, promiseError] = failingBody();
+
+  await assert.rejects(
+    () => client.post('http://localhost:3000/echo', {body: promiseBody}),
+    (err: RequestError) =>
+      err instanceof UploadError &&
+      err.code === 'ERR_UPLOAD' &&
+      err.message === 'disk gone' &&
+      err.cause === promiseError,
+  );
+
+  const [streamBody, streamError] = failingBody();
+  const stream = await client.stream.post('http://localhost:3000/echo', {body: streamBody});
+
+  await assert.rejects(
+    () => text(stream),
+    (err: RequestError) => err instanceof UploadError && err.code === 'ERR_UPLOAD' && err.cause === streamError,
+  );
+});
+
+/** got's `parseJson`/`stringifyJson`, for a bigint-safe parser or a canonical serialiser. */
+test('parseJson and stringifyJson replace the JSON functions, on the client or per call', async () => {
+  const parsed: string[] = [];
+  const api = client.extend({
+    responseType: 'json',
+    parseJson: (raw) => {
+      parsed.push(raw);
+
+      return {parsed: JSON.parse(raw) as unknown};
+    },
+    stringifyJson: (object) => JSON.stringify(object, Object.keys(object as object).sort()),
+  });
+
+  const echoed = await api.post<{parsed: {body: string}}>('http://localhost:3000/echo', {json: {b: 2, a: 1}});
+
+  assert.strictEqual(echoed.body.parsed.body, '{"a":1,"b":2}', 'serialised by stringifyJson');
+  assert.strictEqual(parsed.length, 1);
+
+  // The `.json()` shortcut parses with it too, on a text client and with `resolveBodyOnly`.
+  const shortcut = await client.get('http://localhost:3000/json', {parseJson: () => 'mine'}).json();
+  const bodyOnly = await client
+    .get('http://localhost:3000/json', {parseJson: () => 'mine', resolveBodyOnly: true})
+    .json();
+
+  assert.deepStrictEqual([shortcut, bodyOnly], ['mine', 'mine']);
+
+  await assert.rejects(
+    () =>
+      client.get('http://localhost:3000/json', {
+        responseType: 'json',
+        parseJson: () => {
+          throw new SyntaxError('refused');
+        },
+      }),
+    (err: Error) => err instanceof ParseError && err.message.startsWith('refused'),
+  );
+  await assert.rejects(
+    () => client.get('http://localhost:3000/json', {parseJson: 'no' as never}),
+    (err: Error) => err instanceof ValidationError && err.message.includes('`parseJson` must be a function'),
+  );
+  await assert.rejects(
+    () => client.get('http://localhost:3000/json', {stringifyJson: 'no' as never}),
+    (err: Error) => err instanceof ValidationError && err.message.includes('`stringifyJson` must be a function'),
+  );
+});
+
+/*
+ * A self-signed certificate for `localhost`/127.0.0.1, valid until 2126, for the `https` tests
+ * below. Test-only: the key protects nothing.
+ */
+const tlsKey = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgrm1JOdM/Oph4VBY8
+/c7A2rxyeIYoyrIFry5GjXqbHO2hRANCAASeQFCEy2GXO2dmLsWFCNPTJe+O09qX
+Z/7P2bFYPFH4BRwlUPDWXA79ToBp+kPtm/IwVQcOZOWV9zzkNSi+lPHF
+-----END PRIVATE KEY-----
+`;
+const tlsCert = `-----BEGIN CERTIFICATE-----
+MIIBnDCCAUGgAwIBAgIUUu2owXWNCct2RXHZ3WDhBUWNmcEwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MDkyODE0MzAxNloYDzIxMjYwOTA0
+MTQzMDE2WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAASeQFCEy2GXO2dmLsWFCNPTJe+O09qXZ/7P2bFYPFH4BRwlUPDWXA79
+ToBp+kPtm/IwVQcOZOWV9zzkNSi+lPHFo28wbTAdBgNVHQ4EFgQU9Kg7O57XLTKJ
+dTpwvWHUe4EIWwMwHwYDVR0jBBgwFoAU9Kg7O57XLTKJdTpwvWHUe4EIWwMwGgYD
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZI
+zj0EAwIDSQAwRgIhALait8bieq01Z1ef/ZFO1bLa/Xrd2JnIRYY9t0QMYXv4AiEA
+gACtH3CR7ZPqDDg8wEWlO/NM8tPjb7k+PCRtEm52+2M=
+-----END CERTIFICATE-----
+`;
+
+async function withTlsServer(run: (url: string) => Promise<void>): Promise<void> {
+  const secure = https.createServer({key: tlsKey, cert: tlsCert}, (_req, res) => res.end('secure'));
+
+  secure.listen(0, '127.0.0.1');
+  await once(secure, 'listening');
+
+  try {
+    await run(`https://localhost:${(secure.address() as {port: number}).port}/`);
+  } finally {
+    secure.closeAllConnections();
+    secure.close();
+  }
+}
+
+/**
+ * got's `https` options - `rejectUnauthorized: false` above all - were an `Unknown option`, and the
+ * README's advice was to build an undici `Agent` with `connect` options by hand. They configure
+ * the client's dispatcher now, under got's names.
+ */
+test('https options configure the TLS connection under got names', async () => {
+  await withTlsServer(async (url) => {
+    await assert.rejects(
+      () => createClient().get(url),
+      (err: RequestError) => err instanceof RequestError && err.code === 'DEPTH_ZERO_SELF_SIGNED_CERT',
+    );
+
+    const insecure = createClient({https: {rejectUnauthorized: false}});
+
+    assert.strictEqual((await insecure.get(url)).body, 'secure');
+
+    const checked: string[] = [];
+    const trusting = createClient({
+      https: {
+        certificateAuthority: tlsCert,
+        checkServerIdentity: (host) => {
+          checked.push(host);
+
+          return undefined;
+        },
+      },
+    });
+
+    assert.strictEqual((await trusting.get(url)).body, 'secure');
+    assert.deepStrictEqual(checked, ['localhost']);
+
+    // Merged one level deep, as got merges it: the child keeps the parent's `ca`, and so does not
+    // need `rejectUnauthorized: false` to trust the server.
+    const pinned = createClient({https: {certificateAuthority: tlsCert}}).extend({https: {minVersion: 'TLSv1.2'}});
+
+    assert.strictEqual((await pinned.get(url)).body, 'secure');
+    assert.deepStrictEqual({...pinned.defaults.options.https}, {certificateAuthority: tlsCert, minVersion: 'TLSv1.2'});
+
+    // Alongside `dnsLookup`, which is the other half of the same `connect` options.
+    const looked: string[] = [];
+    const resolving = createClient({
+      https: {rejectUnauthorized: false},
+      dnsLookup: ((hostname: string, options: dns.LookupOptions, callback: never) => {
+        looked.push(hostname);
+        dns.lookup(hostname, options, callback);
+      }) as typeof dns.lookup,
+    });
+
+    assert.strictEqual((await resolving.get(url)).body, 'secure');
+    assert.deepStrictEqual(looked, ['localhost']);
+  });
+});
+
+test('https options are refused where they cannot apply', async () => {
+  await assert.rejects(
+    () => client.get('https://localhost/', {https: {rejectUnauthorized: false}}),
+    (err: Error) => err instanceof ValidationError && err.message.includes('only be set when creating or extending'),
+  );
+
+  const refusals: [string, RequestOptions, RegExp][] = [
+    ['with an explicit agent', {agent: new Agent(), https: {rejectUnauthorized: false}}, /cannot be combined/],
+    ['not an object', {https: true as unknown as HttpsOptions}, /must be an object/],
+    [
+      'a misspelled key',
+      {https: {rejectUnauthorised: false} as HttpsOptions},
+      /Unknown option `https.rejectUnauthorised`/,
+    ],
+    [
+      'alpnProtocols',
+      {https: {alpnProtocols: ['h2']} as HttpsOptions},
+      /not implemented by gotlike - undici negotiates/,
+    ],
+  ];
+
+  for (const [label, options, message] of refusals) {
+    assert.throws(
+      () => createClient(options),
+      (err: Error) => err instanceof ValidationError && message.test(err.message),
+      label,
+    );
+  }
+});

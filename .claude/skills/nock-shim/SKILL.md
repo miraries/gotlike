@@ -37,10 +37,19 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   network instead of failing closed — a live outbound request, silently, which is the one thing owning an origin
   exists to prevent. Covered in `nock-default.spec.ts`, since `nock.spec.ts` calls `disableNetConnect()` up front
   and so can never see a fall-through at all.
-- **Two scopes on one origin share an `isDone()` answer**, regex or string: a pending interceptor reports the
-  origin it was registered under and nothing finer. nock answers per scope. So does the shim's limit on
-  *different* patterns matching one host — undici consults only the first — both documented in the README rather
-  than worked around.
+- **Each scope answers `isDone()`/`pendingMocks()`/`activeMocks()` for itself**, as nock's do. undici's pending
+  list reports only the origin a dispatch was registered under, so two scopes on one origin used to share an
+  answer. Every scope now keeps the dispatch objects it registered (`scopeDispatches`, filled in
+  `#applyScopeOptions`, which finds the new one as its pool's last); one `cleanAll()` removed is recognised by no
+  longer being in its pool. The same list is how **`persist()` reaches interceptors already registered** - it sets
+  undici's own `persist` flag on them, as `MockScope.persist()` does - since `.reply(200).persist()` is a common
+  nock spelling and used to answer once. The shim's limit on *different* patterns matching one host (undici
+  consults only the first) is still documented in the README rather than worked around.
+- **`pendingMocks()`/`activeMocks()` are nock's strings** (`GET http://host:80/base/path`, built by
+  `Interceptor#key` from the scope's `keyPrefix`), stored on undici's dispatch under a symbol, which survives the
+  spread `pendingInterceptors()` copies it with. `optionally()` is a second symbol, which `pendingDispatches`
+  leaves out. Both are read from each pool's own list rather than `pendingInterceptors()`, which repeats a regex
+  origin's dispatches once per concrete origin undici derived from it.
 - **`enableNetConnect()`/`disableNetConnect()` only govern *unmocked* hosts.** An origin with a scope fails closed
   on a miss whatever they say, as in nock. Both used to switch the per-origin check off for the rest of the
   process, so after the ordinary teardown `nock.enableNetConnect()` a typo'd path on a mocked host became a live
@@ -114,9 +123,17 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   would refuse. `scopeHeaders` turns them into header matchers undici already knows how to apply:
   `reqheaders` as they are (an interceptor's own win), `badheaders` as a function that requires the value
   `undefined` (undici hands a function matcher the absent header as `undefined`), and `conditionally` as a
-  function on a header name no request carries. `allowUnmocked` and `filteringScope` are accepted and not
-  applied - both fail *closed* that way (a miss is refused, not passed through; a scope matches only its own
-  host). Throwing on them was tried and broke suites that only ever made matching requests.
+  function on a header name no request carries. `filteringScope` is accepted and not applied - it fails
+  *closed* (a scope matches only its own host); throwing on it was tried and broke suites that only ever made
+  matching requests.
+- **`allowUnmocked` is recorded on the origin** (`PoolEntry.allowUnmocked`, set if *any* scope on it asked -
+  nock's `interceptors.some(...)`), and `mockedOrigin` reports such an origin `'open'`, so the dispatch wrapper
+  leaves MockAgent's net connect on and undici passes a miss through to the network - whatever
+  `disableNetConnect()` says, as in nock, since the host has a scope. A regex entry survives `cleanAll()`, so the
+  flag is reset there explicitly.
+- **Header requirements reach undici as one function** (`Interceptor#headerMatcher`), evaluated at match time
+  over the scope's matchers and the interceptor's own, so a `scope.matchHeader()` added after `reply()` still
+  applies, as in nock. `.basicAuth()` is a `matchHeader('authorization', 'Basic ...')`.
 - **Header matchers compare as nock's do** (`headerMatchers`, every one wrapped in a function before undici sees
   it). undici runs `re.test(value)` whether or not the header was sent and `/./.test(undefined)` is `true`, so
   `.matchHeader('x-key', /./)` matched a request with no `x-key` at all; a string or RegExp now only matches a
@@ -149,8 +166,7 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   to parse as json.
 - **`responseOptions` must always be an object**, never `undefined`, or undici throws `UND_ERR_INVALID_ARG`.
 - **`persist()`, `done()` and `isDone()` live on the `Scope`**, which is where nock's docs put them —
-  `nock(host).persist().get('/')` and `scope.done()`. `isDone()` filters `pendingInterceptors()` by the scope's
-  origin; it used to ask about every origin at once, so an unrelated scope's pending mock made it answer `false`.
+  `nock(host).persist().get('/')` and `scope.done()`. `done()` throws nock's `Mocks not yet satisfied:` message.
 - **Reply callbacks** are translated from undici's `(opts) => {statusCode, data, responseOptions}` to nock's
   `function (uri, requestBody) => [status, body, headers]` with `this.req.headers`. `uri` is the request's
   **whole** path — base path and query included, as nock 14 passes it; it used to be stripped of the scope's base

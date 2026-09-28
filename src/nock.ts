@@ -61,7 +61,13 @@ type Origin = string | RegExp;
  * interceptor falls through to the real network. Real nock matches both; measured against
  * nock 14.
  */
-const pools = new Map<string, {pool: Interceptable; origin: Origin; active: boolean}>();
+const pools = new Map<string, PoolEntry>();
+
+/**
+ * One mocked origin. `allowUnmocked` is set by any scope on it that asked, as nock decides it -
+ * `interceptors.some(i => i.options.allowUnmocked)` - and lets a miss through to the network.
+ */
+type PoolEntry = {pool: Interceptable; origin: Origin; active: boolean; allowUnmocked: boolean};
 
 function poolKey(origin: Origin): string {
   // The pattern, not the object: `\u0000` can appear in neither half, so no two distinct
@@ -78,27 +84,40 @@ function poolKey(origin: Origin): string {
  * pass-through behaviour.
  */
 function hasMockedOrigin(requestOrigin: string): boolean {
-  for (const {origin, active} of pools.values()) {
+  return mockedOrigin(requestOrigin) !== undefined;
+}
+
+/**
+ * How a mocked origin treats a miss: `'closed'` refuses it, `'open'` lets it through to the real
+ * network because a scope on it set `allowUnmocked`. `undefined` for an origin nothing mocks.
+ */
+function mockedOrigin(requestOrigin: string): 'open' | 'closed' | undefined {
+  let found: 'open' | 'closed' | undefined;
+
+  for (const {origin, active, allowUnmocked} of pools.values()) {
     if (!active) {
       continue;
     }
 
-    if (typeof origin === 'string') {
-      if (new URL(origin).origin === requestOrigin) {
-        return true;
-      }
+    let matches: boolean;
 
-      continue;
+    if (typeof origin === 'string') {
+      matches = new URL(origin).origin === requestOrigin;
+    } else {
+      origin.lastIndex = 0;
+      matches = origin.test(requestOrigin);
     }
 
-    origin.lastIndex = 0;
+    if (matches) {
+      if (allowUnmocked) {
+        return 'open';
+      }
 
-    if (origin.test(requestOrigin)) {
-      return true;
+      found = 'closed';
     }
   }
 
-  return false;
+  return found;
 }
 
 type NetConnectMatcher = string | RegExp | ((host: string) => boolean);
@@ -140,7 +159,10 @@ const mockDispatch = mockAgent.dispatch.bind(mockAgent);
 
 mockAgent.dispatch = (options, handler) => {
   const origin = String(options.origin);
-  const open = !hasMockedOrigin(origin) && netConnectAllows(origin);
+  const owned = mockedOrigin(origin);
+  // A mocked origin fails closed on a miss, unless a scope on it allowed unmocked requests -
+  // nock lets those through whatever `disableNetConnect()` says, since the host has a scope.
+  const open = owned === undefined ? netConnectAllows(origin) : owned === 'open';
 
   if (appliedNetConnect !== open) {
     if (open) {
@@ -367,7 +389,7 @@ export type Options = {
 
 /** `nock(host, options)` - the scope-wide options the shim supports. See `scopeHeaders`. */
 export type ScopeOptions = Options & {
-  /** Accepted, not applied: an unmatched request is refused rather than passed through. */
+  /** A request to this host that no interceptor matches goes to the real network, as in nock. */
   allowUnmocked?: boolean;
   /** Accepted, not applied: the scope matches only its own host. */
   filteringScope?: (scope: string) => boolean;
@@ -1031,6 +1053,30 @@ function searchParamsToObject(query: URLSearchParams): Record<string, string | s
   return object;
 }
 
+/**
+ * Marks on undici's dispatch objects. Symbols survive the spread `pendingInterceptors()` copies
+ * them with, and undici never reads them.
+ */
+const nockKey = Symbol('gotlike.nock.key');
+const optionalMark = Symbol('gotlike.nock.optional');
+
+type MarkedDispatch = {
+  method?: string;
+  path?: unknown;
+  pending?: boolean;
+  consumed?: boolean;
+  persist?: boolean;
+  [nockKey]?: string;
+  [optionalMark]?: boolean;
+};
+
+/**
+ * The dispatches each scope registered, so a scope answers `isDone()`/`pendingMocks()` for itself
+ * - nock does - rather than for every scope on its origin, and `persist()` reaches the interceptors
+ * already added. A dispatch `cleanAll()` removed is recognised by no longer being in its pool.
+ */
+const scopeDispatches = new WeakMap<Scope, MarkedDispatch[]>();
+
 class Interceptor {
   #scope: Scope;
   #pool: Interceptable;
@@ -1039,7 +1085,12 @@ class Interceptor {
   #path: PathMatcher;
   #body?: BodyMatcher;
   #headers: Record<string, HeaderMatcher>;
+  /** The scope's own matchers, read when the interceptor is registered - see `Scope#matchHeader`. */
+  #scopeHeaders: Record<string, HeaderMatcher>;
+  /** nock's `METHOD proto://host:port/base` - see `mockKey`. */
+  #keyPrefix: string;
   #query?: QueryMatcher;
+  #optional = false;
 
   /** Recorded before `reply()`, applied to the undici MockScope it produces. */
   #times?: number;
@@ -1052,8 +1103,10 @@ class Interceptor {
     basePath: string,
     method: string,
     path: PathMatcher,
-    body?: BodyMatcher,
-    options?: Options,
+    body: BodyMatcher | undefined,
+    options: Options | undefined,
+    headersOfScope: Record<string, HeaderMatcher>,
+    keyPrefix: string,
   ) {
     this.#scope = scope;
     this.#pool = pool;
@@ -1062,6 +1115,8 @@ class Interceptor {
     this.#path = path;
     this.#body = body;
     this.#headers = {...options?.reqheaders};
+    this.#scopeHeaders = headersOfScope;
+    this.#keyPrefix = keyPrefix;
   }
 
   /**
@@ -1076,6 +1131,24 @@ class Interceptor {
 
   matchHeader(name: string, value: HeaderMatcher): this {
     this.#headers[name] = value;
+
+    return this;
+  }
+
+  /** nock's: requires `authorization: Basic <user:pass>`. */
+  basicAuth({user, pass = ''}: {user: string; pass?: string}): this {
+    return this.matchHeader('authorization', `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`);
+  }
+
+  /**
+   * nock's: the interceptor still matches, but `isDone()` and `pendingMocks()` do not wait for it.
+   */
+  optionally(flag = true): this {
+    if (typeof flag !== 'boolean') {
+      throw new TypeError('Invalid arguments: argument should be a boolean');
+    }
+
+    this.#optional = flag;
 
     return this;
   }
@@ -1137,7 +1210,7 @@ class Interceptor {
       method: this.#method,
       path: buildPathMatcher(this.#basePath, path, ignoreQuery, undiciAppliesQuery ? undefined : query),
       body: toBodyMatcher(this.#body),
-      headers: Object.keys(this.#headers).length > 0 ? headerMatchers(this.#headers) : undefined,
+      headers: this.#headerMatcher(),
     };
 
     if (query && undiciAppliesQuery) {
@@ -1149,7 +1222,36 @@ class Interceptor {
     return this.#pool.intercept(options);
   }
 
+  /**
+   * The header requirements as one function undici asks at match time, not a record fixed when
+   * the interceptor is registered: nock checks a scope's `matchHeader()` on every match, so one
+   * added after `reply()` still applies. undici hands it the headers with lower-cased names.
+   */
+  #headerMatcher(): (sent: Record<string, string | string[] | undefined>) => boolean {
+    const own = this.#headers;
+    const scope = this.#scopeHeaders;
+
+    return (sent) =>
+      Object.entries(headerMatchers({...scope, ...own})).every(([name, match]) =>
+        (match as (value: unknown) => boolean)(sent[name.toLowerCase()]),
+      );
+  }
+
   #applyScopeOptions(mockScope: {times(n: number): any; persist(): any}): Scope {
+    // The dispatch `reply()` just added is the pool's last. Marked with nock's key for
+    // `pendingMocks()`, and as optional when it is.
+    const added = dispatchesOf(this.#pool)?.at(-1) as MarkedDispatch | undefined;
+
+    if (added !== undefined) {
+      added[nockKey] = this.#key();
+
+      if (this.#optional) {
+        added[optionalMark] = true;
+      }
+
+      scopeDispatches.get(this.#scope)?.push(added);
+    }
+
     if (this.#times !== undefined) {
       mockScope.times(this.#times);
     }
@@ -1163,6 +1265,18 @@ class Interceptor {
     // themselves instead - see `pendingDelayTimers`.
 
     return this.#scope;
+  }
+
+  /**
+   * nock's name for the interceptor (`lib/interceptor.js`): the method, the scope's origin with its
+   * port, the base path, and the path - a literal query left off, a RegExp or function path after
+   * a `/`.
+   */
+  #key(): string {
+    const path = this.#path;
+    const tail = typeof path === 'string' ? path.split('?')[0] : `/${String(path)}`;
+
+    return `${this.#method} ${this.#keyPrefix}${this.#basePath}${tail}`;
   }
 
   #context(opts: {method?: string; path: string; headers?: Record<string, string>}): ReplyContext {
@@ -1263,6 +1377,9 @@ class Scope {
   #basePath: string;
   #origin: Origin;
   #poolKey: string;
+  #allowUnmocked: boolean;
+  /** nock's `proto://host:port` for the origin, the start of every interceptor's key. */
+  #keyPrefix: string;
 
   /** Set by `persist()`, and inherited by every interceptor registered after it. */
   #persist = false;
@@ -1270,15 +1387,19 @@ class Scope {
   /** Header matchers from the scope's options, under every interceptor's own - see `scopeHeaders`. */
   #headers: Record<string, HeaderMatcher>;
 
-  constructor(origin: Origin, basePath: string, headers: Record<string, HeaderMatcher> = {}) {
+  constructor(origin: Origin, basePath: string, headers: Record<string, HeaderMatcher> = {}, allowUnmocked = false) {
     this.#headers = headers;
+    this.#allowUnmocked = allowUnmocked;
+    scopeDispatches.set(this, []);
+    this.#keyPrefix = keyPrefixOf(origin);
     const key = poolKey(origin);
     let entry = pools.get(key);
 
     if (entry) {
       entry.active = true;
+      entry.allowUnmocked ||= allowUnmocked;
     } else {
-      entry = {pool: mockAgent.get(origin as string), origin, active: true};
+      entry = {pool: mockAgent.get(origin as string), origin, active: true, allowUnmocked};
       pools.set(key, entry);
     }
 
@@ -1297,6 +1418,7 @@ class Scope {
 
     if (entry) {
       entry.active = true;
+      entry.allowUnmocked ||= this.#allowUnmocked;
     } else {
       /*
        * Put back, not skipped. `cleanAll()` drops string origins from the map, so a Scope
@@ -1306,13 +1428,26 @@ class Scope {
        * those interceptors then fell through to the real network instead of failing closed,
        * which is the one thing this shim owns an origin to prevent, and it did so silently.
        */
-      pools.set(this.#poolKey, {pool: this.#pool, origin: this.#origin, active: true});
+      pools.set(this.#poolKey, {
+        pool: this.#pool,
+        origin: this.#origin,
+        active: true,
+        allowUnmocked: this.#allowUnmocked,
+      });
     }
 
-    const interceptor = new Interceptor(this, this.#pool, this.#basePath, method, path, body, {
-      ...options,
-      reqheaders: {...this.#headers, ...options?.reqheaders},
-    });
+    // The scope's matchers by reference, so one added by `matchHeader()` afterwards still applies.
+    const interceptor = new Interceptor(
+      this,
+      this.#pool,
+      this.#basePath,
+      method,
+      path,
+      body,
+      options,
+      this.#headers,
+      this.#keyPrefix,
+    );
 
     return this.#persist ? interceptor.persist() : interceptor;
   }
@@ -1320,9 +1455,40 @@ class Scope {
   /**
    * Replay every interceptor on this scope indefinitely. nock's own docs put `persist()` on the
    * scope - `nock(host).persist().get('/')` - so the per-interceptor form alone isn't enough.
+   *
+   * Including the ones already registered, as in nock: `nock(host).get('/').reply(200).persist()`
+   * is as common a spelling, and it used to leave that interceptor answering once.
    */
-  persist(): this {
-    this.#persist = true;
+  persist(flag = true): this {
+    if (typeof flag !== 'boolean') {
+      throw new TypeError('Invalid arguments: argument should be a boolean');
+    }
+
+    this.#persist = flag;
+
+    for (const dispatch of this.#live()) {
+      dispatch.persist = flag;
+    }
+
+    return this;
+  }
+
+  /** This scope's dispatches still in their pool. */
+  #live(): MarkedDispatch[] {
+    const pool = dispatchesOf(this.#pool);
+
+    // Only if undici moved its list (see `dispatchesOf`): the origin's, as it answered before scopes
+    // tracked their own. Copies, so `persist()` cannot reach them either.
+    if (pool === undefined) {
+      return liveDispatches().filter((dispatch) => (dispatch as {origin?: Origin}).origin === this.#origin);
+    }
+
+    return (scopeDispatches.get(this) ?? []).filter((dispatch) => pool.includes(dispatch));
+  }
+
+  /** nock's: every interceptor on the scope requires this header - including ones already added. */
+  matchHeader(name: string, value: HeaderMatcher): this {
+    this.#headers[name.toLowerCase()] = value;
 
     return this;
   }
@@ -1368,14 +1534,26 @@ class Scope {
    * reports its origin, and its path may be a function, so there is nothing finer to filter on.
    */
   isDone(): boolean {
-    return !mockAgent.pendingInterceptors().some((interceptor) => interceptor.origin === this.#origin);
+    return this.pendingMocks().length === 0;
   }
 
-  /** nock's assertion form of `isDone()`. */
+  /** nock's assertion form of `isDone()`, with nock's message. */
   done(): void {
-    if (!this.isDone()) {
-      throw new Error(`Mocks for ${this.#origin} are not all done`);
+    const pending = this.pendingMocks();
+
+    if (pending.length > 0) {
+      throw new Error(`Mocks not yet satisfied:\n${pending.join('\n')}`);
     }
+  }
+
+  /** nock's: the keys of this scope's interceptors not used up yet, optional and persisted included. */
+  activeMocks(): string[] {
+    return this.#live().map(mockKey);
+  }
+
+  /** nock's: the keys of this scope's interceptors still waiting to be called - see `pendingMocks`. */
+  pendingMocks(): string[] {
+    return this.#live().filter(isPending).map(mockKey);
   }
 }
 
@@ -1412,9 +1590,9 @@ function trimTrailingSlash(path: string): string {
 /**
  * nock's scope options, as the header matchers every interceptor on the scope inherits.
  *
- * `allowUnmocked` and `filteringScope` are accepted and not applied. Both fail *closed* that way -
- * an unmatched request is refused rather than passed through, a scope matches only its own host -
- * so a suite written against them still runs; it is recorded as a gap in `conformance/`.
+ * `filteringScope` is accepted and not applied. It fails *closed* that way - a scope matches only
+ * its own host - so a suite written against it still runs. `allowUnmocked` is not a header matter:
+ * `nock()` hands it to the `Scope`, which records it on the origin (`PoolEntry`).
  *
  * `nock(host, options)` used to drop its second argument, and three of these fail *open* when
  * dropped: without `reqheaders`, `badheaders` or `conditionally` an interceptor matched requests
@@ -1449,7 +1627,52 @@ const conditionallyHeader = 'x-gotlike-nock-conditionally\u0000';
 function nock(basePath: string | RegExp | Url | URL, options?: ScopeOptions): Scope {
   const {origin, path} = splitOrigin(basePath);
 
-  return new Scope(origin, path, scopeHeaders(options));
+  return new Scope(origin, path, scopeHeaders(options), options?.allowUnmocked === true);
+}
+
+/** nock's `basePath` for a scope: `proto://host:port` with the port filled in, or the RegExp. */
+function keyPrefixOf(origin: Origin): string {
+  if (typeof origin !== 'string') {
+    return String(origin);
+  }
+
+  const url = new URL(origin);
+  const port = url.port === '' ? (url.protocol === 'http:' ? '80' : '443') : url.port;
+
+  return `${url.protocol}//${url.hostname}:${port}`;
+}
+
+/**
+ * The dispatches still waiting to be called, optional ones aside - nock's `pendingMocks()` set.
+ * Read from each pool's own list rather than `mockAgent.pendingInterceptors()`, which lists a
+ * regex origin's once more for every concrete origin undici derived from it.
+ */
+function pendingDispatches(): MarkedDispatch[] {
+  return liveDispatches().filter(isPending);
+}
+
+function isPending(dispatch: MarkedDispatch): boolean {
+  return dispatch.pending === true && dispatch[optionalMark] !== true;
+}
+
+/** Every dispatch not used up yet - nock's `activeMocks()` set. */
+function liveDispatches(): MarkedDispatch[] {
+  const found: MarkedDispatch[] = [];
+
+  for (const {pool, origin} of pools.values()) {
+    // Only if undici moved its list (see `dispatchesOf`): its pending list, copies with an `origin`.
+    const dispatches: MarkedDispatch[] =
+      (dispatchesOf(pool) as MarkedDispatch[] | undefined) ??
+      (mockAgent.pendingInterceptors().filter((dispatch) => dispatch.origin === origin) as MarkedDispatch[]);
+
+    found.push(...dispatches.filter((dispatch) => dispatch.consumed !== true));
+  }
+
+  return found;
+}
+
+function mockKey(dispatch: MarkedDispatch): string {
+  return dispatch[nockKey] ?? `${dispatch.method} ${String(dispatch.path)}`;
 }
 
 Object.assign(nock, {
@@ -1487,8 +1710,17 @@ Object.assign(nock, {
             ? {test: host}
             : true;
   },
+  /** nock's: `METHOD proto://host:port/path` for every interceptor still waiting to be called. */
   pendingMocks() {
-    return mockAgent.pendingInterceptors();
+    return pendingDispatches().map(mockKey);
+  },
+  /** nock's: the same for every interceptor not used up yet, optional and persisted ones included. */
+  activeMocks() {
+    return liveDispatches().map(mockKey);
+  },
+  /** nock's: whether every interceptor, on every scope, has been called. */
+  isDone() {
+    return pendingDispatches().length === 0;
   },
   /** Drop every interceptor registered so far, on every origin. */
   cleanAll() {
@@ -1512,6 +1744,7 @@ Object.assign(nock, {
         pools.delete(key);
       } else {
         entry.active = false;
+        entry.allowUnmocked = false;
       }
     }
   },
@@ -1538,7 +1771,9 @@ type NockApi = typeof nock & {
   isActive(): boolean;
   disableNetConnect(): void;
   enableNetConnect(host?: string | RegExp | ((host: string) => boolean)): void;
-  pendingMocks(): ReturnType<MockAgent['pendingInterceptors']>;
+  pendingMocks(): string[];
+  activeMocks(): string[];
+  isDone(): boolean;
   cleanAll(): void;
   abortPendingRequests(): void;
 };

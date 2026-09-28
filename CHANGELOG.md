@@ -4,6 +4,47 @@ All notable changes to this project are documented here. This project adheres to
 [semantic versioning](https://semver.org/spec/v2.0.0.html); while the major version is `0`, a
 minor bump is where breaking changes land.
 
+## Unreleased
+
+### Added
+
+- **`https` TLS options under got's names** - `rejectUnauthorized`, `certificateAuthority`, `key`,
+  `certificate`, `passphrase`, `pfx`, `checkServerIdentity`, `serverName`, `ciphers`, `minVersion`,
+  and the rest of got's list. They configure the client's dispatcher, so they are create/extend only;
+  `extend()` merges them one level deep. `https.alpnProtocols` is refused by name: undici negotiates
+  ALPN itself.
+- **`followRedirect` as a function**, asked about each redirect with its status, headers and url. A
+  `false` makes the redirect the response, a success rather than an `HTTPError`, as in got. It used
+  to be accepted and never called, and no redirect was followed at all.
+- **`client.defaults.options` reads the client's options back** - `prefixUrl`, `headers`, `timeout`,
+  ... - live, so a `merge()` shows up. It held only `merge()`, so every read was a silent
+  `undefined`. Writing through it is a `ValidationError`.
+- **`hooks.init`**, as got calls it: on a copy of each call's options before they are validated, and
+  on `extend()`'s, so a client can accept an option of its own.
+- **A `beforeRequest` hook can answer the request** by returning `{statusCode, headers, body}`; the
+  body is parsed by `responseType` and the `afterResponse` hooks and `throwHttpErrors` apply.
+- **`parseJson` / `stringifyJson`**, used for `json` bodies, `json` responses and `.json()`.
+- **`UploadError`** (`ERR_UPLOAD`) for a `body` stream that errors while it is sent.
+- **nock shim**: `allowUnmocked` (a miss on that host goes to the real server), `nock.isDone()`,
+  `nock.activeMocks()`, `scope.pendingMocks()`/`activeMocks()`, `.optionally()`, `.basicAuth()`,
+  `scope.matchHeader()`, which also applies to interceptors added before it, and `persist(false)`.
+- **Assigning through `client.defaults.options` on a `mutableDefaults` client** -
+  `client.defaults.options.headers.authorization = token`, as got allows - is a `merge()` of that
+  option.
+
+### Changed
+
+- **`nock.pendingMocks()` returns nock's strings** (`GET http://host:80/path`) rather than undici's
+  interceptor objects, and a scope's `done()` throws nock's `Mocks not yet satisfied:` message.
+- `RequestOptions['followRedirect']` and `FormedOptions['followRedirect']` are `boolean | function`.
+- **A scope's `isDone()`/`done()` answer for that scope**, as nock's do, rather than for every scope
+  on its origin.
+
+### Fixed
+
+- **`nock(host).get(path).reply(200).persist()` persists the interceptor**: `persist()` on a scope
+  only reached interceptors added after it, so this common spelling answered once.
+
 ## 0.7.0 - 2026-09-28
 
 ### Added

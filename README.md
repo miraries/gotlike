@@ -68,17 +68,19 @@ where it doesn't cost anything at runtime (see [Differences](#differences-from-g
 Supports:
 - [x] Extendable client
 - [x] Handlers
-- [x] Hooks: `beforeRequest`, `afterResponse`, `beforeError`, `beforeRetry`, `beforeRedirect` *(arrays, client-level only; no `init`)*
+- [x] Hooks: `init`, `beforeRequest`, `afterResponse`, `beforeError`, `beforeRetry`, `beforeRedirect` *(arrays, client-level only)*; a `beforeRequest` hook may answer the request by returning a response
 - [x] `afterResponse` retries via `retryWithMergedOptions`
 - [x] `context`
-- [x] `mutableDefaults` and `client.defaults.options.merge(...)`, for request-level options
+- [x] `mutableDefaults` and `client.defaults.options.merge(...)`, for request-level options; `client.defaults.options` reads the client's options back *(read-only)*
 - [x] Retries *(partial and opt-in with a `retry` object; maps onto undici's `retry` interceptor and honours `Retry-After`)*
 - [x] `searchParams`, `form`
 - [x] Decompression: gzip, deflate, br, zstd, compress
 - [x] Basic auth: `username` / `password`, or credentials in the url (`https://user:pass@host`)
 - [x] `response.ok` / `rawBody` / `retryCount` / `requestUrl` / `redirectUrls` / `statusMessage`
 - [x] got's promise shortcuts: `client.get(url).json()`, `.text()`, `.buffer()`
-- [x] Named error classes: `HTTPError`, `TimeoutError`, `ParseError`, `ReadError`, `MaxRedirectsError`, `AbortError`
+- [x] Named error classes: `HTTPError`, `TimeoutError`, `ParseError`, `ReadError`, `UploadError`, `MaxRedirectsError`, `AbortError`
+- [x] TLS options under got's names: `https: {rejectUnauthorized, certificateAuthority, key, certificate, ...}` *(create/extend only)*
+- [x] `followRedirect` as a function, `parseJson` / `stringifyJson`
 - [x] Streams *(with response head + timings; no progress events)*
 - [x] Timings *(only total request)*
 - [x] Parsed response body and timings on errors
@@ -98,7 +100,7 @@ Supports:
 
 | | got | gotlike |
 | --- | --- | --- |
-| `hooks`, `handlers`, `retry`, `agent`, `http2`, `pipelining`, `dnsCache`, `dnsLookup`, `decompress` | per request or per client | **create/extend only**; passing them per request is a `ValidationError` |
+| `hooks`, `handlers`, `retry`, `agent`, `https`, `http2`, `pipelining`, `dnsCache`, `dnsLookup`, `decompress` | per request or per client | **create/extend only**; passing them per request is a `ValidationError` |
 | option merging | per-option merge table, every request | **one shallow spread**; `headers`, `context`, `searchParams` and `timeout` merge one level deep, everything else is replaced |
 | `response.rawBody` | always materialised | **computed on first access**. It holds the bytes as received, so a `json` response still hands back the original text. On a `text`/`json` response it is a UTF-8 encoding of the decoded body, which is byte-exact for the UTF-8 that JSON and `charset=utf-8` guarantee; a response in some *other* charset is already mojibake by then, so read it with `responseType: 'buffer'` if the exact bytes matter |
 | a UTF-8 BOM on a `text`/`json` response | kept, so `body` starts with U+FEFF, `rawBody` starts `ef bb bf`, and a BOM-prefixed JSON body is a `ParseError` | **stripped**, because undici's `text()` drops it. `body` and `rawBody` both lack it, and a BOM-prefixed JSON body *parses*. Use `responseType: 'buffer'` if the BOM matters |
@@ -108,7 +110,7 @@ Supports:
 | `validate` | n/a | client-only, like the options above. It is read from the instance, so a per-request value would do nothing |
 | `mutableDefaults` / `defaults.options.merge()` | merges any option; on a client without `mutableDefaults` the merge **silently does nothing** | only what a request merges can be merged. `hooks`, `handlers`, `retry`, `agent` and the other create/extend-only options, a body, a `url`, `responseType` and `resolveBodyOnly` are a `ValidationError`, since the client consumed them when it was built. On a client without `mutableDefaults` the merge is a `ValidationError` too. Not inherited by `extend()`, as in got |
 | `parseUserinfo` | n/a | client-only, same reasoning as `validate`. Turns `user:pass@host` in a url into a Basic-auth header, and is on by default. Turn it off if no url you pass ever carries credentials, to skip the scan (~300-400ns/request, measured) |
-| `followRedirect` | `true` | **`false`**, because redirects cost ~2µs/request to support whether or not one happens. Enable per client with `extend({ followRedirect: true })`; a per-request `true` is a `ValidationError`, since composing the interceptor is a create/extend-time decision |
+| `followRedirect` | `true` | **`false`**, because redirects cost ~2µs/request to support whether or not one happens. Enable per client with `extend({ followRedirect: true })`, or with a function asked about each redirect (`false` makes the redirect the response, a success as in got; it is handed the redirect's `statusCode`, `statusMessage`, `headers` and `url`, not got's full response). A per-request `true` or function is a `ValidationError` on a client that does not follow redirects, since composing the interceptor is a create/extend-time decision; on one that does, either narrows it |
 | `maxRedirects` | configurable | **fixed at 10**, got's own default. A chain longer than that is a `MaxRedirectsError` carrying the 3xx, as it is in got, not a success whose body is the redirect page |
 | `stream()` for a bodyless request | always a `Duplex` | a **`Readable`**, since nothing can be written to a GET and the duplex wrapper cost ~10% of stream throughput |
 | `prefixUrl` with an absolute `url` | throws | the **absolute url wins**, silently. `prefixUrl` therefore does *not* pin the host: if `url` can be influenced from outside, validate it yourself |
@@ -117,7 +119,8 @@ Supports:
 | `responseType: 'buffer'` | a `Uint8Array` since got 15 | a real **`Buffer`**. `Buffer` extends `Uint8Array`, so it satisfies anything typed for one, and callers feeding `sharp()` and friends need the subclass. `response.rawBody` likewise |
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
 | `timeout.lookup`, `.connect`, `.secureConnect`, `.socket`, `.send`, `.response`, `.read` | per-phase bounds | a **`ValidationError`** naming the option. Only `timeout.request` is implemented, and it bounds every phase; accepting the others meant a `timeout: {response: 10000}` that silently bounded nothing. Use `timeout.request`, or the client-level `connectTimeout` for the connection phase |
-| `retry.calculateDelay`, `retry.noise`, `hooks.init` | accepted | a **`ValidationError`** naming the option, as "not implemented" rather than "unknown". Ignoring them would mean a backoff tuning that silently never applies and an `init` hook that silently never fires, which is the failure the unknown-key check exists to stop. Drop them, or cap the backoff with `retry.backoffLimit` and move `init` work into `beforeRequest` |
+| `retry.calculateDelay`, `retry.noise`, `https.alpnProtocols` | accepted | a **`ValidationError`** naming the option, as "not implemented" rather than "unknown". Ignoring them would mean a backoff tuning that silently never applies, which is the failure the unknown-key check exists to stop. Drop them, or cap the backoff with `retry.backoffLimit`; undici negotiates ALPN itself, so use `http2: true` to offer h2 |
+| `https` | per request or per client | **create/extend only**, like the agent options: it configures the client's dispatcher. `extend()` merges it one level deep, as got does |
 | an unknown key in `retry` or `hooks` | accepted and ignored | a **`ValidationError`**. `retry: { limt: 0 }` used to leave the `retry` object's default of two retries in place, and a misspelled hook name simply never fired |
 | an agent-level option alongside an explicit `agent`, or on a client built with one | n/a (got's `agent` is per-protocol) | a **`ValidationError`** either way round. A `ProxyAgent` or `H2CClient` cannot be rebuilt from `connections`, so the option can only be silently ignored (named beside the agent) or silently replace your dispatcher with a plain `undici.Agent` (named on a client that already has one). For a proxy agent, the second means every request going direct. Pass a new `agent` configured the way you want instead |
 | `form: { a: null }`, `form: { a: undefined }` | `a=null`, `a=undefined`, because got serialises `form` with `new URLSearchParams(form)`, which stringifies both | `a=` and **dropped**, the same rule `searchParams` uses. got's is a serialisation artefact rather than an intent. It is not what got itself does with those values in `searchParams`, and no server wants the four characters `null` in a form field |
@@ -144,31 +147,34 @@ hooks can be awaited. An absolute `url` overrides `prefixUrl` instead of being r
 migration finds it at the first request) or listed here because it fails some other way. The list
 comes from running got's own test suite against gotlike (see `conformance/`), not from memory:
 
-- **TLS options** (`https: {rejectUnauthorized, certificateAuthority, key, certificate, ...}`). Give
-  the client an undici `Agent` with `connect: {rejectUnauthorized, ca, key, cert}` as its `agent`.
 - **`cookieJar`**, **`pagination`** / `got.paginate`, a custom **`request`** function,
-  **`allowAbsoluteUrls`**, **`encoding`**, **`parseJson`** / **`stringifyJson`**, **`methodRewriting`**,
+  **`allowAbsoluteUrls`**, **`encoding`**, **`methodRewriting`**,
   **`allowGetBody`** (a GET with a body is sent as it is, not refused), **`copyPipedHeaders`**,
   **`strictContentLength`**, **`preserveHooks`**, and the socket options **`dnsLookupIpVersion`**,
   **`family`**, **`localAddress`**, **`createConnection`**, **`setHost`**, **`maxHeaderSize`**,
   **`h2session`** and **`enableUnixSockets`** (unix socket urls).
-- **`hooks.init`**, **`hooks.beforeCache`**, **`retry.calculateDelay`**, **`retry.noise`**,
-  **`retry.enforceRetryRules`**, per-phase timeouts, and **`followRedirect` as a function**.
+- **`hooks.beforeCache`**, **`retry.calculateDelay`**, **`retry.noise`**,
+  **`retry.enforceRetryRules`**, per-phase timeouts, and `https.alpnProtocols`.
 - **Events** on the request promise and on streams - `request`, `redirect`, `retry`,
   `uploadProgress`, `downloadProgress` - and a stream's `retryCount`, `createRetryStream`, `socket` and
   `isReadonly`. A stream emits `response` only.
 - **Header copying across a pipe**: an `IncomingMessage` piped in does not lend its headers, and a
   `ServerResponse` piped to does not get the status and headers.
-- **Reading `client.defaults.options`**: it has only `merge()`. `extend()` takes one options object,
-  not several, and not another client to merge; got's `Options` class and `got.mergeOptions` do not
-  exist.
-- **`UploadError`**, **`CacheError`**, and an error's `request` (got's request stream). A failing
-  upload body is a plain `RequestError`.
+- **Writing through `client.defaults.options`**: it reads the client's options back, but a write is a
+  `ValidationError` - use `merge()`. It reports options as they were given (`dnsCache: false` stays
+  `false`) where got normalises some. `extend()` takes one options object, not several, and not
+  another client to merge; got's `Options` class and `got.mergeOptions` do not exist.
+- **`CacheError`**, and an error's `request` (got's request stream).
 - **On the response**: `ip`, `isFromCache`, `rawHeaders`, and any timing but `timings.phases.total`.
   `statusMessage` is node's standard phrase for the status, not a server's own non-standard one, and
   `HTTPError`'s message uses the same.
-- **In hooks**: a `beforeRequest` hook returning a response does not short-circuit the request; it
-  runs once per request rather than once per redirect hop, and gets no `{retryCount}` second argument.
+- **In hooks**: a `beforeRequest` hook runs once per request rather than once per redirect hop, and
+  gets no `{retryCount}` second argument. Returning a response (`{statusCode, headers, body}`) answers
+  a promise call, but not a stream one, which is a `RequestError`. An `init` hook's second argument is
+  the same object as its first, where got hands over its `Options` instance; writes to its `context`
+  and `headers` are merged over the client's as the call's own would be. `init` runs on each call
+  made with an options object - including an empty one, where got skips it - and on `extend()`, but
+  not on a `retryWithMergedOptions` retry.
   `beforeRedirect` is handed undici's per-hop options (`RedirectRequest`: no `body`/`json`/`form`,
   and changing the url does not re-target the hop). `beforeRetry` runs inside undici's retry
   interceptor, so its changes to `error.options` do not reach the retried request, and it is not
@@ -192,7 +198,12 @@ client is built; `ValidationError` carries no `options`; `HTTPError#response` is
 has no `requestUrl`; a `TimeoutError` with no response has no `timings`; an `AbortSignal.timeout()`
 firing is `ETIMEDOUT` where got passes the DOMException's numeric code; a `ReadError` keeps its
 cause's code (`Z_DATA_ERROR`) where got reports `ERR_READING_RESPONSE_STREAM`, and a body shorter
-than its `content-length` is `other side closed` where got says `Content-Length mismatch`.
+than its `content-length` is `other side closed` where got says `Content-Length mismatch`; a
+`TimeoutError` has no `event`, since there is one timeout; a TLS handshake failure keeps the TLS
+error's own code where got reports `EPROTO`; an `init` hook on a stream call is not shown got's
+internal `isStream: true`; `defaults.options.context`, `headers` and `hooks` are live views of the
+client's, not got's normalised copies. HTTP/2 is undici's (`allowH2`) rather than got's own session
+pool, so session reuse, informational responses, trailers and its error messages differ.
 
 **Behaves differently, because undici does.** A 301/302 `POST` becomes a `GET` without its body
 (got keeps the method and body unless `methodRewriting` says otherwise); a body is not forwarded
@@ -200,6 +211,11 @@ across origins on a 307/308, and a body that cannot be replayed fails as the 3xx
 caller-set `transfer-encoding`, or a `content-length` that disagrees with the body, is refused
 (`invalid transfer-encoding header`, `Request body length does not match content-length header`);
 and undici's HTTP parser accepts a few malformed responses node's rejects with `Parse Error`.
+**`timeout.request` does not bound connecting**: undici only wires a request's abort once its
+connection is up, so a TCP connect or TLS handshake that stalls (a blackholed address, a server
+that accepts and never answers the handshake) runs to the client's `connectTimeout`, undici's 10s by
+default, whatever `timeout.request` or `signal` say. got's request timeout covers that phase. Set
+`connectTimeout` no higher than your request timeout if that matters.
 
 **No `user-agent` is sent.** got identifies itself as `got (https://github.com/sindresorhus/got)`;
 undici has no default and gotlike adds none, so requests go out with the header absent entirely,
@@ -469,9 +485,13 @@ nock.cleanAll();
 nock.disableNetConnect();
 ```
 
-Also supported: `.persist()`, `.delay()`, `.matchHeader()`, `.replyWithError()`, `.once()`,
-`.twice()`, `.thrice()`, `.isDone()`, `nock.pendingMocks()`, `nock.activate()`/`restore()`, and the
-scope options `reqheaders`, `badheaders` and `conditionally` (`nock(host, {reqheaders: {...}})`).
+Also supported: `.persist()`, `.delay()`, `.matchHeader()` (on an interceptor or a whole scope),
+`.basicAuth()`, `.optionally()`, `.replyWithError()`, `.once()`, `.twice()`, `.thrice()`, `.isDone()`/
+`.done()`/`.pendingMocks()`/`.activeMocks()` on a scope, `nock.isDone()`, `nock.pendingMocks()`/`activeMocks()` (nock's
+`METHOD proto://host:port/path` strings), `nock.activate()`/`restore()`, and the scope options
+`reqheaders`, `badheaders`, `conditionally` and `allowUnmocked` (`nock(host, {reqheaders: {...}})`).
+With `allowUnmocked`, a request to that host no interceptor matches goes to the real server, even
+under `disableNetConnect()`, as in nock.
 
 A request no interceptor matches fails as nock reports it: `Nock: No match for request {...}` with
 code `ERR_NOCK_NO_MATCH` on a mocked origin, and `Nock: Disallowed net connect for "host:port/path"`
@@ -480,14 +500,11 @@ which says which interceptors were left, is on `error.cause`.
 
 **Not implemented** (from running nock's own suite against the shim, see `conformance/`):
 `nock.back`, `nock.recorder`, `nock.define`/`load`, `nock.emitter` and scope events,
-`nock.removeInterceptor`, `nock.isDone()`/`activeMocks()`, `scope.pendingMocks()`/`activeMocks()`/
-`clone()`, `.optionally()`, `.replyWithFile()`, `.delayConnection()`/`.delayBody()`, `.basicAuth()`,
-`.defaultReplyHeaders()`, `.replyContentLength()`, `.replyDate()`, `.filteringPath()`/
+`nock.removeInterceptor`, `scope.remove()`/`clone()`, `.replyWithFile()`,
+`.delayConnection()`/`.delayBody()`, `.defaultReplyHeaders()`, `.replyContentLength()`, `.replyDate()`, `.filteringPath()`/
 `.filteringRequestBody()`, `scope.intercept()`, a node-style `reply(function (uri, body, callback))`,
-and reply headers given as an array, a `Map` or with function values. `allowUnmocked` and
-`filteringScope` are accepted but not applied: both fail closed (a miss is refused rather than passed
-through). `nock.pendingMocks()` returns undici's interceptor objects rather than nock's strings. A
-query is parsed as `URLSearchParams` rather than with `qs`, so nested keys (`a[b]=1`) are not
+and reply headers given as an array, a `Map` or with function values. `filteringScope` is accepted
+but not applied, and fails closed (a scope matches only its own host). A query is parsed as `URLSearchParams` rather than with `qs`, so nested keys (`a[b]=1`) are not
 expanded. The shim does not validate its arguments the way nock does (`times('x')` throws undici's
 error rather than being ignored). A body matcher sees a multipart `FormData` body as unparsed text. A
 `.query(fn)` or `matchHeader()` predicate may be called more than once per request, since undici
@@ -501,8 +518,8 @@ string; add `.query(true)` for that.
 A regex origin such as `nock(/\.example\.com$/)` works, and any number of scopes may share one
 pattern. Two *different* patterns that both match the same host do not: undici resolves a concrete
 origin against the first regex pool registered for it and caches that decision, so the second
-pattern's interceptors never match. `isDone()`/`done()` answer for the origin rather than for the
-individual scope, as they already do for two scopes on one string origin.
+pattern's interceptors never match. A scope's `isDone()`/`done()`/`pendingMocks()` answer for that
+scope alone, as nock's do.
 
 Body matchers take a string, a RegExp, a predicate, or an object/array compared against the
 request body parsed as JSON (a RegExp or function as a leaf value matches that field), as nock's
@@ -643,12 +660,12 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 | `MaxRedirectsError` | `ERR_TOO_MANY_REDIRECTS` | the redirect chain ran past 10 hops (`Redirected 10 times. Aborting.`), or undici refused a redirect straight back to the same url as a loop. `error.response` is the last 3xx |
 | `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request` (`Timeout awaiting 'request' for 5000ms`, got's message), or an `AbortSignal.timeout()` fired |
 | `ReadError` | the cause's `code`, or `ERR_READING_RESPONSE_STREAM` | the response head arrived but reading or decompressing the body failed: a reset part-way through (`ECONNRESET`), a truncated gzip stream |
+| `UploadError` | `ERR_UPLOAD` | a stream passed as `body` errored while it was being sent. The stream's own error, with its code, is `error.cause` |
 | `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType`, on a status that was otherwise fine. An *empty* body is never a parse failure, whatever the status. On an error status the status wins: the body is left as the text that arrived, the hooks still see it, and `throwHttpErrors` decides, so a 500 carrying a proxy's HTML page is an `HTTPError`, not a parse failure |
 | `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted (`This operation was aborted.`, got's message, unless you aborted with a reason of your own) |
 | `RequestError` | the underlying error's own `code`, or `ERR_REQUEST_ERROR` | everything else (connection refused, an unsupported protocol as `ERR_UNSUPPORTED_PROTOCOL`, ...) |
 
-got's `UploadError` and `CacheError` do not exist here: a failing upload stream is a plain
-`RequestError` carrying the stream's own error, and the cache is undici's.
+got's `CacheError` does not exist here: the cache is undici's.
 
 An `HTTPError`'s message is got's (`Request failed with status code 403 (Forbidden): GET
 http://host/path`) with one deliberate difference: **the query string is removed**. got names the

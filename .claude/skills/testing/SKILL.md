@@ -89,7 +89,7 @@ out a second time whether they matter:
 | `index.ts` `headersToObject`, non-array arm | One call site, and undici always hands it the flat array form at a redirect hop. Defensive. |
 | `index.ts` redirect tracker, `lastStatusCode === undefined` | Unreachable in practice — `countAttempts` resets `redirects.count` to 0 on a retry, so a retried attempt's first hop never reaches the callback. **Not removable:** it is also the narrowing that makes `lastStatusCode` a `number` for the hook call below it, and deleting it is a type error rather than a no-op. |
 | `index.ts` `callStream` http-error readable, `raised` guard | Needs undici's duplex to pull twice before the queued destroy lands — a race, not a behaviour. Any test for it would be flaky. |
-| `nock.ts` `cleanAll`'s `cleanMocks()` fallback | Only runs if undici moves its `dispatches` symbol, which is the future it exists for. |
+| `nock.ts` `cleanAll`'s `cleanMocks()` fallback, and `liveDispatches`/`Scope#live` falling back to `pendingInterceptors()` | Only run if undici moves its `dispatches` symbol, which is the future they exist for. |
 | `index.ts` `IsolatedAbortHandler.lead`, `addWaitingHandler` not a function | Only runs if undici renames the method on its `DeduplicationHandler`; it degrades to not counting parked requests rather than throwing on every deduped request. |
 
 A fifth used to be here and is now gone: `callStream`'s `else if (!isBodyMethod(...))` arm was **dead**, since

@@ -9,6 +9,7 @@ import gotlike, {
   AbortError,
   ReadError,
   MaxRedirectsError,
+  UploadError,
 } from 'gotlike';
 
 export * from './index.js';
@@ -34,6 +35,7 @@ const clientOnly = new Set([
   'keepAliveTimeout',
   'keepAliveMaxTimeout',
   'connectTimeout',
+  'https',
 ]);
 
 function split(options: Options | undefined): [Options | undefined, Options | undefined] {
@@ -45,7 +47,9 @@ function split(options: Options | undefined): [Options | undefined, Options | un
   let request: Options | undefined;
   for (const key of Object.keys(options)) {
     const value = options[key];
-    const toClient = clientOnly.has(key) || (key === 'followRedirect' && value === true);
+    // Turning redirects on is create/extend only; a function turns them on too.
+    const toClient =
+      clientOnly.has(key) || (key === 'followRedirect' && (value === true || typeof value === 'function'));
     if (toClient) {
       (client ??= {})[key] = value;
     } else {
@@ -269,4 +273,4 @@ function wrap(client: AnyClient): any {
 const got = wrap(gotlike.extend({retry: {}, followRedirect: true}));
 
 export default got;
-export {got, RequestError, HTTPError, TimeoutError, ParseError, AbortError, ReadError, MaxRedirectsError};
+export {got, RequestError, HTTPError, TimeoutError, ParseError, AbortError, ReadError, MaxRedirectsError, UploadError};

@@ -239,6 +239,68 @@ test('enableNetConnect never reopens an origin that has mocks', async (t) => {
 });
 
 /*
+ * nock's `allowUnmocked`: the host keeps its interceptors, and a request none of them match goes to
+ * the real server instead of failing - whatever `disableNetConnect()` says, since the host has a
+ * scope. It used to be accepted and ignored, failing every such request closed.
+ */
+test('allowUnmocked lets a miss through to the real server, and only on its own origin', async (t) => {
+  const paths: string[] = [];
+  const server = http.createServer((request, response) => {
+    paths.push(request.url ?? '');
+    response.end('live');
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        nock.cleanAll();
+        nock.enableNetConnect();
+        nock.restore();
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  );
+
+  nock.activate();
+  nock.disableNetConnect();
+
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const origin = `http://127.0.0.1:${address.port}`;
+
+  nock(origin, {allowUnmocked: true}).get('/mocked').reply(200, 'mocked');
+  // A second scope on the same host without the option does not close it again: nock asks
+  // whether any interceptor on the host allows it.
+  nock(origin).get('/also-mocked').reply(200, 'also mocked');
+
+  assert.strictEqual((await client.get(`${origin}/mocked`)).body, 'mocked');
+  assert.strictEqual((await client.get(`${origin}/unmocked`)).body, 'live');
+  assert.strictEqual((await client.get(`${origin}/also-mocked`)).body, 'also mocked');
+  assert.deepStrictEqual(paths, ['/unmocked']);
+
+  // Cleared with the scope: afterwards the host is closed as usual.
+  nock.cleanAll();
+  nock(origin).get('/mocked').reply(200, 'mocked');
+  assert.strictEqual((await failure(client.get(`${origin}/unmocked`))).code, 'ERR_NOCK_NO_MATCH');
+  assert.deepStrictEqual(paths, ['/unmocked']);
+
+  // A regex origin keeps its pool across `cleanAll()`, and must not keep the option with it.
+  const escaped = origin.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  nock.cleanAll();
+  nock(new RegExp(`^${escaped}$`), {allowUnmocked: true})
+    .get('/mocked')
+    .reply(200, 'mocked');
+  assert.strictEqual((await client.get(`${origin}/regex-unmocked`)).body, 'live');
+  nock.cleanAll();
+  nock(new RegExp(`^${escaped}$`))
+    .get('/mocked')
+    .reply(200, 'mocked');
+  assert.strictEqual((await failure(client.get(`${origin}/regex-unmocked`))).code, 'ERR_NOCK_NO_MATCH');
+  assert.deepStrictEqual(paths, ['/unmocked', '/regex-unmocked']);
+});
+
+/*
  * A client with its own dispatcher - built from `connections` and friends, or handed an `agent` -
  * used to dispatch straight through it, so the mock never saw its requests: a matching interceptor
  * was skipped, `disableNetConnect()` did nothing, and the request went live. Real nock sits under

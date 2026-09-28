@@ -386,7 +386,7 @@ nockParityTest('a regex origin matches any host it describes', {
 });
 
 nockParityTest('isDone reports whether the scope’s interceptors were consumed', {
-  claim: 'CLAUDE.md: `isDone()` filters `pendingInterceptors()` by the scope’s origin.',
+  claim: 'nock-shim skill: each scope answers `isDone()` for the dispatches it registered.',
   register: (nock, origin) => {
     nock(origin).get('/p').reply(200, 'matched');
   },

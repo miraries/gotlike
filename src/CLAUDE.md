@@ -334,7 +334,7 @@ they must be composed onto a dispatcher up front. The `agent` getter does this:
   outermost (it re-runs the whole chain) and dns innermost (resolving right before the connection is made).
   Getting this backwards silently reorders behaviour — there's a probe in the git history if you need to
   re-verify;
-- `redirect` is composed **only on an explicit `followRedirect: true`** — this is opt-in, and a documented
+- `redirect` is composed **only on an explicit `followRedirect: true` or a function** — this is opt-in, and a documented
   divergence from got. undici allocates a `RedirectHandler` per request once the interceptor is in the chain
   (~1.4µs vs ~0.2µs for `maxRedirections: 0`), which measured at ~80% of the client's total overhead.
   `Gotlike.followsRedirects` records the decision, and `formOptions` rejects a per-request
@@ -372,6 +372,25 @@ they must be composed onto a dispatcher up front. The `agent` getter does this:
 for user agents, not a MUST). Changing it would mean owning redirect handling, which the performance
 note further down rules out; it is in the README's "Forced by undici" table instead. 304 is followed
 by neither.
+
+**A `followRedirect` function is asked inside `GotlikeRedirectHandler.onResponseStart`**, before undici
+decides: it travels per request on the `RedirectState` (`redirects.follow`, set in `dispatchOptions`), and a
+`false` sets the handler's `maxRedirections` to 0 - undici then hands the 3xx through - and marks
+`redirects.declined`. `followed()` reads that, so the 3xx is a success, as got's `isResponseOk` makes it.
+`isHttpError` is always called with `followed()`, never `follows()`; a new call site that uses the second
+turns every declined redirect into an `HTTPError`.
+
+**`https` is an agent option** (it is in `agentOptions`, so everything derived from that list - client-only,
+not mergeable into defaults, refused beside an explicit `agent`, a rebuilt dispatcher on `extend()` - follows).
+`connectOptions` maps got's names onto `tls.connect`'s through `httpsToTls`, a `Record` over every key so a name
+added to `HttpsOptions` alone is a compile error. `extend()` merges it one level deep.
+
+**`timeout.request` does not bound connecting, and cannot from here.** undici's `RequestHandler` only wires the
+signal's abort at `onRequestStart`, once a connection is up; before that an abort only records the reason. So a
+stalled TCP connect or TLS handshake runs to undici's `connectTimeout` (10s) whatever the deadline says -
+measured on 8.10.2 and 8.11.2, raw `undici.request` included. Fixing it means an interceptor that fails the
+request itself when the signal fires before `onRequestStart`, which is a per-request allocation on every client
+with a timeout; it is documented in the README instead.
 
 HTTP/2 works over TLS via `allowH2`; cleartext h2c needs the caller to pass `agent: new H2CClient(origin)`,
 since `H2CClient` is single-origin and can't back a general-purpose client.
@@ -429,6 +448,19 @@ site already carries, and undici raises neither of its own codes under that name
 Making the codes retryable is only half of it; `requestSignal` is the other half — see Timeouts.
 
 # Hooks
+
+**`init` runs before validation, which is its point** - got's docs use it to turn a made-up option into real
+ones and delete it. `applyInitHooks` copies the options (and their `context`/`headers`, which is where a hook
+writes) and hands the copy as both arguments; got's second is its `Options` instance, which does not exist
+here. It runs in `formOptions` for every call on a client that has one (a throw is a `RequestError`, as in got),
+in `extend()` with the parent's hooks plus the extension's own on the extension, and in `createClient()` with
+the options' own - got runs it on every merge. **Not** in the constructor, which `extend()` calls with already
+merged options, so the parent's options would be run twice; and not on a `retryWithMergedOptions` retry.
+
+**A `beforeRequest` hook returning a response answers the request** (`answered` in `call()`): the rest of the
+hooks are skipped, no dispatch happens, and `answeredResponse` hands the rest of `call()` an object shaped like
+undici's response - so parsing, the `afterResponse` hooks and `throwHttpErrors` apply unchanged. A stream call
+refuses it with a `RequestError`, since there is no stream to hand back.
 
 Arrays, got's signatures, **read from instance options only** — a `hooks` object passed to a single call is
 ignored. The constructor flattens each array onto the instance (`beforeRequestHooks` etc., `undefined` when
@@ -658,6 +690,9 @@ on got's names would hit. None of it runs on a request that succeeds.
   for the 3xx undici gave up on - decided by the tracker's `redirects.count > maxRedirections`, so a 3xx undici
   declined for another reason (no `location`, a non-replayable body) is still an `HTTPError`. undici's `Redirect
   loop detected` gets the same class and code, and keeps its message.
+- **`UploadError`** (`ERR_UPLOAD`) is a failure whose error *is* the `body` stream's own (`isUploadFailure`:
+  `options.body.errored === error`, which undici guarantees by failing the request with that object). Checked
+  on the error path only, in both `call()` and `toStreamError`.
 - **`resumeFailure`**: with retries on, undici resumes a body cut off mid-way with a `Range` request, and a
   server that ignores it makes undici fail with `server does not support the range header ...`. The error
   reported is the reset that caused the resume (`retriedBy`, kept by `countAttempts` past the retry that clears
@@ -1306,6 +1341,18 @@ reference outright, so a deadline could be moved out from under a client that wa
 alongside `hooks`/`handlers`/`cloneSearchParams`. Shallow, as `mergeRecords` is everywhere else — it is the
 key-level writes that were reaching through.
 
+
+**`defaults.options` is a read-only proxy over the live `baseOptions`** (`defaultsView`), built on first read
+so an unread one costs `extend()` nothing. `headers` reads `defaultHeaders` (what a request starts from,
+`accept-encoding` included) and `mutableDefaults` the real flag, since the constructor clears it off
+`baseOptions`. Plain objects and arrays come back as read-only proxies too (memoised per object, so two reads
+compare equal); class instances - a `URLSearchParams`, a dispatcher - come back as they are, since a proxy
+breaks their methods. **A write never reaches `baseOptions` directly**: `defaultHeaders` is derived once, so a
+write to `headers` would change what the view reports and not what is sent. On a `mutableDefaults` client an
+assignment is a `merge()` of that one option - top level, or one key of `headers`/`context`, which are
+`liveRecord`s read through the client on every access since a merge replaces the object behind them - and so
+it is refused, with `merge()`'s reason, for anything `merge()` refuses. On any other client every write is a
+`ValidationError`, as got's frozen defaults throw.
 
 **`defaults.options.merge()` is `extend()` applied in place** (`#mergeDefaults`). It builds the child `extend()`
 would and adopts the two fields that child derived for requests - `baseOptions` and `defaultHeaders` - so the

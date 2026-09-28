@@ -1,5 +1,6 @@
 import dns from 'node:dns';
 import {STATUS_CODES} from 'node:http';
+import type tls from 'node:tls';
 import zlib from 'node:zlib';
 import {Duplex, Readable} from 'node:stream';
 import undici, {DecoratorHandler, Dispatcher, errors, getGlobalDispatcher, interceptors, RedirectHandler} from 'undici';
@@ -367,6 +368,10 @@ type RedirectState = DispatchState & {
    * retry starts the chain over, so a response already built keeps the list it was built with.
    */
   urls?: string[];
+  /** The call's `followRedirect` function, when it has one - see `GotlikeRedirectHandler`. */
+  follow?: (response: RedirectResponse) => boolean;
+  /** Set when `follow` declined a redirect, which makes the 3xx the answer rather than an error. */
+  declined?: boolean;
 };
 
 type AttemptState = DispatchState & {
@@ -535,6 +540,7 @@ const countAttempts = trackDispatches(
       redirects.lastStatusCode = undefined;
       redirects.lastHeaders = undefined;
       redirects.lastError = undefined;
+      redirects.declined = undefined;
       // Cleared rather than kept: with no hop recorded for this attempt, `response.url`
       // falls back to the url that was requested, which is where the answer came from.
       redirects.lastUrl = undefined;
@@ -563,8 +569,12 @@ const countAttempts = trackDispatches(
 /** The parts of undici's `RedirectHandler` its typings leave out and `GotlikeRedirectHandler` reads. */
 type RedirectHandlerState = {
   history: URL[];
-  opts: Dispatcher.DispatchOptions;
+  maxRedirections: number;
+  opts: Dispatcher.DispatchOptions & {redirects?: RedirectState};
 };
+
+/** The statuses undici's `RedirectHandler` follows (`redirectableStatusCodes`). */
+const redirectStatuses = new Set([300, 301, 302, 303, 307, 308]);
 
 /**
  * A history entry the loop check can never match - see `GotlikeRedirectHandler`.
@@ -582,6 +592,10 @@ const unmatchable = {toString: () => '\0'} as unknown as URL;
  * `MaxRedirectsError`, `Redirected 10 times. Aborting.`, and so does this now - the check is shown
  * a history of the same length (the limit still counts it) that can match nothing. A real loop costs
  * the ten requests it costs got. Found by got's own suite (`redirects.ts`).
+ *
+ * It is also where a `followRedirect` function is asked, as got asks it: once per redirect, with the
+ * redirect's head, before undici decides. A `false` hands the 3xx to the caller as the response -
+ * and, as in got, as a success rather than an `HTTPError` (`RedirectState.declined`).
  */
 class GotlikeRedirectHandler extends RedirectHandler {
   onResponseStart(
@@ -591,6 +605,20 @@ class GotlikeRedirectHandler extends RedirectHandler {
     statusMessage?: string,
   ): void {
     const self = this as unknown as RedirectHandlerState;
+    const redirects = self.opts.redirects;
+
+    if (redirects?.follow !== undefined && headers.location !== undefined && redirectStatuses.has(statusCode)) {
+      const url = joinOriginPath(String(self.opts.origin ?? ''), self.opts.path);
+      // undici records each hop's url after this point, so only the first hop has none yet.
+      const requestUrl = self.history[0] ?? new URL(url);
+
+      if (!redirects.follow({statusCode, statusMessage, headers, url, requestUrl})) {
+        redirects.declined = true;
+        // undici hands the response through once the limit is reached.
+        self.maxRedirections = 0;
+      }
+    }
+
     // undici's typings declare none of the handler methods, so `super.onResponseStart` does not
     // type-check; the prototype's is called on `this` explicitly below, which is what `super` does.
     // oxlint-disable-next-line typescript/unbound-method
@@ -677,6 +705,12 @@ function resumeFailure(err: unknown, attempts: AttemptState | undefined): Error 
  * here - and re-dispatches later hops with that copy, so anything attached on hop 1 is
  * invisible to hop 2.
  */
+function joinOriginPath(origin: string, path: string | undefined): string {
+  const tail = String(path ?? '');
+
+  return origin.endsWith('/') && tail.startsWith('/') ? origin + tail.slice(1) : origin + tail;
+}
+
 function makeRedirectTracker(hooks?: Hooks['beforeRedirect']): Dispatcher.DispatcherComposeInterceptor {
   return trackDispatches(
     (opts) => opts.redirects,
@@ -695,9 +729,7 @@ function makeRedirectTracker(hooks?: Hooks['beforeRedirect']): Dispatcher.Dispat
       // The hop about to be dispatched. The last one recorded is where the response came
       // from, which is what `response.url` and `StreamHead.url` report.
       const origin = String(opts.origin ?? '');
-      const path = String(opts.path ?? '');
-
-      const hop = origin.endsWith('/') && path.startsWith('/') ? origin + path.slice(1) : origin + path;
+      const hop = joinOriginPath(origin, opts.path);
 
       (state as RedirectState).lastUrl = hop;
       ((state as RedirectState).urls ??= []).push(hop);
@@ -2016,6 +2048,36 @@ function hasHeader(headers: IncomingHttpHeaders, name: string): boolean {
  * Only `statusCode` is tested, deliberately: got also insists on a non-null `body`, which
  * here would reject the perfectly good `undefined` body of a 204 read as json.
  */
+/**
+ * A response a `beforeRequest` hook hands back to answer the request itself - got's, for a cache
+ * or a stub. `body` is the bytes as they would have arrived, read by `responseType` like any other.
+ */
+export type ResponseLike = {
+  statusCode: number;
+  headers?: IncomingHttpHeaders;
+  body?: Buffer | Uint8Array | string;
+};
+
+/** A `ResponseLike` in the shape `call()` reads undici's response in. */
+function answeredResponse(answer: ResponseLike): {
+  statusCode: number;
+  headers: IncomingHttpHeaders;
+  body: {dump(): Promise<void>; text(): Promise<string>; arrayBuffer(): Promise<ArrayBuffer>};
+} {
+  const {body} = answer;
+  const bytes = body === undefined ? Buffer.alloc(0) : typeof body === 'string' ? Buffer.from(body) : Buffer.from(body);
+
+  return {
+    statusCode: answer.statusCode,
+    headers: lowercaseHeaders(answer.headers),
+    body: {
+      dump: () => Promise.resolve(),
+      text: () => Promise.resolve(bytes.toString('utf8')),
+      arrayBuffer: () => Promise.resolve(new Uint8Array(bytes).buffer),
+    },
+  };
+}
+
 function isResponseLike(value: unknown): boolean {
   return typeof value === 'object' && value !== null && typeof (value as Response).statusCode === 'number';
 }
@@ -2186,7 +2248,7 @@ function mergeRecords<T extends object>(base?: T, override?: T): T | undefined {
   return override ? {...base, ...override} : {...base};
 }
 
-const hookNames = ['beforeRequest', 'afterResponse', 'beforeError', 'beforeRetry', 'beforeRedirect'] as const;
+const hookNames = ['init', 'beforeRequest', 'afterResponse', 'beforeError', 'beforeRetry', 'beforeRedirect'] as const;
 
 /**
  * Every key `RetryOptions` declares, checked the same way `knownOptionMap` checks the
@@ -2217,7 +2279,7 @@ const knownRetryKeys = new Set<keyof RetryOptions>([
 const unimplementedOptions = new Map<string, string>([
   ['retry.calculateDelay', "undici's RetryHandler owns the backoff schedule; use `retry.backoffLimit` to cap it"],
   ['retry.noise', "undici's RetryHandler owns the backoff schedule"],
-  ['hooks.init', 'no equivalent stage - `beforeRequest` receives the formed options instead'],
+  ['https.alpnProtocols', 'undici negotiates ALPN itself - set `http2: true` to offer h2'],
   // got's per-phase timeouts. Accepting and ignoring one left the request bounded by whatever
   // else was set, or by nothing at all - `extend({timeout: {response: 100_000}})` is how the
   // aggregator writes it. `extend()` is generic, so the type does not stop it either.
@@ -2284,6 +2346,43 @@ function mergeHooks(base?: Hooks, override?: Hooks): Hooks | undefined {
  * consumed at construction, so a write through them cannot change the client"); this is what
  * makes that true. Once per client, so it costs nothing that matters.
  */
+/**
+ * A copy of `options` after every `init` hook has had it - see `InitHook`. The copy is got's too
+ * (`cloneRaw`): a hook deleting its made-up option must not delete it from the caller's object.
+ * `context` and `headers` are copied as well, since those are what a hook writes into.
+ *
+ * The first argument is the copy as it stands, so a hook testing `plain.context` sees only what the
+ * call passed. The second reads and writes the same copy but always has a `context` and `headers`
+ * to write into, created on first read - got's `Options` instance always has both.
+ */
+function applyInitHooks(hooks: readonly InitHook[], options: RequestOptions): RequestOptions {
+  const plain: RequestOptions & Record<string, any> = {...options};
+
+  if (plain.context !== undefined) {
+    plain.context = {...plain.context};
+  }
+
+  if (plain.headers !== undefined) {
+    plain.headers = {...plain.headers};
+  }
+
+  const self = new Proxy(plain, {
+    get(target, key) {
+      if ((key === 'context' || key === 'headers') && target[key] === undefined) {
+        target[key] = {};
+      }
+
+      return Reflect.get(target, key) as unknown;
+    },
+  }) as Parameters<InitHook>[1];
+
+  for (const hook of hooks) {
+    hook(plain, self);
+  }
+
+  return plain;
+}
+
 function usedHooks<T>(hooks?: T[]): T[] | undefined {
   return hooks?.length ? [...hooks] : undefined;
 }
@@ -2743,11 +2842,31 @@ export class ReadError<T = unknown> extends RequestError<T> {
   override name = 'ReadError';
 }
 
+/**
+ * The request body failed: a stream handed over as `body` errored while it was being sent. got's
+ * class and code (`ERR_UPLOAD`), whatever code the stream's own error carried - that one is on
+ * `cause`.
+ */
+export class UploadError<T = unknown> extends RequestError<T> {
+  override name = 'UploadError';
+}
+
+/**
+ * Whether `error` is the request body's own failure. Identity with the stream's `errored` is
+ * exact - undici fails the request with the body's error object - and costs nothing until
+ * something has already failed.
+ */
+function isUploadFailure(error: unknown, options: FormedOptions): boolean {
+  const body = options.body as Readable | undefined;
+
+  return error !== undefined && error !== null && body instanceof Readable && body.errored === error;
+}
+
 export type FormedOptions = RequestOptions & {
   /** The URL to request, as a string or a [WHATWG `URL`](https://nodejs.org/api/url.html#url_class_url). */
   url?: string | URL;
   throwHttpErrors: boolean;
-  followRedirect: boolean;
+  followRedirect: NonNullable<RequestOptions['followRedirect']>;
   headers: IncomingHttpHeaders;
   responseType: 'text' | 'json' | 'buffer';
   method: Dispatcher.HttpMethod;
@@ -2912,9 +3031,11 @@ export type RequestOptions<T = unknown> = {
   signal?: AbortSignal;
 
   /**
-   * Whether redirect responses should be followed automatically.
+   * Whether redirect responses should be followed automatically - or a function asked about each
+   * redirect, as in got: `false` makes the redirect the response (a success, not an `HTTPError`).
+   * Either one on a client turns redirects on; per request it can only narrow what the client does.
    */
-  followRedirect?: boolean;
+  followRedirect?: boolean | ((response: RedirectResponse) => boolean);
 
   /**
    * Returns a `Stream` instead of a `Promise`.
@@ -2930,6 +3051,12 @@ export type RequestOptions<T = unknown> = {
    * @default false
    **/
   resolveBodyOnly?: boolean;
+
+  /** Parses a `json` response body, and the `.json()` shortcut's. `JSON.parse` by default. */
+  parseJson?: (text: string) => unknown;
+
+  /** Serialises the `json` option into the request body. `JSON.stringify` by default. */
+  stringifyJson?: (object: unknown) => string;
 
   /**
    * Different from `got`'s `agent` option, single dispatcher is used for all requests.
@@ -2970,6 +3097,13 @@ export type RequestOptions<T = unknown> = {
   connectTimeout?: number;
 
   /**
+   * got's TLS options, under got's names - `rejectUnauthorized`, `certificateAuthority`, `key`,
+   * `certificate`, ... They configure the client's dispatcher, so like the options above they
+   * can only be set when creating or extending a client. `extend()` merges them one level deep.
+   */
+  https?: HttpsOptions;
+
+  /**
    * RFC 9111 response caching, via undici's `cache` interceptor. `true` uses an in-memory
    * store; pass an object to configure it (including a `SqliteCacheStore`).
    */
@@ -2981,6 +3115,79 @@ export type RequestOptions<T = unknown> = {
    */
   dedupe?: boolean | DedupeOptions;
 };
+
+/** got's `https` options. Each is handed to `tls.connect` under the name in `httpsToTls`. */
+export type HttpsOptions = {
+  rejectUnauthorized?: boolean;
+  checkServerIdentity?: tls.ConnectionOptions['checkServerIdentity'];
+  serverName?: string;
+  certificateAuthority?: tls.SecureContextOptions['ca'];
+  key?: tls.SecureContextOptions['key'];
+  certificate?: tls.SecureContextOptions['cert'];
+  passphrase?: string;
+  pfx?: tls.SecureContextOptions['pfx'];
+  ciphers?: string;
+  honorCipherOrder?: boolean;
+  minVersion?: tls.SecureVersion;
+  maxVersion?: tls.SecureVersion;
+  signatureAlgorithms?: string;
+  tlsSessionLifetime?: number;
+  dhparam?: tls.SecureContextOptions['dhparam'];
+  ecdhCurve?: string;
+  certificateRevocationLists?: tls.SecureContextOptions['crl'];
+  secureOptions?: number;
+};
+
+/**
+ * got's `https` names and the `tls.connect` option each one is - the mapping got itself applies
+ * (`core/options.js`). A `Record` over every key, so a name added to `HttpsOptions` and not here
+ * is a compile error rather than an option accepted and dropped.
+ */
+const httpsToTls: Record<keyof HttpsOptions, string> = {
+  rejectUnauthorized: 'rejectUnauthorized',
+  checkServerIdentity: 'checkServerIdentity',
+  serverName: 'servername',
+  certificateAuthority: 'ca',
+  key: 'key',
+  certificate: 'cert',
+  passphrase: 'passphrase',
+  pfx: 'pfx',
+  ciphers: 'ciphers',
+  honorCipherOrder: 'honorCipherOrder',
+  minVersion: 'minVersion',
+  maxVersion: 'maxVersion',
+  signatureAlgorithms: 'sigalgs',
+  tlsSessionLifetime: 'sessionTimeout',
+  dhparam: 'dhparam',
+  ecdhCurve: 'ecdhCurve',
+  certificateRevocationLists: 'crl',
+  secureOptions: 'secureOptions',
+};
+
+/** undici's `connect` options for a client: its `dnsLookup` and its `https` options, if any. */
+function connectOptions(options: RequestOptions): Record<string, unknown> | undefined {
+  const {dnsLookup, https} = options;
+
+  if (dnsLookup === undefined && https === undefined) {
+    return undefined;
+  }
+
+  const connect: Record<string, unknown> = {};
+
+  if (dnsLookup !== undefined) {
+    connect['lookup'] = dnsLookup;
+  }
+
+  for (const key in https) {
+    const value = https[key as keyof HttpsOptions];
+
+    if (value !== undefined) {
+      connect[httpsToTls[key as keyof HttpsOptions]] = value;
+    }
+  }
+
+  return connect;
+}
 
 export type DnsCacheOptions = NonNullable<Parameters<typeof interceptors.dns>[0]>;
 export type CacheOptions = NonNullable<Parameters<typeof interceptors.cache>[0]>;
@@ -3008,9 +3215,43 @@ export type RedirectRequest = {
   headers: IncomingHttpHeaders;
 };
 
+/**
+ * The redirect a `followRedirect` function is asked about: its head, before any body is read.
+ * got hands the function its full response; this is the part of one that exists at that point.
+ */
+export type RedirectResponse = {
+  statusCode: number;
+  statusMessage: string | undefined;
+  headers: IncomingHttpHeaders;
+  /** The url that answered with the redirect. */
+  url: string;
+  /** The url the request started at, before any redirect - got's `requestUrl`. */
+  requestUrl: URL;
+};
+
+/**
+ * got's `init` hook: called with a copy of the options a call (or `extend()`) was handed, before
+ * they are validated, so it can turn an option of its own into real ones - rename it, move it into
+ * `context` - and delete it. Synchronous. The second argument is the same object, with `context`
+ * and `headers` always present, where got hands over its `Options` instance: what a hook writes
+ * there is merged over the client's, as the call's own options are.
+ */
+export type InitHook = (
+  plain: RequestOptions & Record<string, any>,
+  options: RequestOptions & {context: Record<string, any>; headers: IncomingHttpHeaders},
+) => void;
+
 export type Hooks<T = any> = {
-  /** Run after options are formed and the body is serialised; may mutate `options`. */
-  beforeRequest?: ((options: FormedOptions) => void | Promise<void>)[];
+  /**
+   * Run on the options of every call made with an options object, and on `extend()`'s - see
+   * `InitHook`. Like the other hooks, only on a client.
+   */
+  init?: InitHook[];
+  /**
+   * Run after options are formed and the body is serialised; may mutate `options`. Returning a
+   * `ResponseLike` answers the request with it instead of sending it, as in got.
+   */
+  beforeRequest?: ((options: FormedOptions) => void | ResponseLike | Promise<void | ResponseLike>)[];
   /**
    * Run before `throwHttpErrors` is applied, so error statuses are visible here.
    * Must return a response - either the one it was given, or `retryWithMergedOptions(...)`.
@@ -3239,38 +3480,42 @@ function shortcutJson<J>(this: ShortcutPromise): ResponsePromise<J> {
     root.then((value) => {
       if (!(value instanceof GotlikeResponse)) {
         // `resolveBodyOnly`: the body is all there is to go on.
-        return (typeof value === 'string' ? parseShortcutJson(value, undefined) : value) as J;
+        return (typeof value === 'string' ? parseShortcutJson(value, undefined, root[shortcutOptions]) : value) as J;
       }
 
       if (value.request.options.responseType === 'json') {
         return value.body as J;
       }
 
-      return parseShortcutJson(value.rawBody.toString('utf8'), value) as J;
+      return parseShortcutJson(value.rawBody.toString('utf8'), value, value.request.options) as J;
     }),
   );
 }
 
-function parseShortcutJson(text: string, response: GotlikeResponse<unknown> | undefined): unknown {
+function parseShortcutJson(
+  text: string,
+  response: GotlikeResponse<unknown> | undefined,
+  options: RequestOptions | undefined,
+): unknown {
   // got's parser hands back an empty body as-is rather than failing on it.
   if (text === '') {
     return '';
   }
 
   try {
-    return JSON.parse(text);
+    return (options?.parseJson ?? JSON.parse)(text);
   } catch (error) {
     if (response === undefined) {
       throw error;
     }
 
-    const {options} = response.request;
+    const formed = response.request.options;
 
     throw new ParseError(
-      `${(error as Error).message} in "${String(options.url)}"`,
+      `${(error as Error).message} in "${String(formed.url)}"`,
       'ERR_BODY_PARSE_FAILURE',
       error as Error,
-      options,
+      formed,
       response,
     );
   }
@@ -3659,6 +3904,7 @@ const agentOptions = [
   'keepAliveTimeout',
   'keepAliveMaxTimeout',
   'connectTimeout',
+  'https',
 ] as const satisfies readonly (keyof RequestOptions)[];
 
 /**
@@ -3745,6 +3991,8 @@ const knownOptionMap = {
   followRedirect: true,
   isStream: true,
   resolveBodyOnly: true,
+  parseJson: true,
+  stringifyJson: true,
   context: true,
   validate: true,
   parseUserinfo: true,
@@ -3759,6 +4007,7 @@ const knownOptionMap = {
   keepAliveTimeout: true,
   keepAliveMaxTimeout: true,
   connectTimeout: true,
+  https: true,
   cache: true,
   dedupe: true,
   decompress: true,
@@ -3833,19 +4082,180 @@ export type DefaultsMergeOptions = Omit<
 export type ClientDefaults = {
   /** Whether `options.merge()` may change the client. Fixed when the client is built. */
   readonly mutableDefaults: boolean;
-  readonly options: {
-    /**
-     * Merge options into the client's defaults, by the rules `extend()` merges by - headers
-     * case-insensitively, `context`/`timeout`/`searchParams` one level deep, everything else
-     * replaced. Every request made afterwards sees them; one already in flight does not, and
-     * neither does a client extended from this one earlier.
-     *
-     * A `ValidationError` on a client built without `mutableDefaults: true` - got ignores the
-     * merge silently there - and for an option only `extend()` can apply.
-     */
-    merge(options: DefaultsMergeOptions): void;
-  };
+  /**
+   * The client's options, live: a `merge()` shows up here. `headers` are the ones every request
+   * starts from, lower-cased, `accept-encoding` included. On a client built with `mutableDefaults:
+   * true` an assignment - `options.prefixUrl = x`, `options.headers.authorization = y` - is a
+   * `merge()` of that one option; on any other client, and for anything `merge()` refuses, it is a
+   * `ValidationError`.
+   */
+  readonly options: RequestOptions &
+    Required<Pick<RequestOptions, 'headers'>> & {
+      /**
+       * Merge options into the client's defaults, by the rules `extend()` merges by - headers
+       * case-insensitively, `context`/`timeout`/`searchParams` one level deep, everything else
+       * replaced. Every request made afterwards sees them; one already in flight does not, and
+       * neither does a client extended from this one earlier.
+       *
+       * A `ValidationError` on a client built without `mutableDefaults: true` - got ignores the
+       * merge silently there - and for an option only `extend()` can apply.
+       */
+      merge(options: DefaultsMergeOptions): void;
+    };
 };
+
+/**
+ * `client.defaults.options`: the client's options as got's callers read them - `prefixUrl`,
+ * `headers`, `timeout`, `hooks` - and `merge()`.
+ *
+ * It used to hold only `merge()`, so every read came back `undefined` with no error, which is the
+ * worst way for a drop-in to differ. A proxy over the live `baseOptions` rather than a copy, so a
+ * `merge()` - which replaces `baseOptions` - shows up here, and nothing is copied until read.
+ * Writing through it is refused instead of reaching `baseOptions`: `defaultHeaders` is derived
+ * from it once, so a write to `headers` would change what this reports and not what is sent.
+ */
+function defaultsView(
+  client: Gotlike,
+  mutableDefaults: boolean,
+  merge: (extension: DefaultsMergeOptions) => void,
+): ClientDefaults['options'] {
+  // `headers` and `context` are what a got caller writes into - `defaults.options.headers.token =
+  // fresh` - so they are live records whose writes are `merge()`s, refused on an immutable client.
+  const headers = liveRecord(
+    () => client.defaultHeaders,
+    (key, value) => merge({headers: {[key]: value as string | undefined}}),
+    mutableDefaults,
+  );
+  const context = liveRecord(
+    () => client.baseOptions.context,
+    (key, value) => merge({context: {[key]: value}}),
+    mutableDefaults,
+  );
+  const read = (key: string): unknown => {
+    if (key === 'headers') {
+      return headers;
+    }
+
+    // Always a record, empty when the client has none, as got's always is.
+    if (key === 'context') {
+      return context;
+    }
+
+    if (key === 'mutableDefaults') {
+      return mutableDefaults;
+    }
+
+    return readOnlyValue((client.baseOptions as Record<string, unknown>)[key]);
+  };
+  // `context` is left out, and reported non-enumerable, as got's is - it keeps a caller's context out
+  // of a logged or serialised options object.
+  const keys = (): string[] =>
+    Object.keys(client.baseOptions).filter((key) => key !== 'context' && read(key) !== undefined);
+  // An assignment is a `merge()` of that one option, as got's `mutableDefaults` allows - and so
+  // refused for anything `merge()` refuses, with its reason.
+  const write = (key: string | symbol, value: unknown): boolean => {
+    if (typeof key !== 'string' || key === 'merge' || !mutableDefaults) {
+      refuseWrite();
+    }
+
+    merge({[key]: value});
+
+    return true;
+  };
+
+  return new Proxy({} as ClientDefaults['options'], {
+    get: (_, key) => (key === 'merge' ? merge : typeof key === 'string' ? read(key) : undefined),
+    has: (_, key) => key === 'merge' || (typeof key === 'string' && read(key) !== undefined),
+    ownKeys: () => keys(),
+    getOwnPropertyDescriptor: (_, key) => {
+      const value = typeof key === 'string' && key !== 'merge' ? read(key) : undefined;
+
+      return value === undefined
+        ? undefined
+        : {value, writable: mutableDefaults, enumerable: key !== 'context', configurable: true};
+    },
+    set: (_, key, value) => write(key, value),
+    deleteProperty: (_, key) => write(key, undefined),
+    defineProperty: refuseWrite,
+  });
+}
+
+/**
+ * A record read through `current()` on every access - a `merge()` replaces the object behind it -
+ * whose writes go to `write` rather than to the object, and only when `writable`.
+ */
+function liveRecord(
+  current: () => Record<string, unknown> | undefined,
+  write: (key: string, value: unknown) => void,
+  writable: boolean,
+): Record<string, unknown> {
+  const assign = (key: string | symbol, value: unknown): boolean => {
+    if (typeof key !== 'string' || !writable) {
+      refuseWrite();
+    }
+
+    write(key, value);
+
+    return true;
+  };
+
+  const target: Record<string, unknown> = {};
+
+  return new Proxy(target, {
+    get: (_, key) => (typeof key === 'string' ? readOnlyValue(current()?.[key]) : undefined),
+    has: (_, key) => typeof key === 'string' && current()?.[key] !== undefined,
+    ownKeys: () => Object.keys(current() ?? {}).filter((key) => current()?.[key] !== undefined),
+    getOwnPropertyDescriptor: (_, key) => {
+      const value = typeof key === 'string' ? current()?.[key] : undefined;
+
+      return value === undefined
+        ? undefined
+        : {value: readOnlyValue(value), writable, enumerable: true, configurable: true};
+    },
+    set: (_, key, value) => assign(key, value),
+    deleteProperty: (_, key) => assign(key, undefined),
+    defineProperty: refuseWrite,
+  });
+}
+
+const readOnlyViews = new WeakMap<object, object>();
+
+/**
+ * A plain object or array as a proxy that refuses writes, recursively; anything else - a
+ * `URLSearchParams`, a dispatcher, a function - as it is, since a proxy breaks a class instance's
+ * methods. The same proxy for the same object, so reading twice compares equal.
+ */
+function readOnlyValue(value: unknown): unknown {
+  if (typeof value !== 'object' || value === null) {
+    return value;
+  }
+
+  const proto = Object.getPrototypeOf(value) as unknown;
+
+  if (!Array.isArray(value) && proto !== Object.prototype && proto !== null) {
+    return value;
+  }
+
+  let view = readOnlyViews.get(value);
+
+  if (view === undefined) {
+    view = readOnly(value, {get: (target, key) => readOnlyValue(Reflect.get(target, key))});
+    readOnlyViews.set(value, view);
+  }
+
+  return view;
+}
+
+function refuseWrite(): never {
+  invalid(
+    '`client.defaults.options` is read-only - use `client.defaults.options.merge()` (on a client built ' +
+      'with `mutableDefaults: true`) or `extend()`',
+  );
+}
+
+function readOnly<T extends object>(target: T, handler: ProxyHandler<T>): T {
+  return new Proxy(target, {...handler, set: refuseWrite, deleteProperty: refuseWrite, defineProperty: refuseWrite});
+}
 
 /**
  * Catches the option mistakes that otherwise fail confusingly much later - a misspelled
@@ -3934,6 +4344,20 @@ function validateOptions(options: RequestOptions & {url?: unknown}, atCreation: 
     invalid('`headers` must be an object');
   }
 
+  const {followRedirect, parseJson, stringifyJson} = options;
+
+  if (parseJson !== undefined && typeof parseJson !== 'function') {
+    invalid('`parseJson` must be a function');
+  }
+
+  if (stringifyJson !== undefined && typeof stringifyJson !== 'function') {
+    invalid('`stringifyJson` must be a function');
+  }
+
+  if (followRedirect !== undefined && typeof followRedirect !== 'boolean' && typeof followRedirect !== 'function') {
+    invalid('`followRedirect` must be a boolean or a function');
+  }
+
   /*
    * got's `agent` is `{http, https, http2}` node agents; here it is one undici dispatcher. The got
    * shape used to be accepted and then fail every request deep in the dispatch with `base.compose
@@ -3946,6 +4370,22 @@ function validateOptions(options: RequestOptions & {url?: unknown}, atCreation: 
     invalid(
       "`agent` must be an undici dispatcher (`Agent`, `Pool`, `ProxyAgent`, ...); got's `{http, https}` node agents do not apply",
     );
+  }
+
+  const {https} = options;
+
+  if (https !== undefined) {
+    if (typeof https !== 'object' || https === null) {
+      invalid('`https` must be an object like `{rejectUnauthorized: false}`');
+    }
+
+    for (const key in https) {
+      if (Object.hasOwn(https, key) && !Object.hasOwn(httpsToTls, key)) {
+        rejectUnimplemented(`https.${key}`);
+
+        invalid(`Unknown option \`https.${key}\``);
+      }
+    }
   }
 
   if (prefixUrl !== undefined) {
@@ -4086,7 +4526,11 @@ function validateRequest(options: RequestOptions & {url?: unknown}, followsRedir
   // decision - a per-request `true` would otherwise be silently ignored. Turning them off per
   // request is fine, and just sets `maxRedirections: 0`.
   if (options.followRedirect && !followsRedirects) {
-    invalid('`followRedirect: true` can only be set when creating or extending a client');
+    invalid(
+      typeof options.followRedirect === 'function'
+        ? '`followRedirect` as a function turns redirects on, which can only be done when creating or extending a client'
+        : '`followRedirect: true` can only be set when creating or extending a client',
+    );
   }
 }
 
@@ -4154,6 +4598,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * Hooks flattened out of `baseOptions` once, so `call()` only has to check for a
    * non-empty array instead of walking an options object per request.
    */
+  initHooks?: NonNullable<Hooks['init']>;
   beforeRequestHooks?: NonNullable<Hooks['beforeRequest']>;
   afterResponseHooks?: NonNullable<Hooks['afterResponse']>;
   beforeErrorHooks?: NonNullable<Hooks['beforeError']>;
@@ -4236,9 +4681,17 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       merged.mutableDefaults = undefined;
     }
 
+    // The view is built on first read: `extend()` constructs a client, and some callers extend
+    // per request, so an unread `defaults.options` has to cost nothing.
+    let view: ClientDefaults['options'] | undefined;
+    const buildView = (): ClientDefaults['options'] =>
+      defaultsView(this, mutableDefaults, (extension) => this.#mergeDefaults(extension));
+
     this.defaults = Object.freeze({
       mutableDefaults,
-      options: Object.freeze({merge: (extension: DefaultsMergeOptions) => this.#mergeDefaults(extension)}),
+      get options() {
+        return (view ??= buildView());
+      },
     });
 
     // Folded once here so `formOptions` only has to look at a per-call method.
@@ -4247,7 +4700,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     this.baseOptions = merged;
-    this.followsRedirects = merged.followRedirect === true;
+    // A function turns redirects on as well: it is asked about each one, which needs the
+    // interceptor composed.
+    this.followsRedirects = merged.followRedirect === true || typeof merged.followRedirect === 'function';
     this.validate = merged.validate !== false;
     this.parseUserinfo = merged.parseUserinfo !== false;
     this.decompress = merged.decompress !== false;
@@ -4281,6 +4736,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     }
 
     // Left undefined when empty, so `call()` only has to check for a truthy field.
+    this.initHooks = usedHooks(merged.hooks?.init);
     this.beforeRequestHooks = usedHooks(merged.hooks?.beforeRequest);
     this.afterResponseHooks = usedHooks(merged.hooks?.afterResponse);
     this.beforeErrorHooks = usedHooks(merged.hooks?.beforeError);
@@ -4300,11 +4756,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         keepAliveTimeout: merged.keepAliveTimeout,
         keepAliveMaxTimeout: merged.keepAliveMaxTimeout,
         connectTimeout: merged.connectTimeout,
-        connect: merged.dnsLookup
-          ? {
-              lookup: merged.dnsLookup,
-            }
-          : undefined,
+        connect: connectOptions(merged),
       });
     }
 
@@ -4508,6 +4960,22 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * it passes in - `call()` and the `beforeRequest` hooks mutate what they're given.
    */
   formOptions(options: RequestOptions, url?: string | URL, method?: Dispatcher.HttpMethod): FormedOptions {
+    // Before validation, which is the point of it: the hook removes the option it made up.
+    if (this.initHooks !== undefined) {
+      try {
+        options = applyInitHooks(this.initHooks, options);
+      } catch (error) {
+        // A failure of the request, as in got, not a raw error: there are no formed options yet
+        // for the `beforeError` hooks to be handed, so they do not run.
+        throw new RequestError(
+          messageOf(error, 'init hook failed'),
+          codeOf(error, 'ERR_REQUEST_ERROR'),
+          error as Error,
+          {...options, url},
+        );
+      }
+    }
+
     if (this.validate) {
       validateRequest(options, this.followsRedirects);
     }
@@ -4726,6 +5194,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   }
 
   /**
+   * Whether a 3xx that reached the caller was one this request *would* have followed - which is
+   * what makes it an error (see `isHttpError`). Not when a `followRedirect` function declined it:
+   * got resolves that redirect as the response.
+   */
+  followed(options: FormedOptions, redirects: RedirectState | undefined): boolean {
+    return this.follows(options) && redirects?.declined !== true;
+  }
+
+  /**
    * The options every dispatch shares. `call()`, `callBodylessStream()` and `callStream()`
    * built this same literal three times over, which is three places to forget a field.
    */
@@ -4761,7 +5238,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       maxRedirections: this.follows(options) ? maxRedirections : 0,
       // Only when redirects are actually in play. Allocating it for any client that merely
       // *had* a `beforeRedirect` hook meant a per-request object the tracker never read.
-      redirects: this.follows(options) ? {count: 0} : undefined,
+      redirects: this.follows(options)
+        ? {count: 0, follow: typeof options.followRedirect === 'function' ? options.followRedirect : undefined}
+        : undefined,
       // Handed to every dispatch, streams included: this is what drives `retryCount` and
       // fires `beforeRetry`.
       attempts,
@@ -4869,6 +5348,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     let undiciResponse;
     /** Whether the head arrived, so a failure from here on is reading the body - see `ReadError`. */
     let headArrived = false;
+    /** A response a `beforeRequest` hook answered with, in place of making the request. */
+    let answered: ResponseLike | undefined;
     let responseBody;
     let rawText;
     let startTime;
@@ -4928,7 +5409,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // Serialise up front so `beforeRequest` hooks can read and re-sign `options.body`
       // regardless of whether the caller passed `json` or `body`.
       if (options.json !== undefined) {
-        options.body = JSON.stringify(options.json);
+        options.body = (options.stringifyJson ?? JSON.stringify)(options.json);
 
         // Case-insensitive: undici would otherwise send both a caller's `Content-Type` and
         // the one we add, and the header the server picks is anyone's guess.
@@ -4994,7 +5475,13 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
          */
         try {
           for (const hook of this.beforeRequestHooks) {
-            await hook(options);
+            const answer = await hook(options);
+
+            // got: a hook returning a response answers the request, and the rest are skipped.
+            if (answer !== undefined && isResponseLike(answer)) {
+              answered = answer;
+              break;
+            }
           }
         } finally {
           // The instrumentation is only needed while the hooks can still write, and `writes` is
@@ -5132,6 +5619,15 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       const body = options.body;
 
       if (options.isStream) {
+        if (answered !== undefined) {
+          throw new RequestError(
+            'A `beforeRequest` hook cannot answer a stream request - return the response from a promise call',
+            'ERR_REQUEST_ERROR',
+            undefined,
+            options,
+          );
+        }
+
         /*
          * The method alone decides, not whether a body happens to be present. The pipeline
          * path exists so the *caller* can write the request body into the duplex's writable
@@ -5149,25 +5645,32 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
       startTime = process.hrtime();
 
-      const dispatch = this.dispatchOptions(options);
+      if (answered === undefined) {
+        const dispatch = this.dispatchOptions(options);
 
-      // Only allocated for clients that actually retry; everyone else reports 0.
-      attempts = dispatch.attempts;
-      // Only allocated when redirects are being followed; records where the chain ended.
-      redirects = dispatch.redirects;
-      release = dispatch.release;
+        // Only allocated for clients that actually retry; everyone else reports 0.
+        attempts = dispatch.attempts;
+        // Only allocated when redirects are being followed; records where the chain ended.
+        redirects = dispatch.redirects;
+        release = dispatch.release;
 
-      const requestOptions: UndiciRequestOptions = {
-        ...dispatch,
-        body,
-      };
+        const requestOptions: UndiciRequestOptions = {
+          ...dispatch,
+          body,
+        };
 
-      undiciResponse = await undici.request(url, requestOptions);
+        undiciResponse = await undici.request(url, requestOptions);
+
+        // The response is ours, so nothing is going to retry it - if the retry bookkeeping paused
+        // the deadline expecting one, the body read below would otherwise run unbounded.
+        dispatch.resume();
+      } else {
+        // Read below exactly as a response from the wire is: parsed by `responseType`, then the
+        // `afterResponse` hooks and `throwHttpErrors`.
+        undiciResponse = answeredResponse(answered);
+      }
+
       headArrived = true;
-
-      // The response is ours, so nothing is going to retry it - if the retry bookkeeping paused
-      // the deadline expecting one, the body read below would otherwise run unbounded.
-      dispatch.resume();
 
       if (hasNoBody(undiciResponse.statusCode, options.method)) {
         // 204/205/304 and HEAD cannot carry a body, so there is nothing to parse. Attempting
@@ -5201,7 +5704,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
          */
         if (text !== '') {
           try {
-            responseBody = JSON.parse(text);
+            responseBody = (options.parseJson ?? JSON.parse)(text);
           } catch (error) {
             /*
              * On an error status the parse failure is not the story - the status is. An upstream
@@ -5214,7 +5717,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
              * `HTTPError`, and with `throwHttpErrors: false` it *resolves*, body and all. Only a
              * parse failure on an otherwise-ok response is a `ParseError`.
              */
-            if (!isHttpError(undiciResponse.statusCode, this.follows(options))) {
+            if (!isHttpError(undiciResponse.statusCode, this.followed(options, redirects))) {
               // Flagged rather than recognised by message. V8 words this differently depending
               // on the input ("Unexpected end of JSON input" vs "... is not valid JSON"), and
               // matching on the wording misfiled empty bodies as generic request errors.
@@ -5312,6 +5815,18 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // refused, a DNS failure and a malformed url alike, leaving every log line and every
       // APM grouping unable to tell them apart. got reports the underlying message too.
       const failure = resumeFailure(err, attempts) ?? err;
+
+      if (isUploadFailure(failure, options)) {
+        throw await this.toRequestError(
+          messageOf(failure, 'Upload failed'),
+          'ERR_UPLOAD',
+          failure as Error,
+          options,
+          response,
+          UploadError,
+        );
+      }
+
       const {message, code} = transportFailure(failure, options, headArrived);
 
       // A failure once the head has arrived is a failure reading the body, which got calls a
@@ -5435,7 +5950,13 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      */
     const effectiveOptions = response.request?.options ?? options;
 
-    if (effectiveOptions.throwHttpErrors && isHttpError(response.statusCode, this.follows(effectiveOptions))) {
+    if (
+      effectiveOptions.throwHttpErrors &&
+      isHttpError(
+        response.statusCode,
+        this.followed(effectiveOptions, effectiveOptions === options ? redirects : undefined),
+      )
+    ) {
       // A 3xx here on a client that follows redirects is one undici gave up on. When that was the
       // limit - more dispatches in the chain than redirects allowed - it is got's
       // `MaxRedirectsError` rather than an `HTTPError` for the redirect page. Only for this call's
@@ -5508,7 +6029,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
     const streamHead = makeStreamHead(undiciResponse.statusCode, undiciResponse.headers, options, dispatch, startTime);
 
-    if (!options.throwHttpErrors || !isHttpError(undiciResponse.statusCode, this.follows(options))) {
+    if (
+      !options.throwHttpErrors ||
+      !isHttpError(undiciResponse.statusCode, this.followed(options, dispatch.redirects))
+    ) {
       // The head arrived, but the body can still fail: a socket reset part-way through a
       // download used to surface undici's raw `SocketError` and skip the `beforeError` hooks.
       // The head goes with the failure when it does - see `streamResponse`.
@@ -5607,6 +6131,17 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       return this.toRequestError(abortMessage(error), 'ERR_ABORTED', error, options, response, AbortError);
     }
 
+    if (isUploadFailure(error, options)) {
+      return this.toRequestError(
+        messageOf(error, 'Upload failed'),
+        'ERR_UPLOAD',
+        error,
+        options,
+        response,
+        UploadError,
+      );
+    }
+
     const {message, code} = transportFailure(error, options, response !== undefined);
 
     // As in `call()`: once the head has arrived, the failure is reading the body.
@@ -5657,7 +6192,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         responded = streamHead;
         resolveHead(streamHead);
 
-        if (!options.throwHttpErrors || !isHttpError(statusCode, this.follows(options))) {
+        if (!options.throwHttpErrors || !isHttpError(statusCode, this.followed(options, dispatch.redirects))) {
           duplex.emit('response', streamHead);
 
           return body;
@@ -6114,6 +6649,14 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   }
 
   extend<E extends RequestOptions>(options: E): Gotlike<MergeClientOptions<O, E>> {
+    // got calls the parent's `init` hooks and the extension's own on every options object it
+    // merges, and this is one. Guarded, since the extension has not been validated yet.
+    const ownInit = options.hooks?.init;
+
+    if (this.initHooks !== undefined || (Array.isArray(ownInit) && ownInit.length > 0)) {
+      options = applyInitHooks([...(this.initHooks ?? []), ...(ownInit ?? [])], options) as E;
+    }
+
     // Checked here as well as in the constructor, which sees the merged result: `timeout` and
     // `searchParams` are merged below, and merging a bad value into a well-formed one turns a
     // `ValidationError` into a silently wrong client.
@@ -6183,6 +6726,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       // The same reasoning for the same shape of mistake: `extend({timeout: {}})` dropped the
       // parent's deadline, and an extended client that named a query lost the parent's.
       timeout: mergeTimeout(base?.timeout, options.timeout),
+      // As got merges it: `extend({https: {rejectUnauthorized: false}})` keeps the parent's `ca`.
+      https: mergeRecords(base?.https, options.https),
       searchParams:
         base?.searchParams !== undefined && options.searchParams !== undefined
           ? mergeSearchParams(base.searchParams, options.searchParams)
@@ -6483,7 +7028,13 @@ function asCallable<O extends ClientOptions>(instance: Gotlike<O>): CallableClie
 export function createClient(): CallableClient<NoClientOptions>;
 export function createClient<O extends ClientOptions = ClientOptions>(options?: O): CallableClient<O>;
 export function createClient<O extends ClientOptions>(options?: O): CallableClient<O> {
-  return asCallable(new Gotlike<O>(options));
+  // `createClient(options)` is got's `got.extend(options)`, which runs the options' own `init`
+  // hooks on them - see `extend()`.
+  const init = options?.hooks?.init;
+
+  return asCallable(
+    new Gotlike<O>(Array.isArray(init) && init.length > 0 ? (applyInitHooks(init, options!) as O) : options),
+  );
 }
 
 /**
