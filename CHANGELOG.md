@@ -4,7 +4,7 @@ All notable changes to this project are documented here. This project adheres to
 [semantic versioning](https://semver.org/spec/v2.0.0.html); while the major version is `0`, a
 minor bump is where breaking changes land.
 
-## Unreleased
+## 0.8.0 - 2026-09-28
 
 ### Added
 

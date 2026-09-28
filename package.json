@@ -1,6 +1,6 @@
 {
   "name": "gotlike",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "Barebones got-like undici-based http client for node.js",
   "keywords": [
     "undici",
