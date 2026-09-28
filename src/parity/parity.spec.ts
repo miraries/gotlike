@@ -831,18 +831,15 @@ parityTest('timeout.request bounds each attempt rather than the whole retry sequ
 /* ------------------------------------------------------------- url as argument and option */
 
 parityTest('a url given both as an argument and as an option is rejected', {
-  claim: 'CLAUDE.md: got refuses the combination outright rather than picking a winner.',
+  claim: 'CLAUDE.md: got refuses a `url` key in an options object outright; so does gotlike.',
   run: async (client, base) => capture(() => client.get(`${base}/echo`, {url: `${base}/status?code=404`}), base),
   divergence: {
     reason:
-      'The claim holds - both refuse, and neither sends a request. What is left is the error’s class ' +
-      'and code: got throws a bare `TypeError` with no code (since got 15 a `url` key in an options ' +
-      'object is refused outright, so the message is about the option rather than the combination), gotlike a ' +
-      '`ValidationError` with `ERR_INVALID_OPTION`. Keeping a distinct class for "you configured this ' +
-      'wrong" rather than folding it into `RequestError` is deliberate, since it is a programming error ' +
-      'rather than a request that failed. got 14 threw a `RequestError`/`ERR_GOT_REQUEST_ERROR` here ' +
-      'with the message "The `url` option is mutually exclusive with the `input` argument"; the change ' +
-      'came with the got 16 bump and is the whole reason this is pinned rather than skipped.',
+      'Both refuse with the same message and neither sends a request. What is left is the error’s class ' +
+      'and code: got throws a bare `TypeError` with no code, gotlike a `ValidationError` with ' +
+      '`ERR_INVALID_OPTION`. Keeping a distinct class for "you configured this wrong" rather than folding ' +
+      'it into `RequestError` is deliberate, since it is a programming error rather than a request that ' +
+      'failed - the same split every other validation failure here has.',
     got: {
       outcome: 'rejected',
       name: 'TypeError',
@@ -855,7 +852,7 @@ parityTest('a url given both as an argument and as an option is rejected', {
       outcome: 'rejected',
       name: 'ValidationError',
       code: 'ERR_INVALID_OPTION',
-      message: '`url` cannot be given both as an argument and as an option',
+      message: 'The `url` option is not supported in options objects. Pass it as the first argument instead.',
       responseStatus: undefined,
       responseBody: undefined,
     },
@@ -865,16 +862,13 @@ parityTest('a url given both as an argument and as an option is rejected', {
 /* ------------------------------------------------------------- url as an option alone */
 
 /**
- * The callable form's own signature, and a divergence that only exists as of got 16.
- *
- * `client({url, ...})` is documented and is how a caller passes a url alongside everything
- * else in one object. got 12 and 14 took it; got 16 removed the option and answers with a
- * `TypeError` in every position. gotlike keeps it - `igd-aggregator-api` is on `got-cjs@12`,
- * where this is the ordinary spelling - so the two now disagree about a form the README
- * advertises. Pinned on both sides so neither can move without the suite noticing.
+ * `client({url, ...})`. got 12 and 14 took it; got 15 removed the option and got 16 answers with a
+ * `TypeError` in every position. gotlike kept it for a while because its first consumer was on
+ * got-cjs@12, which made a call that works here throw under got - the one direction a drop-in
+ * cannot differ in. It refuses it now, with got's message; only the class and code differ.
  */
 parityTest('a url given only as an option', {
-  claim: 'README: the callable client takes `gotlike({url, ...})` as well as `gotlike(url, options)`.',
+  claim: 'got 16: a `url` key in an options object is refused, the url is the first argument.',
   run: async (client, base) => {
     const callable = client as unknown as (options: Record<string, unknown>) => Promise<AnyResponse>;
 
@@ -890,18 +884,20 @@ parityTest('a url given only as an option', {
   },
   divergence: {
     reason:
-      'got refuses a `url` key in an options object as of got 15: it throws a `TypeError` rather than ' +
-      'sending anything, here as well as alongside a positional argument. gotlike accepts it and dispatches, ' +
-      'because the callable `client({url, ...})` form is built on that option and got-cjs@12 - what ' +
-      'the consumer this package exists for actually runs - accepts it too. Dropping it to match got ' +
-      '16 would break the documented callable form for no gain.',
+      'Both refuse with the same message and send nothing. got throws a bare `TypeError`, gotlike a ' +
+      '`ValidationError` with `ERR_INVALID_OPTION`, as for every other validation failure.',
     got: {
       outcome: 'rejected',
       name: 'TypeError',
       code: undefined,
       message: 'The `url` option is not supported in options objects. Pass it as the first argument instead.',
     },
-    gotlike: {outcome: 'resolved', statusCode: 204},
+    gotlike: {
+      outcome: 'rejected',
+      name: 'ValidationError',
+      code: 'ERR_INVALID_OPTION',
+      message: 'The `url` option is not supported in options objects. Pass it as the first argument instead.',
+    },
   },
 });
 

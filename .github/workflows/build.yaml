@@ -16,3 +16,18 @@ jobs:
       - run: npm run check
       # `check` typechecks with `noEmit`, which can't catch a declaration-emit failure.
       - run: npm run build
+  # got's and nock's own suites against gotlike - see conformance/CLAUDE.md. One node version:
+  # this is about what the client does, which the matrix above already covers per runtime.
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install
+      - run: npm run build
+      - run: node run.ts got
+        working-directory: conformance
+      - run: node run.ts nock
+        working-directory: conformance

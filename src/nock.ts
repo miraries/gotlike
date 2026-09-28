@@ -1,6 +1,6 @@
 import type {Url} from 'node:url';
 import {Readable} from 'node:stream';
-import {Dispatcher, getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
+import {DecoratorHandler, Dispatcher, getGlobalDispatcher, MockAgent, setGlobalDispatcher} from 'undici';
 import type {MockInterceptor} from 'undici/types/mock-interceptor.js';
 import type {Interceptable} from 'undici';
 
@@ -152,8 +152,82 @@ mockAgent.dispatch = (options, handler) => {
     appliedNetConnect = open;
   }
 
-  return mockDispatch(options, handler);
+  return mockDispatch(options, new NockErrorHandler(handler, options));
 };
+
+/**
+ * Delivers a miss as nock reports it (`asNockError`). undici's dispatcher catches the
+ * `MockNotMatchedError` its mock pool throws and hands it to the handler's `onResponseError`.
+ */
+class NockErrorHandler extends DecoratorHandler {
+  #options: Dispatcher.DispatchOptions;
+
+  constructor(handler: Dispatcher.DispatchHandler, options: Dispatcher.DispatchOptions) {
+    super(handler);
+    this.#options = options;
+
+    // `DecoratorHandler` always has the body hooks, and undici's mock drains a streamed body
+    // itself when a handler has them - changing when, and in what form, a reply callback sees an
+    // upload (see `resolveRequestBody`). Hidden unless the handler being wrapped has them too.
+    const self = this as unknown as Record<string, unknown>;
+
+    if (typeof handler.onBodySent !== 'function') {
+      self.onBodySent = undefined;
+    }
+
+    if (typeof handler.onRequestSent !== 'function') {
+      self.onRequestSent = undefined;
+    }
+  }
+
+  onResponseError(controller: Dispatcher.DispatchController, error: Error): void {
+    (DecoratorHandler.prototype as unknown as Required<Dispatcher.DispatchHandler>).onResponseError.call(
+      this,
+      controller,
+      asNockError(error, this.#options) as Error,
+    );
+  }
+}
+
+/**
+ * undici's miss as nock reports it.
+ *
+ * undici throws `MockNotMatchedError` (`UND_MOCK_ERR_MOCK_NOT_MATCHED`, `Mock dispatch not matched
+ * ...`) for both a miss on a mocked origin and a request to a host net connect refuses. Suites
+ * written against nock assert on nock's spelling - `/Nock: No match for request/`, `ERR_NOCK_NO_MATCH`,
+ * `ENETUNREACH` - and every one of those failed here although the mock had behaved exactly as
+ * nock's would. The message and code are nock's (`lib/intercepted_request_router.js`,
+ * `lib/common.js`); undici's error stays on `cause`, where its detail - which interceptors were
+ * left - is still useful. Found by running nock's own suite (`conformance/`).
+ */
+function asNockError(error: unknown, options: Dispatcher.DispatchOptions): unknown {
+  if ((error as {code?: string})?.code !== 'UND_MOCK_ERR_MOCK_NOT_MATCHED') {
+    return error;
+  }
+
+  const origin = String(options.origin);
+
+  if (!hasMockedOrigin(origin)) {
+    const url = new URL(options.path, origin);
+    const port = url.port === '' ? (url.protocol === 'http:' ? '80' : '443') : url.port;
+
+    return Object.assign(
+      new Error(`Nock: Disallowed net connect for "${url.hostname}:${port}${url.pathname}"`, {cause: error}),
+      {
+        name: 'NetConnectNotAllowedError',
+        code: 'ENETUNREACH',
+      },
+    );
+  }
+
+  const request = {method: options.method, url: new URL(options.path, origin).href, headers: options.headers};
+
+  return Object.assign(new Error(`Nock: No match for request ${JSON.stringify(request, null, 2)}`, {cause: error}), {
+    code: 'ERR_NOCK_NO_MATCH',
+    statusCode: 404,
+    status: 404,
+  });
+}
 
 /**
  * nock's net-connect test: the matcher is asked about `hostname:port`, lower-cased, with the port
@@ -291,8 +365,20 @@ export type Options = {
   reqheaders?: Record<string, HeaderMatcher>;
 };
 
+/** `nock(host, options)` - the scope-wide options the shim supports. See `scopeHeaders`. */
+export type ScopeOptions = Options & {
+  /** Accepted, not applied: an unmatched request is refused rather than passed through. */
+  allowUnmocked?: boolean;
+  /** Accepted, not applied: the scope matches only its own host. */
+  filteringScope?: (scope: string) => boolean;
+  /** Headers whose presence makes a request *not* match. */
+  badheaders?: string[];
+  /** Asked on every request; the scope's interceptors only match while it returns `true`. */
+  conditionally?: () => boolean;
+};
+
 export type ReplyHeaders = Record<string, string | string[]>;
-export type ReplyBody = string | Buffer | Record<string, any> | unknown[] | null;
+export type ReplyBody = string | number | boolean | Buffer | Record<string, any> | unknown[] | null;
 
 /** nock's `this` inside a reply callback. */
 type ReplyContext = {
@@ -510,16 +596,75 @@ function toBodyMatcher(body?: BodyMatcher): string | RegExp | ((body: string) =>
   }
 
   return (requestBody: string) => {
+    const text = bodyText(requestBody);
     let parsed: unknown;
 
     try {
-      parsed = JSON.parse(requestBody);
+      parsed = JSON.parse(text);
     } catch {
-      return false;
+      // Not JSON, so perhaps a form - see `formBody`.
+      const form = formBody(text);
+
+      return form !== undefined && bodyValueMatches(stringifyLeaves(body), form);
     }
 
     return bodyValueMatches(body, parsed);
   };
+}
+
+/**
+ * An urlencoded body as the object nock compares an object matcher against, a repeated key as an
+ * array; `undefined` for a body that is not a form at all.
+ *
+ * nock parses a form body before matching (`lib/match_body.js`), so `nock(host).post('/login',
+ * {user: 'a'})` matches `form: {user: 'a'}`. Here only JSON was parsed, so every such interceptor
+ * missed - and a miss on a mocked origin fails closed, as `Mock dispatch not matched`, which reads
+ * like the mock was written wrong. nock decides by the request's content-type, which never reaches a
+ * body matcher here (see `predicateBody`); deciding by the body alone is the same answer on both of
+ * undici's calls, which is what a matcher has to give. Nested `qs` keys (`a[b]=1`) are not expanded.
+ */
+function formBody(text: string): Record<string, string | string[]> | undefined {
+  if (text === '' || !text.includes('=')) {
+    return undefined;
+  }
+
+  const form: Record<string, string | string[]> = {};
+
+  for (const [key, value] of new URLSearchParams(text)) {
+    const previous = form[key];
+
+    form[key] = previous === undefined ? value : Array.isArray(previous) ? [...previous, value] : [previous, value];
+  }
+
+  return form;
+}
+
+/** A matcher with its scalar leaves as strings, which is how a form carries them - as nock compares. */
+function stringifyLeaves(expected: unknown): unknown {
+  if (Array.isArray(expected)) {
+    return expected.map(stringifyLeaves);
+  }
+
+  if (typeof expected === 'number' || typeof expected === 'boolean') {
+    return String(expected);
+  }
+
+  if (expected !== null && typeof expected === 'object' && !(expected instanceof RegExp)) {
+    return Object.fromEntries(Object.entries(expected).map(([key, value]) => [key, stringifyLeaves(value)]));
+  }
+
+  return expected;
+}
+
+/** A request body as undici hands it to a matcher - a string, a Buffer, or nothing - as text. */
+function bodyText(requestBody: string | ArrayBufferView | undefined): string {
+  if (requestBody === undefined) {
+    return '';
+  }
+
+  return typeof requestBody === 'string'
+    ? requestBody
+    : Buffer.from(requestBody.buffer, requestBody.byteOffset, requestBody.byteLength).toString('utf8');
 }
 
 /**
@@ -534,18 +679,74 @@ function toBodyMatcher(body?: BodyMatcher): string | RegExp | ((body: string) =>
  * in `nock-parity.spec.ts`.
  */
 function predicateBody(requestBody: string | ArrayBufferView | undefined): unknown {
-  const text =
-    requestBody === undefined
-      ? ''
-      : typeof requestBody === 'string'
-        ? requestBody
-        : Buffer.from(requestBody.buffer, requestBody.byteOffset, requestBody.byteLength).toString('utf8');
+  const text = bodyText(requestBody);
 
   try {
     return JSON.parse(text);
   } catch {
     return text;
   }
+}
+
+/**
+ * Header matchers undici applies the way nock does (`reqheaderMatches` in nock's `interceptor.js`).
+ *
+ * Each becomes a function, because undici's own comparison differs from nock's in three places,
+ * all found once scope-level `reqheaders` started being applied (they had been dropped - see
+ * `scopeHeaders`):
+ * - undici tests a RegExp with `re.test(value)` whether or not the header was sent, and
+ *   `/./.test(undefined)` is `true` - so `.matchHeader('x-key', /./)` matched a request that never
+ *   carried `x-key`. A string or RegExp only matches a header that is there.
+ * - a header sent as an array or a number reaches the matcher as one; nock compares node's string
+ *   form (`['a', 'b']` as `a, b`, `0` as `'0'`), and a number expectation as a string too.
+ * - a `host` requirement is skipped when the request set no `host` header, as nock skips it: undici
+ *   derives the host rather than carrying one, so it would otherwise never match.
+ * A function is handed the (string) value, or `undefined` when absent - `badheaders` relies on that.
+ */
+function headerMatchers(headers: Record<string, HeaderMatcher>): Record<string, HeaderMatcher> {
+  const result: Record<string, HeaderMatcher> = {};
+
+  for (const [name, matcher] of Object.entries(headers)) {
+    const isHost = name.toLowerCase() === 'host';
+
+    result[name] = (sent: string | number | string[] | undefined) => {
+      const value = sent === undefined ? undefined : Array.isArray(sent) ? sent.join(', ') : String(sent);
+
+      if (typeof matcher === 'function') {
+        return Boolean(matcher(value as string));
+      }
+
+      if (value === undefined) {
+        return isHost;
+      }
+
+      if (matcher instanceof RegExp) {
+        matcher.lastIndex = 0;
+
+        return matcher.test(value);
+      }
+
+      return value === String(matcher);
+    };
+  }
+
+  return result;
+}
+
+/**
+ * A reply body as undici should send it.
+ *
+ * `=== undefined`, not `??`: `reply(200, null)` means a body of `null`, and coercing it to `''`
+ * turned a mocked null response into a parse failure. A boolean or number is sent as its text,
+ * as nock sends it - undici's MockAgent sends a falsy one as an empty body, so `reply(200, false)`
+ * answered `''`.
+ */
+function replyData(body: unknown): any {
+  if (body === undefined) {
+    return '';
+  }
+
+  return typeof body === 'boolean' || typeof body === 'number' ? String(body) : body;
 }
 
 /** Whether a reply body is one nock would label `application/json`. */
@@ -936,7 +1137,7 @@ class Interceptor {
       method: this.#method,
       path: buildPathMatcher(this.#basePath, path, ignoreQuery, undiciAppliesQuery ? undefined : query),
       body: toBodyMatcher(this.#body),
-      headers: Object.keys(this.#headers).length > 0 ? this.#headers : undefined,
+      headers: Object.keys(this.#headers).length > 0 ? headerMatchers(this.#headers) : undefined,
     };
 
     if (query && undiciAppliesQuery) {
@@ -974,10 +1175,12 @@ class Interceptor {
     };
   }
 
-  reply(responseCode: number, body?: ReplyBody | ReplyBodyFunction, headers?: ReplyHeaders): Scope;
+  reply(responseCode?: number, body?: ReplyBody | ReplyBodyFunction, headers?: ReplyHeaders): Scope;
   reply(replyFunction: ReplyFunction): Scope;
   reply(
-    responseCodeOrFunction: number | ReplyFunction,
+    // nock defaults the status to 200: a bare `.reply()` is how its docs mock an empty OK, and it
+    // used to reach undici as `statusCode: undefined` and fail every request it matched.
+    responseCodeOrFunction: number | ReplyFunction = 200,
     body?: ReplyBody | ReplyBodyFunction,
     headers?: ReplyHeaders,
   ): Scope {
@@ -1006,9 +1209,7 @@ class Interceptor {
 
         return {
           statusCode: responseCodeOrFunction,
-          // `=== undefined`, not `??`: `reply(200, null)` means a body of `null`, and coercing
-          // it to `''` turned a mocked null response into a parse failure.
-          data: (body === undefined ? '' : body) as any,
+          data: replyData(body),
           responseOptions: replyOptions(body, headers),
         };
       }),
@@ -1043,7 +1244,7 @@ class Interceptor {
 
         return {
           statusCode,
-          data: (data === undefined ? '' : data) as any,
+          data: replyData(data),
           responseOptions: replyOptions(data, replyHeaders),
         };
       }),
@@ -1066,7 +1267,11 @@ class Scope {
   /** Set by `persist()`, and inherited by every interceptor registered after it. */
   #persist = false;
 
-  constructor(origin: Origin, basePath: string) {
+  /** Header matchers from the scope's options, under every interceptor's own - see `scopeHeaders`. */
+  #headers: Record<string, HeaderMatcher>;
+
+  constructor(origin: Origin, basePath: string, headers: Record<string, HeaderMatcher> = {}) {
+    this.#headers = headers;
     const key = poolKey(origin);
     let entry = pools.get(key);
 
@@ -1104,7 +1309,10 @@ class Scope {
       pools.set(this.#poolKey, {pool: this.#pool, origin: this.#origin, active: true});
     }
 
-    const interceptor = new Interceptor(this, this.#pool, this.#basePath, method, path, body, options);
+    const interceptor = new Interceptor(this, this.#pool, this.#basePath, method, path, body, {
+      ...options,
+      reqheaders: {...this.#headers, ...options?.reqheaders},
+    });
 
     return this.#persist ? interceptor.persist() : interceptor;
   }
@@ -1201,10 +1409,47 @@ function trimTrailingSlash(path: string): string {
   return path === '/' ? '' : path.replace(/\/$/, '');
 }
 
-function nock(basePath: string | RegExp | Url | URL): Scope {
+/**
+ * nock's scope options, as the header matchers every interceptor on the scope inherits.
+ *
+ * `allowUnmocked` and `filteringScope` are accepted and not applied. Both fail *closed* that way -
+ * an unmatched request is refused rather than passed through, a scope matches only its own host -
+ * so a suite written against them still runs; it is recorded as a gap in `conformance/`.
+ *
+ * `nock(host, options)` used to drop its second argument, and three of these fail *open* when
+ * dropped: without `reqheaders`, `badheaders` or `conditionally` an interceptor matched requests
+ * nock would have refused, so a test asserting that an auth header was sent passed without it.
+ * All three reuse undici's own header matching: a function matcher is handed the header's value,
+ * `undefined` when it is absent - which is exactly `badheaders` - and `conditionally` is asked on a
+ * header name no request carries. Found by running nock's own suite (`conformance/`).
+ */
+function scopeHeaders(options: ScopeOptions | undefined): Record<string, HeaderMatcher> {
+  if (options === undefined) {
+    return {};
+  }
+
+  const headers: Record<string, HeaderMatcher> = {...options.reqheaders};
+
+  for (const name of options.badheaders ?? []) {
+    headers[name] = (value: string | undefined) => value === undefined;
+  }
+
+  const {conditionally} = options;
+
+  if (conditionally !== undefined) {
+    headers[conditionallyHeader] = () => Boolean(conditionally());
+  }
+
+  return headers;
+}
+
+/** A header name no request can carry - the hook `conditionally` hangs off. See `scopeHeaders`. */
+const conditionallyHeader = 'x-gotlike-nock-conditionally\u0000';
+
+function nock(basePath: string | RegExp | Url | URL, options?: ScopeOptions): Scope {
   const {origin, path} = splitOrigin(basePath);
 
-  return new Scope(origin, path);
+  return new Scope(origin, path, scopeHeaders(options));
 }
 
 Object.assign(nock, {

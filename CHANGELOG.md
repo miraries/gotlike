@@ -4,6 +4,82 @@ All notable changes to this project are documented here. This project adheres to
 [semantic versioning](https://semver.org/spec/v2.0.0.html); while the major version is `0`, a
 minor bump is where breaking changes land.
 
+## Unreleased
+
+### Added
+
+- **got's promise shortcuts**: `client.get(url).json()`, `.text()` and `.buffer()`, on every verb and
+  on the callable client. `.buffer()` is byte-exact; a shortcut's result has the shortcuts too, as
+  got's does. `.json()` does not add `accept: application/json` - set `responseType: 'json'` for
+  that. Measured against a null dispatcher, no cost beyond noise.
+- **`response.requestUrl`, `response.redirectUrls` and `response.statusMessage`**, as in got.
+  `statusMessage` is node's standard phrase for the status.
+- **`ReadError`** for a failure reading or decompressing the body once the head has arrived, and
+  **`MaxRedirectsError`** (`Redirected 10 times. Aborting.`, `ERR_TOO_MANY_REDIRECTS`) for a redirect
+  chain past the limit - which used to be an `HTTPError` for the last 3xx.
+- A README list of what is not implemented, built from running got's and nock's own suites.
+
+### Changed
+
+- **A `url` in an options object is refused, as in got 16.** `client({url})`, `client.get({url})`,
+  `client.get(url, {url})`, `client.stream({url})`, `extend({url})` and `createClient({url})` are
+  all a `ValidationError` with got's message, `The \`url\` option is not supported in options
+  objects. Pass it as the first argument instead.` gotlike used to accept it because got 12 and 14
+  did; that made a call that works here and throws under got 16. Pass the url as the first argument.
+  `retryWithMergedOptions({url})` still takes one, as got's does. `RequestOptions` (and so
+  `ExtendOptions`) no longer has a `url` key; `FormedOptions`, `RequestError#options` and the retry's
+  argument still do, so code reading `response.request.options.url` should type it as
+  `FormedOptions`.
+- **Errors use got's wording and codes where callers match on them**: `timeout.request` is
+  `Timeout awaiting 'request' for 5000ms`; an abort is `This operation was aborted.`; a connection
+  the server reset is `ECONNRESET` (undici's `UND_ERR_SOCKET` stays on `cause`); an unsupported
+  protocol is `ERR_UNSUPPORTED_PROTOCOL` / `Unsupported protocol: ftp:`; a call with no url is
+  `Missing \`url\` property`. A body-read failure is now a `ReadError` (a `RequestError` subclass).
+- **A redirect loop is followed to the limit**, as got does, and ends in `MaxRedirectsError`, rather
+  than undici's `Redirect loop detected` on the first repeat.
+- **The nock shim reports a miss as nock does**: `Nock: No match for request ...` with
+  `ERR_NOCK_NO_MATCH`, or `Nock: Disallowed net connect for "host:port/path"` with `ENETUNREACH`,
+  instead of undici's `UND_MOCK_ERR_MOCK_NOT_MATCHED`. A test matching the old code needs updating.
+
+### Fixed
+
+Everything here was found by running got's and nock's own test suites against gotlike
+(`conformance/`).
+
+- **Post/Redirect/Get to the same url is followed.** `POST /orders` -> `303` -> `GET /orders` failed
+  with undici's `Redirect loop detected`, whose loop check compares urls and ignores that the method
+  changed. A same-method redirect back to itself is still refused as a loop.
+- **A cross-origin redirect drops `cookie2`** as well as `authorization`, `cookie` and
+  `proxy-authorization`, as got does.
+- **`retryWithMergedOptions(response.request.options)` works** - the form got documents. The formed
+  options carry the client's `hooks`, `retry` and `handlers`, so on any client with an
+  `afterResponse` hook the retry was a `ValidationError`. The client's own values are now let through;
+  a *different* `hooks` or `retry` is still refused.
+- **got's `agent: {http: new Agent()}` shape is a `ValidationError`** naming the problem, instead of
+  every request failing with `base.compose is not a function`.
+- **A body cut off mid-way reports the reset** (`UND_ERR_SOCKET`) when retries are on, rather than
+  undici's `server does not support the range header and the payload was partially consumed` from its
+  attempt to resume it.
+- **`nock(host).get(path).reply()` with no arguments replies with an empty 200**, as nock does. It
+  reached undici with no status code and failed every request it matched.
+- **`nock(host, options)` applies its options.** The second argument was dropped, so scope-level
+  `reqheaders`, `badheaders` and `conditionally` were ignored and interceptors matched requests nock
+  would have refused. `allowUnmocked` and `filteringScope` are accepted but still not applied (both
+  fail closed).
+- **A RegExp header matcher only matches a header that was sent** - `/./` matched a request without
+  the header, because undici tests `'undefined'`. Array and number header values, and a `host`
+  requirement on a request that set no `host`, now compare as nock compares them.
+- **An object body matcher matches an urlencoded form body**, as nock parses one; only JSON was
+  parsed, so `nock(host).post('/login', {user: 'a'})` never matched `form: {user: 'a'}`.
+- **`reply(200, false)` sends `false`** (and a number its text); a falsy body was sent empty.
+- **A stream decompression failure is a `ReadError`** with the `beforeError` hooks applied; it reached
+  the caller as the raw zlib `Error`.
+- **An upload that never connects fails a `pipeline()` into it.** The upload stream finished as soon
+  as its body was buffered, so `await pipeline(source, client.stream.put(url))` resolved for a
+  request that was refused; `finish` now waits for the response head, as got's does.
+- **A stream emits no `response` event for a status `throwHttpErrors` refuses**, as in got - only
+  the `HTTPError`. `stream.response` still resolves with the head.
+
 ## 0.6.0 - 2026-09-27
 
 ### Fixed

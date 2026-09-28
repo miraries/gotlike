@@ -2,7 +2,7 @@ import dns from 'node:dns';
 import {STATUS_CODES} from 'node:http';
 import zlib from 'node:zlib';
 import {Duplex, Readable} from 'node:stream';
-import undici, {DecoratorHandler, Dispatcher, errors, getGlobalDispatcher, interceptors} from 'undici';
+import undici, {DecoratorHandler, Dispatcher, errors, getGlobalDispatcher, interceptors, RedirectHandler} from 'undici';
 import type {IncomingHttpHeaders} from 'undici/types/header.js';
 
 const {BodyTimeoutError, HeadersTimeoutError, RequestRetryError} = errors;
@@ -133,7 +133,13 @@ function announceHead(stream: Readable, head: StreamHead): void {
  * listener; on a later tick, a small body has already been consumed and the read finished
  * cleanly. See `raiseWhenListening`.
  */
-function asStream(readable: Readable, head: StreamHead | undefined, error?: Error): GotlikeStream {
+function asStream(
+  readable: Readable,
+  head: StreamHead | undefined,
+  error?: Error,
+  /** Whether `error` is the head's own status, refused by `throwHttpErrors` - see below. */
+  statusRefused = false,
+): GotlikeStream {
   // Only built for a failure, so an ordinary response body allocates nothing extra here.
   const failed = error === undefined ? undefined : failedReadable(error);
   const stream = (failed?.stream ?? readable) as GotlikeStream;
@@ -142,12 +148,15 @@ function asStream(readable: Readable, head: StreamHead | undefined, error?: Erro
   // Nothing is obliged to await this; an unhandled rejection would take the process down.
   stream.response.catch(() => undefined);
 
-  if (head) {
+  // Not for a status `throwHttpErrors` refuses: got emits only the `HTTPError` then, never
+  // `response`, so the got way of proxying - `on('response', (head) => res.writeHead(...))` - does
+  // not start forwarding a 404 it is about to fail on. `stream.response` still has the head.
+  if (head && !statusRefused) {
     announceHead(stream, head);
   }
 
-  // Armed after the `response` emit above is queued, so a caller listening for both sees them
-  // in that order - the head first, then the failure it carries.
+  // Armed after any `response` emit above is queued, so a caller listening for both sees them in
+  // that order - the head first, then a failure that came after it.
   failed?.arm();
 
   return stream;
@@ -227,6 +236,35 @@ function normaliseStreamErrors<T extends Readable>(
   };
 
   return stream;
+}
+
+/**
+ * Hold an upload duplex's `finish` event until the response head has arrived.
+ *
+ * undici's pipeline duplex finishes as soon as the body is buffered for sending, and the request
+ * can still fail after that - a connection refused arrives later. `pipeline()` waits only for the
+ * last stream's `finish`, so `await pipeline(source, client.stream.put(url))` resolved for an upload
+ * that never connected. got's stream finishes only once the request has gone, so its pipeline
+ * rejects with `ECONNREFUSED`; with `finish` held, this one fails before it finishes, the same way.
+ * The event is held rather than a `final` added, because undici ends the request body on
+ * `prefinish` - a `final` waiting for the head would wait for a server waiting for the body. Found
+ * by got's own suite (`stream.ts`, "works with pipeline").
+ */
+function holdFinishForHead(duplex: Duplex, head: Promise<unknown>): void {
+  // Called with the duplex as `this` below, as Node itself calls it.
+  // oxlint-disable-next-line typescript/unbound-method
+  const emit = duplex.emit;
+
+  duplex.emit = function emitWhenHeadArrived(this: Duplex, event: string | symbol, ...args: unknown[]): boolean {
+    if (event !== 'finish') {
+      return emit.call(this, event, ...args);
+    }
+
+    // On a failure the stream is destroyed with the error instead, and never finishes.
+    head.then(() => emit.call(this, event, ...args), noop);
+
+    return true;
+  } as Duplex['emit'];
 }
 
 /**
@@ -324,10 +362,20 @@ type RedirectState = DispatchState & {
    * rather than the one that answered. got documents `response.url` as the *final* url.
    */
   lastUrl?: string;
+  /**
+   * Every hop's url, in order - got's `response.redirectUrls`. Replaced, never truncated, when a
+   * retry starts the chain over, so a response already built keeps the list it was built with.
+   */
+  urls?: string[];
 };
 
 type AttemptState = DispatchState & {
   onRetry?: (error: Error | undefined, statusCode: number | undefined, retryCount: number) => void;
+  /**
+   * The transport error that made undici retry most recently, kept past the retry that clears
+   * `lastError` - see `resumeFailure`.
+   */
+  retriedBy?: Error;
   /** Starts the request deadline over for a new attempt. See `requestSignal`. */
   restartDeadline?: () => void;
   /**
@@ -490,12 +538,14 @@ const countAttempts = trackDispatches(
       // Cleared rather than kept: with no hop recorded for this attempt, `response.url`
       // falls back to the url that was requested, which is where the answer came from.
       redirects.lastUrl = undefined;
+      redirects.urls = undefined;
     }
 
     // A fresh attempt gets the whole of `timeout.request`, not what the last one left over.
     (state as AttemptState).restartDeadline?.();
 
     (state as AttemptState).onRetry?.(state.lastError, state.lastStatusCode, state.count - 1);
+    (state as AttemptState).retriedBy = state.lastError;
 
     /*
      * Consumed, so the attempt about to run starts with no outcome recorded. `canRetryError`
@@ -509,6 +559,110 @@ const countAttempts = trackDispatches(
     state.lastError = undefined;
   },
 );
+
+/** The parts of undici's `RedirectHandler` its typings leave out and `GotlikeRedirectHandler` reads. */
+type RedirectHandlerState = {
+  history: URL[];
+  opts: Dispatcher.DispatchOptions;
+};
+
+/**
+ * A history entry the loop check can never match - see `GotlikeRedirectHandler`.
+ */
+const unmatchable = {toString: () => '\0'} as unknown as URL;
+
+/**
+ * undici's `RedirectHandler`, without its loop check.
+ *
+ * undici refuses to follow a redirect to any url already in the chain's history - a guard for a
+ * `Client`/`Pool` bouncing a cross-origin redirect back at itself. It compares urls only, and
+ * records the current url *before* comparing, so the most ordinary redirect there is, Post/
+ * Redirect/Get to the same url (`POST /orders` -> `303` -> `GET /orders`), failed every time with
+ * `Redirect loop detected`. got has no loop check: it follows up to its limit and then throws
+ * `MaxRedirectsError`, `Redirected 10 times. Aborting.`, and so does this now - the check is shown
+ * a history of the same length (the limit still counts it) that can match nothing. A real loop costs
+ * the ten requests it costs got. Found by got's own suite (`redirects.ts`).
+ */
+class GotlikeRedirectHandler extends RedirectHandler {
+  onResponseStart(
+    controller: Dispatcher.DispatchController,
+    statusCode: number,
+    headers: IncomingHttpHeaders,
+    statusMessage?: string,
+  ): void {
+    const self = this as unknown as RedirectHandlerState;
+    // undici's typings declare none of the handler methods, so `super.onResponseStart` does not
+    // type-check; the prototype's is called on `this` explicitly below, which is what `super` does.
+    // oxlint-disable-next-line typescript/unbound-method
+    const start = (RedirectHandler.prototype as unknown as Dispatcher.DispatchHandler).onResponseStart!;
+    const history = self.history;
+    const blind = history.map(() => unmatchable);
+
+    // What undici records still lands in the real history.
+    blind.push = (...urls: URL[]) => history.push(...urls);
+    self.history = blind;
+
+    try {
+      start.call(this, controller, statusCode, headers, statusMessage);
+    } finally {
+      self.history = history;
+    }
+  }
+}
+
+/**
+ * undici's `interceptors.redirect()`, built on `GotlikeRedirectHandler`, and stripping `cookie2`
+ * on a cross-origin hop as well as the `authorization`/`cookie`/`proxy-authorization` undici strips
+ * itself - got strips all four, and `cookie2` is as much a credential as `cookie`. undici's own
+ * interceptor has no way to swap the handler class, so this is its dozen lines again.
+ */
+const crossOriginCredentials: readonly string[] = ['cookie2'];
+
+const redirectInterceptor: Dispatcher.DispatcherComposeInterceptor = (dispatch) =>
+  function interceptRedirect(opts, handler) {
+    const {maxRedirections, stripHeadersOnCrossOriginRedirect, ...rest} = opts as Dispatcher.DispatchOptions & {
+      maxRedirections?: number;
+      stripHeadersOnCrossOriginRedirect?: string[];
+    };
+
+    if (maxRedirections === undefined || maxRedirections === 0) {
+      return dispatch(opts, handler);
+    }
+
+    // Without `maxRedirections`, so the dispatch below does not redirect a second time. The
+    // usual list is one shared array rather than one per request.
+    const dispatchOpts = {
+      ...rest,
+      stripHeadersOnCrossOriginRedirect:
+        stripHeadersOnCrossOriginRedirect === undefined
+          ? crossOriginCredentials
+          : [...stripHeadersOnCrossOriginRedirect, 'cookie2'],
+    } as Dispatcher.DispatchOptions;
+
+    return dispatch(dispatchOpts, new GotlikeRedirectHandler(dispatch, maxRedirections, dispatchOpts, handler));
+  };
+
+/**
+ * The error a response cut off mid-body really failed with, when undici's attempt to resume it
+ * is what reported the failure.
+ *
+ * undici retries a body that breaks off part-way by asking for the rest with a `Range` header.
+ * A server that ignores it answers `200` with the whole body again, and undici gives up with its
+ * own `server does not support the range header and the payload was partially consumed` (or
+ * `Content-Range mismatch`) - a `RequestRetryError` that names neither the reset nor its code. A
+ * caller branching on `ECONNRESET`/`UND_ERR_SOCKET`, as got's callers do, never saw one. Found by
+ * got's own suite (`http.ts`, `stream.ts`); got itself restarts the request from scratch instead.
+ */
+function resumeFailure(err: unknown, attempts: AttemptState | undefined): Error | undefined {
+  if (
+    err instanceof RequestRetryError &&
+    (err.message.startsWith('server does not support the range header') || err.message === 'Content-Range mismatch')
+  ) {
+    return attempts?.retriedBy;
+  }
+
+  return undefined;
+}
 
 /**
  * Records where a redirect chain ended up, and fires `beforeRedirect` hooks. The hop's
@@ -543,8 +697,10 @@ function makeRedirectTracker(hooks?: Hooks['beforeRedirect']): Dispatcher.Dispat
       const origin = String(opts.origin ?? '');
       const path = String(opts.path ?? '');
 
-      (state as RedirectState).lastUrl =
-        origin.endsWith('/') && path.startsWith('/') ? origin + path.slice(1) : origin + path;
+      const hop = origin.endsWith('/') && path.startsWith('/') ? origin + path.slice(1) : origin + path;
+
+      (state as RedirectState).lastUrl = hop;
+      ((state as RedirectState).urls ??= []).push(hop);
 
       if (!hooks) {
         return;
@@ -2380,8 +2536,24 @@ function isRequestFailure(
   }
 
   return (
-    cleanupError instanceof errors.UndiciError || isTimeoutReason(cleanupError, signal) || signal?.aborted === true
+    cleanupError instanceof errors.UndiciError ||
+    isDecompressionError(cleanupError) ||
+    isTimeoutReason(cleanupError, signal) ||
+    signal?.aborted === true
   );
+}
+
+/**
+ * A body the decompress interceptor could not decode - zlib's `Z_DATA_ERROR`, zstd's
+ * `ZSTD_error_*`, brotli's `ERR__ERROR_*`. Not an `UndiciError`, so `isRequestFailure` used to take
+ * it for the consumer's own failure: a stream of a corrupt gzip body ended with the raw zlib
+ * `Error`, no `ReadError`, and no `beforeError` hooks - where the promise API reported a
+ * `ReadError`. Found by got's own suite (`gzip.ts`, `zstd.ts`).
+ */
+function isDecompressionError(error: Error): boolean {
+  const code = (error as {code?: unknown}).code;
+
+  return typeof code === 'string' && /^(Z_|ZSTD_|ERR__ERROR_)/.test(code);
 }
 
 /**
@@ -2400,6 +2572,68 @@ function codeOf(error: unknown, fallback: string): string {
   const code = (error as {code?: unknown} | undefined)?.code;
 
   return typeof code === 'string' && code !== '' ? code : fallback;
+}
+
+/**
+ * got's wording for the three failures callers most often match on by message or code - found by
+ * running got's own suite (`conformance/`), where every one of these was a mismatch:
+ *
+ * - `timeout.request` firing is `Timeout awaiting 'request' for 5000ms`, not the signal's `The
+ *   operation was aborted due to timeout`. A caller's own `AbortSignal.timeout()` keeps its message,
+ *   as it does in got.
+ * - an abort is `This operation was aborted.` - got's own sentence, with the period the DOMException
+ *   lacks. A caller's `abort(reason)` keeps the reason's message.
+ * - a socket the server reset is `ECONNRESET`, the code got reports and the one its callers and
+ *   retry lists name, rather than undici's `UND_ERR_SOCKET` for `other side closed`; an unsupported
+ *   protocol is `ERR_UNSUPPORTED_PROTOCOL` with `Unsupported protocol: c:`, and a call with no url at
+ *   all says `Missing \`url\` property` rather than undici's `invalid url`.
+ *
+ * Only ever reached on the failure path, so the request that succeeds pays nothing for it.
+ */
+function timeoutMessage(error: unknown, options: FormedOptions): string {
+  const callerTimeout =
+    options.signal?.aborted === true && (options.signal.reason as Error | undefined)?.name === 'TimeoutError';
+
+  return options.timeout?.request !== undefined && !callerTimeout
+    ? `Timeout awaiting 'request' for ${options.timeout.request}ms`
+    : messageOf(error, 'Request timed out');
+}
+
+function abortMessage(error: unknown): string {
+  const message = messageOf(error, 'This operation was aborted.');
+
+  return message === 'This operation was aborted' ? 'This operation was aborted.' : message;
+}
+
+function transportFailure(
+  error: unknown,
+  options: FormedOptions,
+  /** got's code for a body-read failure whose cause carries none - see `ReadError`. */
+  readingBody = false,
+): {message: string; code: string} {
+  const message = messageOf(error, 'Request error');
+  const code = codeOf(error, readingBody ? 'ERR_READING_RESPONSE_STREAM' : 'ERR_REQUEST_ERROR');
+
+  if (code === 'UND_ERR_SOCKET' && message === 'other side closed') {
+    return {message, code: 'ECONNRESET'};
+  }
+
+  if (code === 'UND_ERR_INVALID_ARG') {
+    if (message.startsWith('Invalid URL protocol')) {
+      return {message: `Unsupported protocol: ${protocolOf(options.url)}`, code: 'ERR_UNSUPPORTED_PROTOCOL'};
+    }
+
+    // No url and no `prefixUrl` resolves to the empty string.
+    if (message === 'invalid url' && (options.url === undefined || options.url === '')) {
+      return {message: 'Missing `url` property', code: 'ERR_INVALID_URL'};
+    }
+  }
+
+  return {message, code};
+}
+
+function protocolOf(url: string | URL | undefined): string {
+  return URL.parse(String(url))?.protocol ?? String(url);
 }
 
 function messageOf(error: unknown, fallback: string): string {
@@ -2442,7 +2676,8 @@ export class RequestError<T = unknown> extends Error {
   override name = 'RequestError';
 
   code: string;
-  declare readonly options: RequestOptions;
+  /** The options the request was made with, `url` included - see `FormedOptions`. */
+  declare readonly options: RequestOptions & {url?: string | URL};
 
   /**
    * The response that produced this error, in the same shape `call()` resolves with: a
@@ -2455,7 +2690,7 @@ export class RequestError<T = unknown> extends Error {
     message: string,
     code: string,
     error: Partial<Error> | undefined,
-    options: RequestOptions,
+    options: RequestOptions & {url?: string | URL},
     response?: Response<T>,
   ) {
     // Any value may be a `cause`, not only an `Error` - and a hook is allowed to
@@ -2490,7 +2725,27 @@ export class ParseError<T = unknown> extends RequestError<T> {
   override name = 'ParseError';
 }
 
+/**
+ * Thrown when a redirect chain runs past the limit (fixed at 10, got's default) - got's
+ * `Redirected 10 times. Aborting.`, `ERR_TOO_MANY_REDIRECTS`, carrying the last 3xx as its
+ * `response`. A loop is no exception: like got, gotlike follows it to the limit.
+ */
+export class MaxRedirectsError<T = unknown> extends RequestError<T> {
+  override name = 'MaxRedirectsError';
+}
+
+/**
+ * Thrown when the response head arrived but reading or decompressing its body failed - a reset
+ * part-way through, a truncated gzip stream. got's name for it, and got's code when the cause has
+ * none (`ERR_READING_RESPONSE_STREAM`).
+ */
+export class ReadError<T = unknown> extends RequestError<T> {
+  override name = 'ReadError';
+}
+
 export type FormedOptions = RequestOptions & {
+  /** The URL to request, as a string or a [WHATWG `URL`](https://nodejs.org/api/url.html#url_class_url). */
+  url?: string | URL;
   throwHttpErrors: boolean;
   followRedirect: boolean;
   headers: IncomingHttpHeaders;
@@ -2504,10 +2759,14 @@ export type HandlerFunction = (
   next: (newOptions: FormedOptions) => Promise<Response>,
 ) => Promise<Response>;
 
+/**
+ * What a caller passes: to a request, `extend()` or the constructor.
+ *
+ * No `url`: it is the first argument, as in got 16, which refuses a `url` key in an options object.
+ * The formed options (`FormedOptions`, what hooks and handlers see) and `retryWithMergedOptions`
+ * do carry one.
+ */
 export type RequestOptions<T = unknown> = {
-  /** The URL to request, as a string or a [WHATWG `URL`](https://nodejs.org/api/url.html#url_class_url). */
-  url?: string | URL;
-
   /** Request headers. */
   headers?: IncomingHttpHeaders;
 
@@ -2733,7 +2992,10 @@ export type DecompressOptions = NonNullable<Parameters<typeof interceptors.decom
  * sent with (`headers` and `context` are shallow-merged, everything else is replaced).
  * Returning its result from an `afterResponse` hook is how got-style token refresh works.
  */
-export type RetryWithMergedOptions<T = any> = (newOptions: RequestOptions<T>) => Promise<Response<T>>;
+/** A retry may name a `url` - it is how a retry is sent somewhere else - so it is allowed here. */
+export type RetryWithMergedOptions<T = any> = (
+  newOptions: RequestOptions<T> & {url?: string | URL},
+) => Promise<Response<T>>;
 
 /** Methods that can carry a request body, and so get a writable stream half. */
 export type BodyMethod = (typeof bodyMethods)[number];
@@ -2843,6 +3105,19 @@ export type StreamClient = {
   query(url: RequestInput, options?: RequestOptions): Promise<GotlikeUploadStream>;
 };
 
+/**
+ * What every request call returns: the promise, plus got's shortcuts for reading the body of the
+ * response it resolves to - see `withShortcuts`.
+ */
+export type ResponsePromise<T> = Promise<T> & {
+  /** The body parsed as JSON. */
+  json<J = unknown>(): ResponsePromise<J>;
+  /** The body as text. */
+  text(): ResponsePromise<string>;
+  /** The body as received, byte for byte - call it before awaiting the request. */
+  buffer(): ResponsePromise<Buffer>;
+};
+
 /** A verb's first argument, as got takes it: a url, or an options object standing in for one. */
 type RequestInput = string | URL | RequestOptions;
 
@@ -2871,16 +3146,15 @@ function handleInput(
   isStream?: true,
 ): Promise<any> {
   if (input === null || typeof input !== 'object' || input instanceof URL) {
-    return instance.handle(isStream ? {...options, isStream} : (options ?? {}), input, method);
+    lastFormed = undefined;
+    const promise = instance.handle(isStream ? {...options, isStream} : (options ?? {}), input, method);
+
+    return isStream ? promise : withShortcuts(promise, lastFormed);
   }
 
   let merged = input;
 
   if (options !== undefined) {
-    if (instance.validate && options.url !== undefined) {
-      return Promise.reject(new ValidationError('`url` cannot be given both as an argument and as an option'));
-    }
-
     merged = mergeOptions(input, options);
 
     if (input.headers !== undefined && options.headers !== undefined) {
@@ -2900,7 +3174,151 @@ function handleInput(
     }
   }
 
-  return instance.handle(isStream ? {...merged, isStream} : merged, undefined, method);
+  lastFormed = undefined;
+  const promise = instance.handle(isStream ? {...merged, isStream} : merged, undefined, method);
+
+  return isStream ? promise : withShortcuts(promise, lastFormed);
+}
+
+/**
+ * The options `handle()` formed for the call it was just given. It forms them synchronously,
+ * before its first `await`, so `handleInput` can read them back the moment `handle()` returns and
+ * nothing else can have run in between. `.buffer()` uses them - see `shortcutBuffer`.
+ */
+let lastFormed: FormedOptions | undefined;
+
+/** Where a shortcut finds the request's options, and the promise the chain started from. */
+const shortcutOptions = Symbol('gotlike.shortcutOptions');
+const shortcutRoot = Symbol('gotlike.shortcutRoot');
+
+type ShortcutPromise = Promise<unknown> & {[shortcutOptions]?: FormedOptions; [shortcutRoot]?: ShortcutPromise};
+
+/**
+ * got's promise shortcuts: `client.get(url).json()`, `.text()`, `.buffer()` - the most common way
+ * got is called at all, and a `TypeError` here until got's own suite ran against this
+ * (`conformance/`). Each reads the response that arrives, whatever `responseType` it was fetched
+ * with: `.json()` parses `rawBody` (or hands back a body already parsed as json), `.text()` decodes
+ * it, `.buffer()` is it.
+ *
+ * Unlike got's, `.json()` does not add `accept: application/json` - the request is already on its
+ * way by the time it can be called. Set `responseType: 'json'` for that.
+ *
+ * The three functions are shared rather than closures, so a request pays three property stores.
+ */
+function withShortcuts<T>(promise: Promise<T>, formed?: FormedOptions): ResponsePromise<T> {
+  const shortcuts = promise as ResponsePromise<T> & ShortcutPromise;
+
+  shortcuts.json = shortcutJson;
+  shortcuts.text = shortcutText;
+  shortcuts.buffer = shortcutBuffer;
+
+  if (formed !== undefined) {
+    shortcuts[shortcutOptions] = formed;
+  }
+
+  return shortcuts;
+}
+
+/**
+ * A shortcut's result, which has the shortcuts too and reads the same response - got's
+ * `got(url).json().text()`. Only allocated when a shortcut is used.
+ */
+function chained<T>(root: ShortcutPromise, result: Promise<T>): ResponsePromise<T> {
+  const next = withShortcuts(result) as ResponsePromise<T> & ShortcutPromise;
+
+  next[shortcutRoot] = root;
+
+  return next;
+}
+
+function shortcutJson<J>(this: ShortcutPromise): ResponsePromise<J> {
+  const root = this[shortcutRoot] ?? this;
+
+  return chained(
+    root,
+    root.then((value) => {
+      if (!(value instanceof GotlikeResponse)) {
+        // `resolveBodyOnly`: the body is all there is to go on.
+        return (typeof value === 'string' ? parseShortcutJson(value, undefined) : value) as J;
+      }
+
+      if (value.request.options.responseType === 'json') {
+        return value.body as J;
+      }
+
+      return parseShortcutJson(value.rawBody.toString('utf8'), value) as J;
+    }),
+  );
+}
+
+function parseShortcutJson(text: string, response: GotlikeResponse<unknown> | undefined): unknown {
+  // got's parser hands back an empty body as-is rather than failing on it.
+  if (text === '') {
+    return '';
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    if (response === undefined) {
+      throw error;
+    }
+
+    const {options} = response.request;
+
+    throw new ParseError(
+      `${(error as Error).message} in "${String(options.url)}"`,
+      'ERR_BODY_PARSE_FAILURE',
+      error as Error,
+      options,
+      response,
+    );
+  }
+}
+
+function shortcutText(this: ShortcutPromise): ResponsePromise<string> {
+  const root = this[shortcutRoot] ?? this;
+
+  return chained(
+    root,
+    root.then((value) =>
+      value instanceof GotlikeResponse
+        ? typeof value.body === 'string'
+          ? value.body
+          : value.rawBody.toString('utf8')
+        : typeof value === 'string'
+          ? value
+          : Buffer.isBuffer(value)
+            ? value.toString('utf8')
+            : JSON.stringify(value),
+    ),
+  );
+}
+
+/**
+ * The body's exact bytes. A text response's `rawBody` is its decoded text encoded again, which
+ * is not the bytes that arrived for anything that is not text - so `.buffer()`, called as got's
+ * callers call it, before the body has been read, switches the request itself to reading bytes.
+ * Called later, on a text response it can only hand back the re-encoded text.
+ */
+function shortcutBuffer(this: ShortcutPromise): ResponsePromise<Buffer> {
+  const root = this[shortcutRoot] ?? this;
+  const formed = root[shortcutOptions];
+
+  if (formed !== undefined && formed.responseType === 'text') {
+    formed.responseType = 'buffer';
+  }
+
+  return chained(
+    root,
+    root.then((value) =>
+      value instanceof GotlikeResponse
+        ? value.rawBody
+        : Buffer.isBuffer(value)
+          ? value
+          : Buffer.from(typeof value === 'string' ? value : JSON.stringify(value)),
+    ),
+  );
 }
 
 /** The verbs `stream` carries, each dispatching through `handle()` like the client's own. */
@@ -3045,7 +3463,13 @@ export type Response<T = any> = {
   body: T;
   headers: IncomingHttpHeaders;
   readonly url: string;
+  /** The url that was requested, before any redirect. */
+  readonly requestUrl: URL;
+  /** Every url a redirect led to, in order; empty when none was followed. */
+  readonly redirectUrls: URL[];
   statusCode: number;
+  /** node's standard reason phrase for `statusCode` - a server's own non-standard one is not reported. */
+  readonly statusMessage: string;
   /** Whether `statusCode` is in the 2xx range. */
   ok: boolean;
   /**
@@ -3088,6 +3512,7 @@ class GotlikeResponse<T> implements Response<T> {
   #rawBody?: Buffer;
   #rawText?: string;
   #url?: string;
+  #redirectUrls?: readonly string[];
 
   constructor(
     body: T,
@@ -3104,10 +3529,10 @@ class GotlikeResponse<T> implements Response<T> {
      */
     rawText?: string,
     /**
-     * Where the response actually came from, when redirects moved it. Only the redirect
-     * tracker supplies this; without one `options.url` is already the right answer.
+     * The redirect chain, when the client follows redirects: where the response actually came
+     * from, and every hop on the way. Without a tracker `options.url` is already the answer.
      */
-    finalUrl?: string,
+    redirects?: RedirectState,
   ) {
     this.body = body;
     this.headers = headers;
@@ -3117,12 +3542,32 @@ class GotlikeResponse<T> implements Response<T> {
     this.timings = {phases: {total}};
     this.request = {options};
     this.#rawText = rawText;
-    this.#url = finalUrl;
+    this.#url = redirects?.lastUrl;
+    this.#redirectUrls = redirects?.urls;
   }
 
   /** The url the response came from - the last hop's, when redirects were followed. */
   get url(): string {
     return this.#url ?? String(this.request.options.url);
+  }
+
+  /** The url that was requested, before any redirect - got's `response.requestUrl`. */
+  get requestUrl(): URL {
+    return new URL(String(this.request.options.url));
+  }
+
+  /** Every url a redirect led to, in order; empty when none was followed. got's `redirectUrls`. */
+  get redirectUrls(): URL[] {
+    return this.#redirectUrls === undefined ? [] : this.#redirectUrls.map((url) => new URL(url));
+  }
+
+  /**
+   * The status's reason phrase - node's standard one (`Service Unavailable` for a 503). A server's
+   * own non-standard phrase reaches only a dispatch handler, not `undici.request()`, so it is not
+   * reported; see `httpErrorMessage`, which has the same limit.
+   */
+  get statusMessage(): string {
+    return STATUS_CODES[this.statusCode] ?? '';
   }
 
   get rawBody(): Buffer {
@@ -3167,10 +3612,10 @@ function streamResponse(
     head.timings.phases.total,
     options,
     undefined,
-    // Read here rather than at each call site: three copies of `dispatch.redirects?.lastUrl` is
-    // three places to forget that a stream's error, like its head, has to name the url that
-    // actually answered rather than the one that was requested.
-    dispatch.redirects?.lastUrl,
+    // Read here rather than at each call site: three copies of `dispatch.redirects` is three
+    // places to forget that a stream's error, like its head, has to name the url that actually
+    // answered rather than the one that was requested.
+    dispatch.redirects,
   );
 }
 
@@ -3319,7 +3764,7 @@ const knownOptionMap = {
   decompress: true,
   handlers: true,
   hooks: true,
-} satisfies Record<keyof RequestOptions, true>;
+} satisfies Record<keyof RequestOptions | 'url', true>;
 
 const knownOptions = new Set(Object.keys(knownOptionMap));
 
@@ -3409,8 +3854,14 @@ export type ClientDefaults = {
  *
  * `atCreation` distinguishes the two call sites: `hooks` and `retry` are meaningful on a
  * client but inert on a single call, and saying so beats being quietly ignored.
+ *
+ * `url` is refused in every options object a caller hands in - a request's, `extend()`'s, the
+ * constructor's - because got 16 refuses it there (`assertNoUrlInOptionsObject`, since got 15),
+ * and a call that works here and throws under got is the one kind of difference a drop-in
+ * cannot have. `retryWithMergedOptions` is the exception, as it is in got: there a `url` is
+ * how a retry is sent somewhere else, so `isRetry` lets it through.
  */
-function validateOptions(options: RequestOptions, atCreation: boolean): void {
+function validateOptions(options: RequestOptions & {url?: unknown}, atCreation: boolean, isRetry = false): void {
   for (const key in options) {
     // Own properties only. `for...in` walks the prototype chain, so anything that had added an
     // enumerable property to `Object.prototype` failed every request with `Unknown option`.
@@ -3420,6 +3871,10 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
 
     if (!knownOptions.has(key)) {
       invalid(`Unknown option \`${key}\``);
+    }
+
+    if (key === 'url' && !isRetry && options.url !== undefined) {
+      invalid('The `url` option is not supported in options objects. Pass it as the first argument instead.');
     }
 
     if (
@@ -3477,6 +3932,20 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
 
   if (headers !== undefined && (typeof headers !== 'object' || headers === null || Array.isArray(headers))) {
     invalid('`headers` must be an object');
+  }
+
+  /*
+   * got's `agent` is `{http, https, http2}` node agents; here it is one undici dispatcher. The got
+   * shape used to be accepted and then fail every request deep in the dispatch with `base.compose
+   * is not a function` - or escape as an uncaught exception from a stream - which says nothing
+   * about the option that caused it. Found by got's own suite (`agent.ts`, `timeout.ts`).
+   */
+  const {agent} = options;
+
+  if (agent !== undefined && (typeof agent !== 'object' || agent === null || typeof agent.dispatch !== 'function')) {
+    invalid(
+      "`agent` must be an undici dispatcher (`Agent`, `Pool`, `ProxyAgent`, ...); got's `{http, https}` node agents do not apply",
+    );
   }
 
   if (prefixUrl !== undefined) {
@@ -3577,6 +4046,31 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
 }
 
 /**
+ * `newOptions` without the create/extend-only options it merely carried over from `options`.
+ *
+ * got documents `retryWithMergedOptions(response.request.options)` - hand the request's own
+ * options back, perhaps spread with a change - and those formed options carry the client's
+ * `hooks`, `retry`, `handlers` and the rest, because formed options are the client's merged with
+ * the call's. Validated as a per-request call, every such retry was a `ValidationError` on any
+ * client with hooks - which is every client that has an `afterResponse` hook to retry from. A value
+ * *identical* to the one this request already carries says nothing new, so it is dropped before
+ * the check; a hook naming a different `hooks` or `retry` still hears that it cannot. Allocates
+ * only when there is something to drop.
+ */
+function withoutInheritedClientOptions<O extends RequestOptions>(newOptions: O, options: FormedOptions): O {
+  let result: O | undefined;
+
+  for (const key of clientOnlyOptions) {
+    if (newOptions[key] !== undefined && newOptions[key] === options[key]) {
+      result ??= {...newOptions};
+      delete result[key];
+    }
+  }
+
+  return result ?? newOptions;
+}
+
+/**
  * The per-request check, shared by the two routes into `call()`: `formOptions` and an
  * `afterResponse` retry.
  *
@@ -3585,8 +4079,8 @@ function validateOptions(options: RequestOptions, atCreation: boolean): void {
  * that triggered the retry is a `ValidationError`. One function, so a rule added to one route
  * cannot go missing from the other.
  */
-function validateRequest(options: RequestOptions, followsRedirects: boolean): void {
-  validateOptions(options, false);
+function validateRequest(options: RequestOptions & {url?: unknown}, followsRedirects: boolean, isRetry = false): void {
+  validateOptions(options, false, isRetry);
 
   // Turning redirects *on* means composing an interceptor, which is a create/extend-time
   // decision - a per-request `true` would otherwise be silently ignored. Turning them off per
@@ -3969,7 +4463,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
         // Must sit before `redirect` in the array: compose() wraps in order, so an earlier
         // entry ends up inside, and only something inside is re-entered per hop. Composed
         // whether or not there are hooks - it is also what records the final url.
-        chain.push(makeRedirectTracker(this.beforeRedirectHooks), interceptors.redirect());
+        chain.push(makeRedirectTracker(this.beforeRedirectHooks), redirectInterceptor);
       }
 
       if (options.dedupe) {
@@ -4114,19 +4608,9 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       formed.context = {...formed.context};
     }
 
+    // A `url` in `options` never gets this far with validation on - `validateOptions` refuses it,
+    // as got 16 does - so the argument is the only url there is.
     if (url !== undefined) {
-      // got refuses this rather than picking a winner, and two urls in one call is always a
-      // mistake worth hearing about - the argument used to quietly overwrite the option.
-      // Measured against got 16, which goes further: since got 15 a `url` key in any options
-      // object is a TypeError (`The \`url\` option is not supported in options objects. Pass
-      // it as the first argument instead.`), with or without an argument beside it, and in
-      // `extend()` too. The options-only callable form is built on that option, so it stays.
-      // Inside the `url !== undefined` branch and behind `validate`, so the hot path pays one
-      // property read for it.
-      if (this.validate && options.url !== undefined) {
-        invalid('`url` cannot be given both as an argument and as an option');
-      }
-
       formed.url = url;
     }
 
@@ -4164,6 +4648,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // synchronously - `new Gotlike(...)` isn't async.
     try {
       formed = this.formOptions(options, url, method);
+      lastFormed = formed;
 
       /*
        * got hands handlers a url already resolved against `prefixUrl` and `searchParams`, and
@@ -4382,6 +4867,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
   async call<T = unknown>(options: FormedOptions): Promise<Response<T>> {
     let undiciResponse;
+    /** Whether the head arrived, so a failure from here on is reading the body - see `ReadError`. */
+    let headArrived = false;
     let responseBody;
     let rawText;
     let startTime;
@@ -4676,6 +5163,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       };
 
       undiciResponse = await undici.request(url, requestOptions);
+      headArrived = true;
 
       // The response is ours, so nothing is going to retry it - if the retry bookkeeping paused
       // the deadline expecting one, the body read below would otherwise run unbounded.
@@ -4766,11 +5254,18 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
           elapsedMs(startTime),
           options,
           rawText,
-          redirects?.lastUrl,
+          redirects,
         );
 
       if (err instanceof HeadersTimeoutError || err instanceof BodyTimeoutError) {
-        throw await this.toRequestError(err.message, 'ETIMEDOUT', err, options, response, TimeoutError);
+        throw await this.toRequestError(
+          timeoutMessage(err, options),
+          'ETIMEDOUT',
+          err,
+          options,
+          response,
+          TimeoutError,
+        );
       }
 
       if (parseFailed) {
@@ -4794,7 +5289,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
        */
       if (isTimeoutReason(err, options.signal)) {
         throw await this.toRequestError(
-          messageOf(err, 'Request timed out'),
+          timeoutMessage(err, options),
           'ETIMEDOUT',
           err as Error,
           options,
@@ -4809,27 +5304,21 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
        * alone reported a cancelled request as a generic `ERR_REQUEST_ERROR`.
        */
       if ((err as Error)?.name === 'AbortError' || options.signal?.aborted) {
-        throw await this.toRequestError(
-          messageOf(err, 'Request aborted'),
-          'ERR_ABORTED',
-          err as Error,
-          options,
-          response,
-          AbortError,
-        );
+        throw await this.toRequestError(abortMessage(err), 'ERR_ABORTED', err as Error, options, response, AbortError);
       }
 
       // The underlying message, not a generic one - the same reasoning as the pre-request
       // catch above. "Request error" was all that reached `error.message` for a connection
       // refused, a DNS failure and a malformed url alike, leaving every log line and every
       // APM grouping unable to tell them apart. got reports the underlying message too.
-      throw await this.toRequestError(
-        messageOf(err, 'Request error'),
-        codeOf(err, 'ERR_REQUEST_ERROR'),
-        err as Error,
-        options,
-        response,
-      );
+      const failure = resumeFailure(err, attempts) ?? err;
+      const {message, code} = transportFailure(failure, options, headArrived);
+
+      // A failure once the head has arrived is a failure reading the body, which got calls a
+      // `ReadError` - a reset part-way through, a truncated gzip stream.
+      throw headArrived
+        ? await this.toRequestError(message, code, failure as Error, options, response, ReadError)
+        : await this.toRequestError(message, code, failure as Error, options, response);
     } finally {
       // The body has been read (or the request has failed), so the deadline has nothing left
       // to bound. `afterResponse` hooks run after this and are deliberately outside it: they
@@ -4845,7 +5334,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       elapsedMs(startTime),
       options,
       rawText,
-      redirects?.lastUrl,
+      redirects,
     );
 
     // Runs before `throwHttpErrors` on purpose: got-style token refresh hooks need to see
@@ -4947,6 +5436,21 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     const effectiveOptions = response.request?.options ?? options;
 
     if (effectiveOptions.throwHttpErrors && isHttpError(response.statusCode, this.follows(effectiveOptions))) {
+      // A 3xx here on a client that follows redirects is one undici gave up on. When that was the
+      // limit - more dispatches in the chain than redirects allowed - it is got's
+      // `MaxRedirectsError` rather than an `HTTPError` for the redirect page. Only for this call's
+      // own response: one a hook's retry produced was judged by that call.
+      if (effectiveOptions === options && redirects !== undefined && redirects.count > maxRedirections) {
+        throw await this.toRequestError(
+          `Redirected ${maxRedirections} times. Aborting.`,
+          'ERR_TOO_MANY_REDIRECTS',
+          undefined,
+          options,
+          response,
+          MaxRedirectsError,
+        );
+      }
+
       throw await this.toRequestError(
         httpErrorMessage(response.statusCode, effectiveOptions),
         httpErrorCode,
@@ -5024,7 +5528,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
     // The body was dumped just above, so there is nothing left to present - the error readable
     // `asStream` builds for a failure is what the caller reads.
-    return asStream(Readable.from([]), streamHead, error);
+    return asStream(Readable.from([]), streamHead, error, true);
   }
 
   /**
@@ -5039,6 +5543,18 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * so the readable it returns can raise it at read time rather than throwing synchronously.
    */
   streamHttpError(head: StreamHead, options: FormedOptions, dispatch: SharedDispatchOptions): Promise<Error> {
+    // The redirect limit, as in `call()`.
+    if (dispatch.redirects !== undefined && dispatch.redirects.count > maxRedirections) {
+      return this.toRequestError(
+        `Redirected ${maxRedirections} times. Aborting.`,
+        'ERR_TOO_MANY_REDIRECTS',
+        undefined,
+        options,
+        streamResponse(head, options, dispatch),
+        MaxRedirectsError,
+      );
+    }
+
     return this.toRequestError(
       httpErrorMessage(head.statusCode, options),
       httpErrorCode,
@@ -5080,38 +5596,23 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    */
   toStreamError(error: Error, options: FormedOptions, response?: Response<undefined>): Promise<Error> {
     if (error instanceof HeadersTimeoutError || error instanceof BodyTimeoutError) {
-      return this.toRequestError(error.message, 'ETIMEDOUT', error, options, response, TimeoutError);
+      return this.toRequestError(timeoutMessage(error, options), 'ETIMEDOUT', error, options, response, TimeoutError);
     }
 
     if (isTimeoutReason(error, options.signal)) {
-      return this.toRequestError(
-        messageOf(error, 'Request timed out'),
-        'ETIMEDOUT',
-        error,
-        options,
-        response,
-        TimeoutError,
-      );
+      return this.toRequestError(timeoutMessage(error, options), 'ETIMEDOUT', error, options, response, TimeoutError);
     }
 
     if (error?.name === 'AbortError' || options.signal?.aborted) {
-      return this.toRequestError(
-        messageOf(error, 'Request aborted'),
-        'ERR_ABORTED',
-        error,
-        options,
-        response,
-        AbortError,
-      );
+      return this.toRequestError(abortMessage(error), 'ERR_ABORTED', error, options, response, AbortError);
     }
 
-    return this.toRequestError(
-      messageOf(error, 'Request error'),
-      codeOf(error, 'ERR_REQUEST_ERROR'),
-      error,
-      options,
-      response,
-    );
+    const {message, code} = transportFailure(error, options, response !== undefined);
+
+    // As in `call()`: once the head has arrived, the failure is reading the body.
+    return response === undefined
+      ? this.toRequestError(message, code, error, options, response)
+      : this.toRequestError(message, code, error, options, response, ReadError);
   }
 
   /**
@@ -5155,11 +5656,14 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 
         responded = streamHead;
         resolveHead(streamHead);
-        duplex.emit('response', streamHead);
 
         if (!options.throwHttpErrors || !isHttpError(statusCode, this.follows(options))) {
+          duplex.emit('response', streamHead);
+
           return body;
         }
+
+        // No `response` event for a status `throwHttpErrors` refuses, as in got - see `asStream`.
 
         // The body is being replaced by the error, so let undici reclaim the socket.
         body.resume();
@@ -5203,6 +5707,8 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
     // The duplex covers the whole exchange here - upload and download both - so its close is
     // the moment the deadline stops being needed.
     releaseOnClose(duplex, dispatch.release);
+
+    holdFinishForHead(duplex, head);
 
     /*
      * Installed before anything can fail - `undici.pipeline` returns synchronously and every
@@ -5277,7 +5783,7 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    */
   async retryWithMergedOptions<T>(
     options: FormedOptions,
-    newOptions: RequestOptions,
+    newOptions: RequestOptions & {url?: string | URL},
     /** Index of the `afterResponse` hook driving this retry; absent when called directly. */
     hookIndex?: number,
     /** The status that triggered this retry, for `beforeRetry` - absent when called directly. */
@@ -5300,8 +5806,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
      * `formOptions` gates its own - and through the same `validateRequest`, so the two cannot
      * drift the way they had over `followRedirect`.
      */
+    newOptions = withoutInheritedClientOptions(newOptions, options);
+
     if (this.validate) {
-      validateRequest(newOptions, this.followsRedirects);
+      validateRequest(newOptions, this.followsRedirects, true);
     }
 
     const depth = ((options as RetryDepth)[retryDepth] ?? 0) + 1;
@@ -5720,67 +6228,67 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
   }
 
   get(options: RequestOptions & IsStream): Promise<GotlikeStream>;
-  get(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  get(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  get(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  get(options: TextCall & BodyOnly): Promise<string>;
-  get(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  get(options: BufferCall & BodyOnly): Promise<Buffer>;
-  get<T>(options: RequestOptions & BodyOnly): Promise<T>;
-  get<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  get(options: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  get(options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  get(options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  get(options: TextCall & BodyOnly): ResponsePromise<string>;
+  get(options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  get(options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  get<T>(options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  get<T>(options: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   get(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeStream>;
-  get(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  get(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  get(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  get(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  get(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  get(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
-  get<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  get<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  get(url: string | URL, options?: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  get(url: string | URL, options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  get(url: string | URL, options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  get(url: string | URL, options: TextCall & BodyOnly): ResponsePromise<string>;
+  get(url: string | URL, options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  get(url: string | URL, options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  get<T>(url: string | URL, options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  get<T>(url: string | URL, options?: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   get(url: RequestInput, options?: RequestOptions): Promise<any> {
     return handleInput(this, url, options, 'GET');
   }
 
   post(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  post(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  post(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  post(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  post(options: TextCall & BodyOnly): Promise<string>;
-  post(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  post(options: BufferCall & BodyOnly): Promise<Buffer>;
-  post<T>(options: RequestOptions & BodyOnly): Promise<T>;
-  post<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  post(options: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  post(options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  post(options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  post(options: TextCall & BodyOnly): ResponsePromise<string>;
+  post(options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  post(options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  post<T>(options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  post<T>(options: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   post(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  post(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  post(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  post(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  post(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  post(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  post(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
-  post<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  post<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  post(url: string | URL, options?: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  post(url: string | URL, options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  post(url: string | URL, options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  post(url: string | URL, options: TextCall & BodyOnly): ResponsePromise<string>;
+  post(url: string | URL, options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  post(url: string | URL, options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  post<T>(url: string | URL, options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  post<T>(url: string | URL, options?: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   post(url: RequestInput, options?: RequestOptions): Promise<any> {
     return handleInput(this, url, options, 'POST');
   }
 
   delete(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  delete(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  delete(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  delete(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  delete(options: TextCall & BodyOnly): Promise<string>;
-  delete(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  delete(options: BufferCall & BodyOnly): Promise<Buffer>;
-  delete<T>(options: RequestOptions & BodyOnly): Promise<T>;
-  delete<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  delete(options: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  delete(options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  delete(options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  delete(options: TextCall & BodyOnly): ResponsePromise<string>;
+  delete(options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  delete(options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  delete<T>(options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  delete<T>(options: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   delete(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  delete(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  delete(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  delete(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  delete(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  delete(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  delete(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
-  delete<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  delete<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  delete(url: string | URL, options?: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  delete(url: string | URL, options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  delete(url: string | URL, options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  delete(url: string | URL, options: TextCall & BodyOnly): ResponsePromise<string>;
+  delete(url: string | URL, options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  delete(url: string | URL, options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  delete<T>(url: string | URL, options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  delete<T>(url: string | URL, options?: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   delete(url: RequestInput, options?: RequestOptions): Promise<any> {
     return handleInput(this, url, options, 'DELETE');
   }
@@ -5792,89 +6300,89 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
    * TypeError. Found by the parity suite, which could not run its HEAD scenario at all.
    */
   head(options: RequestOptions & IsStream): Promise<GotlikeStream>;
-  head(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  head(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  head(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  head(options: TextCall & BodyOnly): Promise<string>;
-  head(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  head(options: BufferCall & BodyOnly): Promise<Buffer>;
-  head<T>(options: RequestOptions & BodyOnly): Promise<T>;
-  head<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  head(options: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  head(options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  head(options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  head(options: TextCall & BodyOnly): ResponsePromise<string>;
+  head(options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  head(options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  head<T>(options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  head<T>(options: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   head(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeStream>;
-  head(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  head(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  head(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  head(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  head(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  head(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
-  head<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  head<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  head(url: string | URL, options?: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  head(url: string | URL, options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  head(url: string | URL, options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  head(url: string | URL, options: TextCall & BodyOnly): ResponsePromise<string>;
+  head(url: string | URL, options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  head(url: string | URL, options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  head<T>(url: string | URL, options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  head<T>(url: string | URL, options?: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   head(url: RequestInput, options?: RequestOptions): Promise<any> {
     return handleInput(this, url, options, 'HEAD');
   }
 
   put(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  put(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  put(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  put(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  put(options: TextCall & BodyOnly): Promise<string>;
-  put(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  put(options: BufferCall & BodyOnly): Promise<Buffer>;
-  put<T>(options: RequestOptions & BodyOnly): Promise<T>;
-  put<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  put(options: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  put(options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  put(options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  put(options: TextCall & BodyOnly): ResponsePromise<string>;
+  put(options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  put(options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  put<T>(options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  put<T>(options: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   put(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  put(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  put(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  put(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  put(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  put(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  put(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
-  put<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  put<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  put(url: string | URL, options?: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  put(url: string | URL, options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  put(url: string | URL, options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  put(url: string | URL, options: TextCall & BodyOnly): ResponsePromise<string>;
+  put(url: string | URL, options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  put(url: string | URL, options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  put<T>(url: string | URL, options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  put<T>(url: string | URL, options?: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   put(url: RequestInput, options?: RequestOptions): Promise<any> {
     return handleInput(this, url, options, 'PUT');
   }
 
   patch(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  patch(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  patch(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  patch(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  patch(options: TextCall & BodyOnly): Promise<string>;
-  patch(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  patch(options: BufferCall & BodyOnly): Promise<Buffer>;
-  patch<T>(options: RequestOptions & BodyOnly): Promise<T>;
-  patch<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  patch(options: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  patch(options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  patch(options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  patch(options: TextCall & BodyOnly): ResponsePromise<string>;
+  patch(options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  patch(options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  patch<T>(options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  patch<T>(options: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   patch(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  patch(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  patch(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  patch(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  patch(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  patch(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  patch(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
-  patch<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  patch<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  patch(url: string | URL, options?: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  patch(url: string | URL, options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  patch(url: string | URL, options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  patch(url: string | URL, options: TextCall & BodyOnly): ResponsePromise<string>;
+  patch(url: string | URL, options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  patch(url: string | URL, options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  patch<T>(url: string | URL, options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  patch<T>(url: string | URL, options?: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   patch(url: RequestInput, options?: RequestOptions): Promise<any> {
     return handleInput(this, url, options, 'PATCH');
   }
 
   query(options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  query(options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  query(options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  query(options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  query(options: TextCall & BodyOnly): Promise<string>;
-  query(options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  query(options: BufferCall & BodyOnly): Promise<Buffer>;
-  query<T>(options: RequestOptions & BodyOnly): Promise<T>;
-  query<T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  query(options: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  query(options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  query(options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  query(options: TextCall & BodyOnly): ResponsePromise<string>;
+  query(options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  query(options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  query<T>(options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  query<T>(options: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   query(url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeUploadStream>;
-  query(url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  query(url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  query(url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  query(url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  query(url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  query(url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
-  query<T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  query<T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  query(url: string | URL, options?: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  query(url: string | URL, options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  query(url: string | URL, options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  query(url: string | URL, options: TextCall & BodyOnly): ResponsePromise<string>;
+  query(url: string | URL, options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  query(url: string | URL, options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  query<T>(url: string | URL, options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  query<T>(url: string | URL, options?: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   query(url: RequestInput, options?: RequestOptions): Promise<any> {
     return handleInput(this, url, options, 'QUERY');
   }
@@ -5887,23 +6395,23 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
 export type CallableClient<O extends ClientOptions = ClientOptions> = Omit<Gotlike<O>, 'extend'> & {
   /* `client({url, ...})`, the options-only form got's export also accepts. */
   (options: RequestOptions & IsStream): Promise<GotlikeStream | GotlikeUploadStream>;
-  (options: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  (options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  (options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  (options: TextCall & BodyOnly): Promise<string>;
-  (options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  (options: BufferCall & BodyOnly): Promise<Buffer>;
-  <T>(options: RequestOptions & BodyOnly): Promise<T>;
-  <T>(options: RequestOptions): Promise<ClientResult<O, T>>;
+  (options: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  (options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  (options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  (options: TextCall & BodyOnly): ResponsePromise<string>;
+  (options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  (options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  <T>(options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  <T>(options: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   (url: string | URL, options: RequestOptions & IsStream): Promise<GotlikeStream | GotlikeUploadStream>;
-  (url: string | URL, options?: InheritCall & WholeResponse): Promise<ClientResult<O, ClientBody<O>>>;
-  (url: string | URL, options: InheritCall & BodyOnly): Promise<ClientBody<O>>;
-  (url: string | URL, options: TextCall & WholeResponse): Promise<ClientResult<O, string>>;
-  (url: string | URL, options: TextCall & BodyOnly): Promise<string>;
-  (url: string | URL, options: BufferCall & WholeResponse): Promise<ClientResult<O, Buffer>>;
-  (url: string | URL, options: BufferCall & BodyOnly): Promise<Buffer>;
-  <T>(url: string | URL, options: RequestOptions & BodyOnly): Promise<T>;
-  <T>(url: string | URL, options?: RequestOptions): Promise<ClientResult<O, T>>;
+  (url: string | URL, options?: InheritCall & WholeResponse): ResponsePromise<ClientResult<O, ClientBody<O>>>;
+  (url: string | URL, options: InheritCall & BodyOnly): ResponsePromise<ClientBody<O>>;
+  (url: string | URL, options: TextCall & WholeResponse): ResponsePromise<ClientResult<O, string>>;
+  (url: string | URL, options: TextCall & BodyOnly): ResponsePromise<string>;
+  (url: string | URL, options: BufferCall & WholeResponse): ResponsePromise<ClientResult<O, Buffer>>;
+  (url: string | URL, options: BufferCall & BodyOnly): ResponsePromise<Buffer>;
+  <T>(url: string | URL, options: RequestOptions & BodyOnly): ResponsePromise<T>;
+  <T>(url: string | URL, options?: RequestOptions): ResponsePromise<ClientResult<O, T>>;
   /**
    * `Gotlike` is `Omit`ted of `extend` above on purpose: an intersection merges call
    * signatures into an overload set, and `Gotlike['extend']` would win and type an extended

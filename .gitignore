@@ -13,3 +13,7 @@ src/*.d.ts
 
 # profile.ts output - regenerate with `npm run profile` in benchmark/
 benchmark/*.cpuprofile
+
+# conformance/run.ts clones the upstream suites here
+conformance/.upstream/
+conformance/results/

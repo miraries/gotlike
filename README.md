@@ -76,8 +76,9 @@ Supports:
 - [x] `searchParams`, `form`
 - [x] Decompression: gzip, deflate, br, zstd, compress
 - [x] Basic auth: `username` / `password`, or credentials in the url (`https://user:pass@host`)
-- [x] `response.ok` / `rawBody` / `retryCount`
-- [x] Named error classes: `HTTPError`, `TimeoutError`, `ParseError`
+- [x] `response.ok` / `rawBody` / `retryCount` / `requestUrl` / `redirectUrls` / `statusMessage`
+- [x] got's promise shortcuts: `client.get(url).json()`, `.text()`, `.buffer()`
+- [x] Named error classes: `HTTPError`, `TimeoutError`, `ParseError`, `ReadError`, `MaxRedirectsError`, `AbortError`
 - [x] Streams *(with response head + timings; no progress events)*
 - [x] Timings *(only total request)*
 - [x] Parsed response body and timings on errors
@@ -88,7 +89,7 @@ Supports:
 - [x] HTTP2 *(over TLS; cleartext h2c needs an `agent`)*
 - [x] Pipelining
 - [x] Options validation
-- [x] Callable client: `gotlike(url, options)` and `gotlike({ url, ... })`
+- [x] Callable client: `gotlike(url, options)`, and `gotlike(options)` with the url from `prefixUrl`
 - [x] An options object in place of the url on every verb, as got takes it: `client.post({ json })`, `client.stream.post({ body })`
 
 ## Differences from got
@@ -108,12 +109,11 @@ Supports:
 | `mutableDefaults` / `defaults.options.merge()` | merges any option; on a client without `mutableDefaults` the merge **silently does nothing** | only what a request merges can be merged. `hooks`, `handlers`, `retry`, `agent` and the other create/extend-only options, a body, a `url`, `responseType` and `resolveBodyOnly` are a `ValidationError`, since the client consumed them when it was built. On a client without `mutableDefaults` the merge is a `ValidationError` too. Not inherited by `extend()`, as in got |
 | `parseUserinfo` | n/a | client-only, same reasoning as `validate`. Turns `user:pass@host` in a url into a Basic-auth header, and is on by default. Turn it off if no url you pass ever carries credentials, to skip the scan (~300-400ns/request, measured) |
 | `followRedirect` | `true` | **`false`**, because redirects cost ~2µs/request to support whether or not one happens. Enable per client with `extend({ followRedirect: true })`; a per-request `true` is a `ValidationError`, since composing the interceptor is a create/extend-time decision |
-| `maxRedirects` | configurable | **fixed at 10**, got's own default. A chain longer than that is an `HTTPError` carrying the 3xx, as it is in got, not a success whose body is the redirect page |
+| `maxRedirects` | configurable | **fixed at 10**, got's own default. A chain longer than that is a `MaxRedirectsError` carrying the 3xx, as it is in got, not a success whose body is the redirect page |
 | `stream()` for a bodyless request | always a `Duplex` | a **`Readable`**, since nothing can be written to a GET and the duplex wrapper cost ~10% of stream throughput |
 | `prefixUrl` with an absolute `url` | throws | the **absolute url wins**, silently. `prefixUrl` therefore does *not* pin the host: if `url` can be influenced from outside, validate it yourself |
 | `prefixUrl` with a query or fragment | allowed | a **`ValidationError`**. The prefix is concatenated with `url`, so a `?` on it would land mid-url. Use `searchParams` |
 | `prefixUrl` with a leading slash on `url` | throws (`` `url` must not start with a slash ``) | **accepted**. Every leading slash is stripped and the path is joined, so `'/items'` and `'items'` do the same thing. More permissive than got on purpose, so a caller who meant an absolute path gets a silently different request where got would have stopped them |
-| `url` as an option (`gotlike({ url, ... })`) | **rejected since got 15**, with a `TypeError` for a `url` key in any options object, `extend()` included; got 12 and 14 accepted it | **kept**, since the callable form is built on it. Passing a url as an argument *and* as an option is rejected on both sides |
 | `responseType: 'buffer'` | a `Uint8Array` since got 15 | a real **`Buffer`**. `Buffer` extends `Uint8Array`, so it satisfies anything typed for one, and callers feeding `sharp()` and friends need the subclass. `response.rawBody` likewise |
 | `timeout: { request: 0 }` | immediate timeout | a **`ValidationError`**, along with `Infinity` and `NaN`. undici reads its own `bodyTimeout: 0` as *disabled*, so 0 meant two opposite things at once. Leave the option off for no timeout |
 | `timeout.lookup`, `.connect`, `.secureConnect`, `.socket`, `.send`, `.response`, `.read` | per-phase bounds | a **`ValidationError`** naming the option. Only `timeout.request` is implemented, and it bounds every phase; accepting the others meant a `timeout: {response: 10000}` that silently bounded nothing. Use `timeout.request`, or the client-level `connectTimeout` for the connection phase |
@@ -139,7 +139,67 @@ Supports:
 
 `stream()` resolves to the stream rather than returning it synchronously, so async `beforeRequest`
 hooks can be awaited. An absolute `url` overrides `prefixUrl` instead of being rejected outright.
-got's `init` hook, `pagination`, `allowGetBody` and `methodRewriting` are not implemented.
+
+**Not implemented.** Every one of these is either a `ValidationError` naming the option (so a
+migration finds it at the first request) or listed here because it fails some other way. The list
+comes from running got's own test suite against gotlike (see `conformance/`), not from memory:
+
+- **TLS options** (`https: {rejectUnauthorized, certificateAuthority, key, certificate, ...}`). Give
+  the client an undici `Agent` with `connect: {rejectUnauthorized, ca, key, cert}` as its `agent`.
+- **`cookieJar`**, **`pagination`** / `got.paginate`, a custom **`request`** function,
+  **`allowAbsoluteUrls`**, **`encoding`**, **`parseJson`** / **`stringifyJson`**, **`methodRewriting`**,
+  **`allowGetBody`** (a GET with a body is sent as it is, not refused), **`copyPipedHeaders`**,
+  **`strictContentLength`**, **`preserveHooks`**, and the socket options **`dnsLookupIpVersion`**,
+  **`family`**, **`localAddress`**, **`createConnection`**, **`setHost`**, **`maxHeaderSize`**,
+  **`h2session`** and **`enableUnixSockets`** (unix socket urls).
+- **`hooks.init`**, **`hooks.beforeCache`**, **`retry.calculateDelay`**, **`retry.noise`**,
+  **`retry.enforceRetryRules`**, per-phase timeouts, and **`followRedirect` as a function**.
+- **Events** on the request promise and on streams - `request`, `redirect`, `retry`,
+  `uploadProgress`, `downloadProgress` - and a stream's `retryCount`, `createRetryStream`, `socket` and
+  `isReadonly`. A stream emits `response` only.
+- **Header copying across a pipe**: an `IncomingMessage` piped in does not lend its headers, and a
+  `ServerResponse` piped to does not get the status and headers.
+- **Reading `client.defaults.options`**: it has only `merge()`. `extend()` takes one options object,
+  not several, and not another client to merge; got's `Options` class and `got.mergeOptions` do not
+  exist.
+- **`UploadError`**, **`CacheError`**, and an error's `request` (got's request stream). A failing
+  upload body is a plain `RequestError`.
+- **On the response**: `ip`, `isFromCache`, `rawHeaders`, and any timing but `timings.phases.total`.
+  `statusMessage` is node's standard phrase for the status, not a server's own non-standard one, and
+  `HTTPError`'s message uses the same.
+- **In hooks**: a `beforeRequest` hook returning a response does not short-circuit the request; it
+  runs once per request rather than once per redirect hop, and gets no `{retryCount}` second argument.
+  `beforeRedirect` is handed undici's per-hop options (`RedirectRequest`: no `body`/`json`/`form`,
+  and changing the url does not re-target the hop). `beforeRetry` runs inside undici's retry
+  interceptor, so its changes to `error.options` do not reach the retried request, and it is not
+  called for a `retryWithMergedOptions` retry. A relative string `url` handed to
+  `retryWithMergedOptions` resolves against `prefixUrl`, not against the url of the current request.
+- **`.json()`** does not add `accept: application/json` the way got's does - the request is already
+  on its way. Set `responseType: 'json'` for that. **`.buffer()`** is byte-exact only when called
+  before the body is read, as it always is when written `client.get(url).buffer()`.
+
+**Smaller differences** got's suite also turned up, none of which a caller is likely to depend on:
+an invalid url's error carries no `input`, and an empty url is reported as missing rather than
+invalid; `https:host` (no `//`) is accepted and read by WHATWG rules; `prefixUrl` must be a string,
+not a `URL`, and a hook sees it as given rather than normalised to end in `/`; a non-enumerable
+option (`context` defined with `Object.defineProperty`) is dropped, since options are copied with a
+spread; a hook array holding something other than a function fails when it is called, not when the
+client is built; `ValidationError` carries no `options`; `HTTPError#response` is enumerable; an
+`authorization` or `proxy-authorization` header given as a multi-value array, an array `form` and a
+`null` header value are all accepted rather than refused; `response.request.options` omits a
+`username`/`password` the caller never set rather than reporting `''`; after a redirect,
+`HTTPError`'s message names the url requested rather than the last one; a stream's response head
+has no `requestUrl`; a `TimeoutError` with no response has no `timings`; an `AbortSignal.timeout()`
+firing is `ETIMEDOUT` where got passes the DOMException's numeric code; a `ReadError` keeps its
+cause's code (`Z_DATA_ERROR`) where got reports `ERR_READING_RESPONSE_STREAM`, and a body shorter
+than its `content-length` is `other side closed` where got says `Content-Length mismatch`.
+
+**Behaves differently, because undici does.** A 301/302 `POST` becomes a `GET` without its body
+(got keeps the method and body unless `methodRewriting` says otherwise); a body is not forwarded
+across origins on a 307/308, and a body that cannot be replayed fails as the 3xx `HTTPError`; a
+caller-set `transfer-encoding`, or a `content-length` that disagrees with the body, is refused
+(`invalid transfer-encoding header`, `Request body length does not match content-length header`);
+and undici's HTTP parser accepts a few malformed responses node's rejects with `Parse Error`.
 
 **No `user-agent` is sent.** got identifies itself as `got (https://github.com/sindresorhus/got)`;
 undici has no default and gotlike adds none, so requests go out with the header absent entirely,
@@ -410,7 +470,30 @@ nock.disableNetConnect();
 ```
 
 Also supported: `.persist()`, `.delay()`, `.matchHeader()`, `.replyWithError()`, `.once()`,
-`.twice()`, `.thrice()`, `.isDone()`, `nock.pendingMocks()`, `nock.activate()`/`restore()`.
+`.twice()`, `.thrice()`, `.isDone()`, `nock.pendingMocks()`, `nock.activate()`/`restore()`, and the
+scope options `reqheaders`, `badheaders` and `conditionally` (`nock(host, {reqheaders: {...}})`).
+
+A request no interceptor matches fails as nock reports it: `Nock: No match for request {...}` with
+code `ERR_NOCK_NO_MATCH` on a mocked origin, and `Nock: Disallowed net connect for "host:port/path"`
+with `ENETUNREACH` on an unmocked one that net connect refuses. undici's own `MockNotMatchedError`,
+which says which interceptors were left, is on `error.cause`.
+
+**Not implemented** (from running nock's own suite against the shim, see `conformance/`):
+`nock.back`, `nock.recorder`, `nock.define`/`load`, `nock.emitter` and scope events,
+`nock.removeInterceptor`, `nock.isDone()`/`activeMocks()`, `scope.pendingMocks()`/`activeMocks()`/
+`clone()`, `.optionally()`, `.replyWithFile()`, `.delayConnection()`/`.delayBody()`, `.basicAuth()`,
+`.defaultReplyHeaders()`, `.replyContentLength()`, `.replyDate()`, `.filteringPath()`/
+`.filteringRequestBody()`, `scope.intercept()`, a node-style `reply(function (uri, body, callback))`,
+and reply headers given as an array, a `Map` or with function values. `allowUnmocked` and
+`filteringScope` are accepted but not applied: both fail closed (a miss is refused rather than passed
+through). `nock.pendingMocks()` returns undici's interceptor objects rather than nock's strings. A
+query is parsed as `URLSearchParams` rather than with `qs`, so nested keys (`a[b]=1`) are not
+expanded. The shim does not validate its arguments the way nock does (`times('x')` throws undici's
+error rather than being ignored). A body matcher sees a multipart `FormData` body as unparsed text. A
+`.query(fn)` or `matchHeader()` predicate may be called more than once per request, since undici
+applies matchers more than once - keep them pure. A reply callback's body is only JSON-parsed when
+the request's `content-type` is a single string. And the shim never sees a request made with node's
+own `http` module - it replaces undici's global dispatcher.
 
 As in nock, a plain string path does **not** match a request that carries a query
 string; add `.query(true)` for that.
@@ -470,7 +553,8 @@ const upload = await gotlike.stream(url, { method: 'POST' });
 await pipeline(createReadStream('file'), upload);
 ```
 
-With `throwHttpErrors` on, an error status surfaces when you read the stream, so listen on `error`.
+With `throwHttpErrors` on, an error status surfaces when you read the stream, so listen on `error`;
+as in got, no `response` event is emitted for it.
 With it off, await `stream.response` and check `ok`. The error is a full `HTTPError`, with
 `error.response` populated and the `beforeError` hooks already applied.
 
@@ -555,11 +639,16 @@ Failures are normalised to a `RequestError` subclass, all of which stay `instanc
 
 | class | `code` | when |
 | --- | --- | --- |
-| `HTTPError` | `ERR_NON_2XX_3XX_RESPONSE` | `throwHttpErrors` is on and the status is outside 2xx, plus a 3xx that reached you *while following redirects*, which means the chain outran `maxRedirects`. A 3xx with `followRedirect` off is not an error, and a 304 never is |
-| `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request`, or an `AbortSignal.timeout()` fired |
+| `HTTPError` | `ERR_NON_2XX_3XX_RESPONSE` | `throwHttpErrors` is on and the status is outside 2xx, or a 3xx that reached you while following redirects for a reason other than the limit (no `location`, a body that cannot be replayed). A 3xx with `followRedirect` off is not an error, and a 304 never is |
+| `MaxRedirectsError` | `ERR_TOO_MANY_REDIRECTS` | the redirect chain ran past 10 hops (`Redirected 10 times. Aborting.`), or undici refused a redirect straight back to the same url as a loop. `error.response` is the last 3xx |
+| `TimeoutError` | `ETIMEDOUT` | exceeded `timeout.request` (`Timeout awaiting 'request' for 5000ms`, got's message), or an `AbortSignal.timeout()` fired |
+| `ReadError` | the cause's `code`, or `ERR_READING_RESPONSE_STREAM` | the response head arrived but reading or decompressing the body failed: a reset part-way through (`ECONNRESET`), a truncated gzip stream |
 | `ParseError` | `ERR_BODY_PARSE_FAILURE` | body didn't parse as the requested `responseType`, on a status that was otherwise fine. An *empty* body is never a parse failure, whatever the status. On an error status the status wins: the body is left as the text that arrived, the hooks still see it, and `throwHttpErrors` decides, so a 500 carrying a proxy's HTML page is an `HTTPError`, not a parse failure |
-| `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted |
-| `RequestError` | the underlying error's own `code`, or `ERR_REQUEST_ERROR` | everything else (connection refused, socket errors, ...) |
+| `AbortError` | `ERR_ABORTED` | the request's `signal` was aborted (`This operation was aborted.`, got's message, unless you aborted with a reason of your own) |
+| `RequestError` | the underlying error's own `code`, or `ERR_REQUEST_ERROR` | everything else (connection refused, an unsupported protocol as `ERR_UNSUPPORTED_PROTOCOL`, ...) |
+
+got's `UploadError` and `CacheError` do not exist here: a failing upload stream is a plain
+`RequestError` carrying the stream's own error, and the cache is undici's.
 
 An `HTTPError`'s message is got's (`Request failed with status code 403 (Forbidden): GET
 http://host/path`) with one deliberate difference: **the query string is removed**. got names the
@@ -579,10 +668,10 @@ from inside an `afterResponse` retry.
 one transport failure from another. The originating error is also kept as `error.cause`.
 
 `error.code` comes from that same underlying error, as got's does: `ECONNREFUSED`, `ENOTFOUND`,
-`ERR_INVALID_URL`. What undici raises is passed through as it stands, so a failure undici describes
-itself arrives under its own name (`UND_ERR_SOCKET` for a connection dropped mid-body) where got,
-which does not use undici, would say `ECONNRESET`. `ERR_REQUEST_ERROR` is the fallback, for a
-failure carrying no code of its own: a throwing hook, say.
+`ERR_INVALID_URL`. A connection the server closed on you is `ECONNRESET`, as in got, although undici
+calls it `UND_ERR_SOCKET` (`other side closed`) - that stays on `error.cause`. Other failures undici
+describes itself arrive under its own names. `ERR_REQUEST_ERROR` is the fallback, for a failure
+carrying no code of its own: a throwing hook, say.
 
 Hooks follow the same rule: anything a `beforeRequest`, `afterResponse` or `beforeError` hook
 throws comes back as a `RequestError` carrying the hook's own message, not as the raw error.

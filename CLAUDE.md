@@ -43,6 +43,7 @@ Three things live here, and the detail for each is loaded on demand rather than 
 | the nock-compatible mocking shim | `src/nock.ts` | the **`nock-shim`** skill |
 | the tests and the coverage gate | `src/*.spec.ts` | the **`testing`** skill |
 | the got/nock parity suites | `src/parity/` | **`src/parity/CLAUDE.md`** |
+| got's and nock's own test suites, run against gotlike | `conformance/` | **`conformance/CLAUDE.md`** |
 | the benchmark + profiler | `benchmark/` | **`benchmark/CLAUDE.md`** |
 | lint / format / tsconfig setup | `.oxlintrc.json`, `.oxfmtrc.json`, `tsconfig*.json` | the **`lint-config`** skill |
 
@@ -78,6 +79,14 @@ a promise, so **always `await` it**. `npm run lint` now catches that via `typesc
 
 Lives in `src/parity/` — full notes in `src/parity/CLAUDE.md`, which loads when you work in that
 directory. Read it before touching a scenario, a generator or a `divergence` pin.
+
+## Conformance
+
+`conformance/` runs **got 16's own test suite** and **nock 14's got-based suite** against gotlike and the shim,
+against a committed list of expected failures, each labelled `bug`/`gap`/`unsupported`/`divergence`/... - full
+notes in `conformance/CLAUDE.md`. It is what the parity suite cannot be: cases someone else wrote. Its CI job runs
+separately from `check`, since it clones and installs both upstreams. **The target is got 16**: a consumer on an
+older got moves to 16, rather than gotlike keeping the older behaviour as a divergence.
 
 ## Benchmark
 

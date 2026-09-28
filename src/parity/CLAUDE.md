@@ -98,10 +98,14 @@ divergence table rather than only in a test.
 The sixth arrived with the bump rather than from anything changing here: **got rejects a `url` key in an
 options object**, so `got({url, ...})` and `got(url, {url})` both throw a `TypeError` where got 12 and 14
 took the first and rejected only the second. The change landed in **got 15**, not 16 — the suite was simply
-still pinned to 14 and had never seen it. gotlike keeps the option, because the callable `client({url, ...})`
-form the README advertises is built on it and `got-cjs@12` — what the consumer actually runs — accepts it.
-Both halves are pinned. This is what the bump was for: an upstream behaviour change surfaced by a failing
-test naming the exact value that moved, rather than by a caller finding it.
+still pinned to 14 and had never seen it. This is what the bump was for: an upstream behaviour change surfaced
+by a failing test naming the exact value that moved, rather than by a caller finding it.
+
+gotlike first *kept* the option, because its first consumer was on `got-cjs@12`, where it is ordinary. That
+was the wrong call and has been undone: **the target is got 16**, and a consumer on an older got updates to
+it rather than gotlike carrying the older behaviour. Keeping it made a call that works here and throws under
+got, which is the one direction a drop-in must never differ in. Both now refuse with got's message; the class
+and code differ as they do for every validation failure. **Don't add a divergence to accommodate an older got.**
 
 **Adding a divergence is a deliberate act.** If a change makes something new diverge, the suite fails
 until someone writes down why that is acceptable. Reaching for `divergence` to make a red test green is

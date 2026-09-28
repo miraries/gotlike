@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import http from 'node:http';
 import zlib from 'node:zlib';
 import {clearInterval} from 'node:timers';
-import {getEventListeners} from 'node:events';
+import {getEventListeners, once} from 'node:events';
 import {setTimeout as sleep} from 'node:timers/promises';
 import {Readable, Writable} from 'node:stream';
 import {pipeline} from 'node:stream/promises';
@@ -22,10 +22,13 @@ import client, {
   type HandlerFunction,
   Gotlike,
   HTTPError,
+  MaxRedirectsError,
   ParseError,
+  ReadError,
   RequestError,
   type RequestOptions,
   type Response as GotlikeResponse,
+  type RetryWithMergedOptions,
   TimeoutError,
   ValidationError,
 } from './index.ts';
@@ -212,6 +215,21 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
     return;
   }
 
+  // Bytes that are not valid UTF-8: a PNG signature.
+  if (req.url === '/binary') {
+    res.end(Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex'));
+
+    return;
+  }
+
+  // Claims gzip, isn't.
+  if (req.url === '/gzip-corrupt') {
+    res.setHeader('content-encoding', 'gzip');
+    res.end('not gzipped at all');
+
+    return;
+  }
+
   if (req.url === '/gzip-error') {
     res.statusCode = 400;
     res.setHeader('content-encoding', 'gzip');
@@ -308,6 +326,27 @@ const server = http.createServer((req: http.IncomingMessage, res: http.ServerRes
   if (req.url === '/redirect-307') {
     res.statusCode = 307;
     res.setHeader('location', '/echo');
+    res.end();
+
+    return;
+  }
+
+  // Post/Redirect/Get to the same url: a POST is answered with a 303 back to itself.
+  if (req.url === '/prg') {
+    if (req.method === 'POST') {
+      res.statusCode = 303;
+      res.setHeader('location', '/prg');
+      res.end();
+    } else {
+      res.end(`answered ${req.method}`);
+    }
+
+    return;
+  }
+
+  if (req.url === '/loop') {
+    res.statusCode = 302;
+    res.setHeader('location', '/loop');
     res.end();
 
     return;
@@ -578,6 +617,68 @@ test('body is available as string on parse failure', async () => {
   );
 
   assert.strictEqual(err.response?.body, 'hello\n');
+});
+
+/*
+ * got's wording for the failures callers match on by message or code - each was a mismatch in
+ * got's own suite (`conformance/`). A caller's own abort reason or `AbortSignal.timeout()` keeps
+ * its message, as in got.
+ */
+test('failures are reported in got’s words', async () => {
+  const aborted = new AbortController();
+  const custom = new AbortController();
+  const rows: [string, Promise<unknown>, string, string, string][] = [
+    [
+      'timeout.request',
+      client.get('http://localhost:3000/timeout', {timeout: {request: 100}}),
+      'TimeoutError',
+      'ETIMEDOUT',
+      "Timeout awaiting 'request' for 100ms",
+    ],
+    [
+      'a caller’s AbortSignal.timeout()',
+      client.get('http://localhost:3000/timeout', {signal: AbortSignal.timeout(50)}),
+      'TimeoutError',
+      'ETIMEDOUT',
+      'The operation was aborted due to timeout',
+    ],
+    [
+      'abort()',
+      client.get('http://localhost:3000/timeout', {signal: aborted.signal}),
+      'AbortError',
+      'ERR_ABORTED',
+      'This operation was aborted.',
+    ],
+    [
+      'abort(reason)',
+      client.get('http://localhost:3000/timeout', {signal: custom.signal}),
+      'AbortError',
+      'ERR_ABORTED',
+      'cancelled by the caller',
+    ],
+    [
+      'an unsupported protocol',
+      client.get('ftp://localhost:3000/x'),
+      'RequestError',
+      'ERR_UNSUPPORTED_PROTOCOL',
+      'Unsupported protocol: ftp:',
+    ],
+    ['no url at all', client.get({}), 'RequestError', 'ERR_INVALID_URL', 'Missing `url` property'],
+  ];
+
+  setTimeout(() => {
+    aborted.abort();
+    custom.abort(new Error('cancelled by the caller'));
+  }, 20);
+
+  // Every row's handler is attached now, so none of them rejects unobserved while an earlier one runs.
+  const errors = rows.map(([, request]) => failure(request));
+
+  for (const [index, [name, , errorName, code, message]] of rows.entries()) {
+    const error = await errors[index]!;
+
+    assert.deepStrictEqual([error.name, error.code, error.message], [errorName, code, message], name);
+  }
 });
 
 test('throws error on timeout', async () => {
@@ -1458,7 +1559,7 @@ test('a handler rewriting the url reaches the wire, whether or not the request h
  * replaces it; measured against got 16 for each row.
  */
 test('an afterResponse retry with a url of its own does not inherit the first attempt’s searchParams', async () => {
-  const rows: [string, RequestOptions, string][] = [
+  const rows: [string, Parameters<RetryWithMergedOptions>[0], string][] = [
     ['a url with a query', {url: 'http://localhost:3000/echo/p?token=new'}, '/echo/p?token=new'],
     ['a url with no query', {url: 'http://localhost:3000/echo/p'}, '/echo/p'],
     ['a relative url under prefixUrl', {url: 'p?token=new'}, '/echo/p?token=new'],
@@ -1489,6 +1590,46 @@ test('an afterResponse retry with a url of its own does not inherit the first at
 
     assert.strictEqual(response.body.url, expected, name);
   }
+});
+
+/*
+ * got documents handing the request's own options back - `retry(response.request.options)`, or a
+ * spread of them with a change - and those carry the client's `hooks`, `retry` and `handlers`.
+ * Validated as a per-request call, that was a `ValidationError` on every client with a hook to
+ * retry from. The same value carried over says nothing; a *different* one is still refused.
+ */
+test('an afterResponse retry may hand back the request’s own options', async () => {
+  const retried = (retryOptions: (options: FormedOptions) => Parameters<RetryWithMergedOptions>[0]) =>
+    createClient({
+      responseType: 'json',
+      retry: {limit: 0},
+      handlers: [(options, next) => next(options)],
+      hooks: {
+        afterResponse: [
+          (response, retryWithMergedOptions) =>
+            response.request.options.headers['x-retried'] === undefined
+              ? retryWithMergedOptions(retryOptions(response.request.options))
+              : response,
+        ],
+      },
+    });
+
+  const whole = await retried((options) => {
+    options.headers['x-retried'] = '1';
+
+    return options;
+  }).get<Echo>('http://localhost:3000/echo');
+  const spread = await retried((options) => ({...options, headers: {'x-retried': '1'}})).get<Echo>(
+    'http://localhost:3000/echo',
+  );
+
+  assert.strictEqual(whole.body.headers['x-retried'], '1');
+  assert.strictEqual(spread.body.headers['x-retried'], '1');
+
+  await assert.rejects(
+    retried((options) => ({...options, hooks: {}, headers: {'x-retried': '1'}})).get('http://localhost:3000/echo'),
+    {name: 'ValidationError', message: /`hooks` can only be set when creating or extending a client/},
+  );
 });
 
 test('an afterResponse retry’s own throwHttpErrors and url settle the outcome, not the original request’s', async () => {
@@ -1788,7 +1929,7 @@ test('an afterResponse retry ignores an option the hook names as undefined', asy
   // means something. A table whose baseline had quietly become a failure would otherwise pass.
   assert.match(absent, /^POST \/echo\?q=x ct=application\/json body=\{"a":1\} parsed=object$/);
 
-  const keys: (keyof RequestOptions)[] = [
+  const keys: (keyof Parameters<RetryWithMergedOptions>[0])[] = [
     'method',
     'url',
     'responseType',
@@ -2490,6 +2631,45 @@ test('stream accepts a request body written to the duplex', async () => {
   assert.strictEqual(echo.body, 'written-to-the-stream');
 });
 
+/*
+ * Two stream behaviours measured against got 16, both found by its own suite. A status
+ * `throwHttpErrors` refuses emits the `HTTPError` and no `response` event - the got way of proxying,
+ * `on('response', (head) => res.writeHead(...))`, must not start forwarding a response it is about
+ * to fail on. And an upload that never connects fails a `pipeline()` into it: the duplex used to
+ * finish as soon as its body was buffered, so the pipeline resolved before the error arrived.
+ */
+test('a refused status emits no response event, and a failed upload fails its pipeline', async () => {
+  for (const open of [
+    () => client.stream('http://localhost:3000/status?code=404'),
+    () => client.stream.post('http://localhost:3000/status?code=404', {body: 'x'}),
+  ]) {
+    const stream = await open();
+    const events: string[] = [];
+
+    stream.on('response', () => events.push('response'));
+    stream.resume();
+    await failure(
+      once(stream, 'error').then(([error]) => {
+        events.push((error as Error).name);
+
+        throw error as Error;
+      }),
+    );
+
+    assert.deepStrictEqual(events, ['HTTPError']);
+  }
+
+  const refused = await failure(pipeline(Readable.from([]), await client.stream.put('http://127.0.0.1:1')));
+
+  assert.strictEqual(refused.code, 'ECONNREFUSED');
+
+  // An upload that succeeds still finishes, once its head has arrived.
+  const upload = await client.stream.put('http://localhost:3000/echo');
+
+  upload.resume();
+  await pipeline(Readable.from(['body']), upload);
+});
+
 test('stream errors on a non-2xx when throwHttpErrors is on', async () => {
   const duplex = await client.stream('http://localhost:3000/status?code=500');
 
@@ -2582,6 +2762,25 @@ test('exhausted retries resolve to the last response', async () => {
   const response = await extClient.get('http://localhost:3000/retry');
 
   assert.strictEqual(response.statusCode, 429);
+});
+
+/*
+ * undici resumes a body cut off part-way with a `Range` request; `/truncate` ignores it, as most
+ * servers do, and undici then failed with its own `server does not support the range header ...`,
+ * naming neither the reset nor its code. The error is the reset, as it is without a retry.
+ */
+test('a body cut off mid-way reports the reset, not the failed attempt to resume it', async () => {
+  const retrying = client.extend({retry: {limit: 1, backoffLimit: 10}});
+  const errors = [
+    await failure(client.get('http://localhost:3000/truncate')),
+    await failure(retrying.get('http://localhost:3000/truncate')),
+  ];
+
+  for (const err of errors) {
+    assert.ok(err instanceof ReadError);
+    assert.strictEqual(err.code, 'ECONNRESET');
+    assert.doesNotMatch(err.message, /range header/);
+  }
 });
 
 test('exhausted retries throw when throwHttpErrors is set', async () => {
@@ -3797,6 +3996,18 @@ test('mutableDefaults is not inherited by extend, as in got', () => {
   assert.strictEqual(client.extend({mutableDefaults: true}).defaults.mutableDefaults, true);
 });
 
+// got's `{http: new Agent()}` used to fail every request with `base.compose is not a function`.
+test('an agent that is not an undici dispatcher is refused when the client is built', () => {
+  for (const agent of [{http: new http.Agent({keepAlive: true})}, new http.Agent(), 'agent', null]) {
+    assert.throws(() => client.extend({agent: agent as unknown as Dispatcher}), {
+      name: 'ValidationError',
+      message: /^`agent` must be an undici dispatcher/,
+    });
+  }
+
+  assert.doesNotThrow(() => client.extend({agent: new Agent()}));
+});
+
 test('mutableDefaults is client-only', async () => {
   await assert.rejects(
     client.get('http://localhost:3000/headers', {mutableDefaults: true} as RequestOptions),
@@ -3824,7 +4035,7 @@ test('defaults.options.merge refuses what it cannot apply', () => {
     {json: {a: 1}},
     {body: 'x'},
     {form: {a: 1}},
-    {url: 'http://localhost:3000'},
+    {url: 'http://localhost:3000'} as RequestOptions,
     {isStream: true},
     {responseType: 'json'},
     {resolveBodyOnly: true},
@@ -4455,12 +4666,7 @@ test('every verb takes an options object in place of the url, as got does', asyn
   assert.deepStrictEqual([downloaded.url, downloaded.headers['x-verb']], ['/echo/token/', 'stream']);
   assert.deepStrictEqual([direct.url, direct.headers['x-verb']], ['/echo/token/', 'direct']);
 
-  // A url carried in the object is the request's, on the verbs as on the callable form.
-  const absolute = await client.get<Echo>({url: 'http://localhost:3000/echo/absolute', responseType: 'json'});
-
-  assert.strictEqual(absolute.body.url, '/echo/absolute');
-
-  // A second options object merges over the first, headers case-insensitively, as got 12 does.
+  // A second options object merges over the first, headers case-insensitively.
   // Untyped there as here - both declare the options-first form with one argument - so it is
   // reached through a loose signature.
   type TwoObjects = (input: RequestOptions, options: RequestOptions) => Promise<GotlikeResponse<Echo>>;
@@ -4476,16 +4682,14 @@ test('every verb takes an options object in place of the url, as got does', asyn
     ['1', '2', 'second'],
   );
 
-  const viaCallable = await (client as unknown as TwoObjects)(
-    {url: 'http://localhost:3000/echo/c', responseType: 'json'},
-    {method: 'PUT'},
-  );
+  const viaCallable = await (prefixed as unknown as TwoObjects)({responseType: 'json'}, {method: 'PUT'});
 
   assert.strictEqual(viaCallable.body.method, 'PUT');
 
   // `context` merges one level deep too, as it does on every other route.
   let seen: unknown;
   const hooked = createClient({
+    prefixUrl: 'http://localhost:3000/echo',
     responseType: 'json',
     hooks: {
       beforeRequest: [
@@ -4496,21 +4700,12 @@ test('every verb takes an options object in place of the url, as got does', asyn
     },
   });
 
-  await (hooked.get as TwoObjects)({url: 'http://localhost:3000/echo', context: {a: 1}}, {context: {b: 2}});
+  await (hooked.get as TwoObjects)({context: {a: 1}}, {context: {b: 2}});
   assert.deepStrictEqual(seen, {a: 1, b: 2});
 
   // A bad query value in the merge rejects, as it would on a single object.
   await assert.rejects(
-    (client.get as TwoObjects)(
-      {url: 'http://localhost:3000/echo', searchParams: {a: '1'}},
-      {searchParams: {b: {} as unknown as string}},
-    ),
-    {name: 'ValidationError'},
-  );
-
-  // Naming the url in both is the same mistake as naming it as an argument and an option.
-  await assert.rejects(
-    (client.get as TwoObjects)({url: 'http://localhost:3000/echo/a'}, {url: 'http://localhost:3000/echo/b'}),
+    (prefixed.get as TwoObjects)({searchParams: {a: '1'}}, {searchParams: {b: {} as unknown as string}}),
     {name: 'ValidationError'},
   );
 
@@ -4681,26 +4876,56 @@ test('an unknown hook name is rejected rather than silently dropped', () => {
 });
 
 /*
- * got refuses this outright rather than picking a winner; the argument used to overwrite the
- * option with nothing said. Measured against got 16, which rejects a `url` key in an options
- * object in every position - a change that landed in got 15. gotlike keeps it, because the
- * options-only callable form is the legal way to pass a url as an option and has to keep
- * working; the parity suite pins both sides of that difference.
+ * got 16 refuses a `url` key in any options object - a request's, alongside an argument or not,
+ * `extend()`'s - with `The \`url\` option is not supported in options objects` (since got 15).
+ * gotlike used to keep it for got-cjs@12 callers, which meant a call that works here and throws
+ * under got; the url is the first argument now, as it is there. A table over every route an
+ * options object comes in by, because the old check lived on one route (an argument *and* an
+ * option) and missed the rest. `retryWithMergedOptions` is the one place got still takes a
+ * `url`, so it is the row that must *not* refuse.
  */
-test('a url given both as an argument and as an option is rejected', async () => {
-  await assert.rejects(
-    () => client.get('http://localhost:3000/json', {url: 'http://localhost:3000/text'}),
-    (err: Error) => {
-      assert.ok(err instanceof ValidationError);
-      assert.match(err.message, /both as an argument and as an option/);
+test('a url in an options object is refused on every route, as in got 16', async () => {
+  type Loose = (...args: unknown[]) => Promise<unknown>;
+  const url = 'http://localhost:3000/json';
+  const message = /^The `url` option is not supported in options objects\. Pass it as the first argument instead\.$/;
+  const routes: [string, () => unknown][] = [
+    ['request, beside an argument', () => (client.get as Loose)(url, {url})],
+    ['request, alone', () => (client.get as Loose)({url})],
+    ['request, second object', () => (client.get as Loose)({}, {url})],
+    ['callable client', () => (client as unknown as Loose)({url})],
+    ['stream', () => (client.stream as unknown as Loose)({url})],
+    ['stream verb', () => (client.stream.post as Loose)({url, body: 'x'})],
+    ['extend', () => client.extend({url} as RequestOptions)],
+    ['createClient', () => createClient({url} as RequestOptions)],
+    ['constructor', () => new Gotlike({url} as RequestOptions)],
+  ];
+  const accepted: string[] = [];
 
-      return true;
+  for (const [name, route] of routes) {
+    try {
+      await route();
+      accepted.push(name);
+    } catch (error) {
+      assert.ok(error instanceof ValidationError, name);
+      assert.match((error as Error).message, message, name);
+    }
+  }
+
+  assert.deepStrictEqual(accepted, []);
+
+  // The exception: a retry names where it goes.
+  const retried = createClient({
+    responseType: 'json',
+    hooks: {
+      afterResponse: [
+        (response, retryWithMergedOptions) =>
+          response.statusCode === 404 ? retryWithMergedOptions({url: 'http://localhost:3000/echo/retried'}) : response,
+      ],
     },
-  );
+  });
+  const response = await retried.get<Echo>('http://localhost:3000/status?code=404', {throwHttpErrors: false});
 
-  const response = await client({url: 'http://localhost:3000/json'});
-
-  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.body.url, '/echo/retried');
 });
 
 test('validate itself is client-only', async () => {
@@ -4783,6 +5008,56 @@ test('beforeRedirect can restore a header stripped on a cross-origin redirect', 
   });
 
   assert.strictEqual(withHook.body.headers['authorization'], 'Bearer restored');
+});
+
+// got's `requestUrl`, `redirectUrls` and `statusMessage`, which got's own suite reads throughout.
+test('a response carries the requested url, the redirect chain and the status text', async () => {
+  const redirecting = client.extend({followRedirect: true});
+  const redirected = await redirecting.get('http://localhost:3000/redirect-chain');
+  const direct = await client.get('http://localhost:3000/status?code=503', {throwHttpErrors: false});
+
+  assert.strictEqual(redirected.requestUrl.href, 'http://localhost:3000/redirect-chain');
+  assert.deepStrictEqual(redirected.redirectUrls.map(String), [
+    'http://localhost:3000/redirect-chain-2',
+    'http://localhost:3000/echo',
+  ]);
+  assert.strictEqual(redirected.url, 'http://localhost:3000/echo');
+  assert.strictEqual(redirected.statusMessage, 'OK');
+  assert.deepStrictEqual(direct.redirectUrls, []);
+  assert.strictEqual(direct.statusMessage, 'Service Unavailable');
+});
+
+// got strips all four credentials on a cross-origin hop; undici's handler only knew three.
+test('a cross-origin redirect drops cookie2 along with the other credentials', async () => {
+  const redirecting = client.extend({followRedirect: true, responseType: 'json'});
+  const response = await redirecting.get<Echo>('http://localhost:3000/redirect-cross-origin', {
+    headers: {authorization: 'Bearer secret', cookie: 'a=1', cookie2: '$Version=1', 'x-kept': 'yes'},
+  });
+
+  assert.deepStrictEqual(
+    ['authorization', 'cookie', 'cookie2', 'x-kept'].map((name) => response.body.headers[name]),
+    [undefined, undefined, undefined, 'yes'],
+  );
+});
+
+/*
+ * undici's loop check compares urls only, and records the current one before comparing, so the
+ * commonest redirect of all - POST, then a 303 back to the same url as a GET - was refused as
+ * `Redirect loop detected`. got has no loop check at all - it follows to its limit - and neither does
+ * this now.
+ */
+test('Post/Redirect/Get to the same url is followed, not taken for a loop', async () => {
+  const redirecting = client.extend({followRedirect: true});
+  const response = await redirecting.post('http://localhost:3000/prg', {body: 'x'});
+
+  assert.strictEqual(response.body, 'answered GET');
+  assert.strictEqual(response.url, 'http://localhost:3000/prg');
+
+  // A real loop is followed to the limit and then refused, as in got.
+  await assert.rejects(redirecting.get('http://localhost:3000/loop'), {
+    name: 'MaxRedirectsError',
+    message: 'Redirected 10 times. Aborting.',
+  });
 });
 
 /**
@@ -5330,11 +5605,7 @@ test('status codes that cannot carry a body are not parsed', async () => {
 });
 
 test('a HEAD response is not parsed as json', async () => {
-  const response = await client.handle({
-    url: 'http://localhost:3000/json',
-    method: 'HEAD',
-    responseType: 'json',
-  });
+  const response = await client.handle({method: 'HEAD', responseType: 'json'}, 'http://localhost:3000/json');
 
   assert.strictEqual(response.statusCode, 200);
   assert.strictEqual(response.body, undefined);
@@ -6161,6 +6432,35 @@ test('timeout.request on an upload stream is a TimeoutError, not a DOMException'
   assert.deepStrictEqual(seen, ['ETIMEDOUT']);
 });
 
+/*
+ * A body the decompress interceptor cannot decode is the request's failure, on both APIs. On a
+ * stream it used to be taken for the consumer's own - it is not an `UndiciError` - so the raw zlib
+ * `Error` came out with no `beforeError` hooks.
+ */
+test('a body that fails to decompress is a ReadError on both APIs, with beforeError applied', async () => {
+  const seen: string[] = [];
+  const hooked = client.extend({
+    hooks: {
+      beforeError: [
+        (error) => {
+          seen.push(error.name);
+
+          return error;
+        },
+      ],
+    },
+  });
+  const url = 'http://localhost:3000/gzip-corrupt';
+  const errors = [await failure(hooked.get(url)), await failure(text(await hooked.stream(url)))];
+
+  for (const error of errors) {
+    assert.ok(error instanceof ReadError, `expected a ReadError, got ${error}`);
+    assert.strictEqual(error.code, 'Z_DATA_ERROR');
+  }
+
+  assert.deepStrictEqual(seen, ['ReadError', 'ReadError']);
+});
+
 test('a truncated body on a bodyless stream is a RequestError with beforeError applied', async () => {
   const {seen, recording} = hookRecorder();
 
@@ -6171,9 +6471,9 @@ test('a truncated body on a bodyless stream is a RequestError with beforeError a
 
   const error = await failure(text(stream));
 
-  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
-  // undici describes this one itself, so its own code is what comes through.
-  assert.deepStrictEqual(seen, ['UND_ERR_SOCKET']);
+  assert.ok(error instanceof ReadError, `expected a ReadError, got ${error}`);
+  // undici's `UND_ERR_SOCKET` for `other side closed` is reported as the reset it is, as got does.
+  assert.deepStrictEqual(seen, ['ECONNRESET']);
   // The head arrived, so the error carries it - `error.response` is documented as undefined
   // *only* for a failure that happened before a response. `call()` always honoured that; this
   // path handed back undefined for a response it had already seen and reported the head of.
@@ -6189,8 +6489,8 @@ test('a truncated body on an upload stream is a RequestError with beforeError ap
 
   const error = await failure(text(duplex));
 
-  assert.ok(error instanceof RequestError, `expected a RequestError, got ${error}`);
-  assert.deepStrictEqual(seen, ['UND_ERR_SOCKET']);
+  assert.ok(error instanceof ReadError, `expected a ReadError, got ${error}`);
+  assert.deepStrictEqual(seen, ['ECONNRESET']);
   assert.strictEqual(error.response?.statusCode, 200);
 });
 
@@ -6342,17 +6642,22 @@ test('a stream reports the final url too', async () => {
 /*
  * A chain longer than `maxRedirections` leaves undici handing back the redirect itself. That
  * used to resolve as a *success* whose body was the redirect page - the caller got
- * `body: 'redirecting'` and no error at all. got throws here: its ok-range stops at 299 once
- * redirects are being followed.
+ * `body: 'redirecting'` and no error at all - and then as an `HTTPError` for the 302. got throws
+ * its `MaxRedirectsError` here, and so does this now, on both APIs.
  */
-test('a redirect chain that exceeds the limit is an HTTPError', async () => {
+test('a redirect chain that exceeds the limit is a MaxRedirectsError', async () => {
   const redirecting = client.extend({followRedirect: true});
 
-  const error = await failure(redirecting.get('http://localhost:3000/hop/0'));
+  const errors = [
+    await failure(redirecting.get('http://localhost:3000/hop/0')),
+    await failure(text(await redirecting.stream('http://localhost:3000/hop/0'))),
+  ];
 
-  assert.strictEqual(error.code, 'ERR_NON_2XX_3XX_RESPONSE');
-  assert.strictEqual(error.name, 'HTTPError');
-  assert.strictEqual(error.response?.statusCode, 302);
+  for (const error of errors) {
+    assert.ok(error instanceof MaxRedirectsError, `expected a MaxRedirectsError, got ${error}`);
+    assert.deepStrictEqual([error.code, error.message], ['ERR_TOO_MANY_REDIRECTS', 'Redirected 10 times. Aborting.']);
+    assert.strictEqual(error.response?.statusCode, 302);
+  }
 });
 
 test('a streamed failure names the url that answered, not the one requested', async () => {
@@ -6363,7 +6668,7 @@ test('a streamed failure names the url that answered, not the one requested', as
   const stream = await redirecting.stream('http://localhost:3000/hop/0');
   const error = await failure<RequestError>(text(stream));
 
-  assert.ok(error instanceof HTTPError, `expected an HTTPError, got ${error}`);
+  assert.ok(error instanceof MaxRedirectsError, `expected a MaxRedirectsError, got ${error}`);
   assert.strictEqual(error.response?.statusCode, 302);
   // The last hop, not `/hop/0`. `response.url` follows the same rule on the promise API, and the
   // error a stream raises is built from the same head - one place reading `redirects.lastUrl`
@@ -7726,11 +8031,67 @@ test('validation ignores inherited enumerable properties', async () => {
   }
 });
 
-// got's export takes `got({url, ...})` as well as `got(url, options)`.
-test('the client can be called with an options object alone', async () => {
-  const response = await client({url: 'http://localhost:3000/echo', method: 'POST', responseType: 'json'});
+/*
+ * got's promise shortcuts - `got(url).json()` is how most got code reads a body, and it was a
+ * `TypeError` here. Each reads the response whatever `responseType` fetched it.
+ */
+test('a request promise has got’s json, text and buffer shortcuts', async () => {
+  const url = 'http://localhost:3000/json';
+  const jsonClient = client.extend({responseType: 'json'});
 
-  assert.strictEqual((response.body as Echo).url, '/echo');
+  assert.deepStrictEqual(await client.get(url).json(), {test: 'value'});
+  assert.deepStrictEqual(await jsonClient.get(url).json(), {test: 'value'});
+  assert.deepStrictEqual(await client(url).json(), {test: 'value'});
+  assert.strictEqual(await client.get(url).text(), '{"test": "value"}\n');
+  assert.strictEqual(await jsonClient.get(url).text(), '{"test": "value"}\n');
+  assert.ok((await client.get(url).buffer()).equals(Buffer.from('{"test": "value"}\n')));
+  assert.deepStrictEqual(await client.get(url, {resolveBodyOnly: true}).json(), {test: 'value'});
+
+  // `resolveBodyOnly` hands the shortcuts the body alone, in whichever form it was read.
+  const bodyOnly = {resolveBodyOnly: true} as const;
+  const asBuffer = {resolveBodyOnly: true, responseType: 'buffer'} as const;
+
+  assert.strictEqual(await client.get(url, bodyOnly).text(), '{"test": "value"}\n');
+  assert.strictEqual(await client.get(url, asBuffer).text(), '{"test": "value"}\n');
+  assert.ok((await client.get(url, asBuffer).buffer()).equals(Buffer.from('{"test": "value"}\n')));
+  assert.ok((await client.get(url, bodyOnly).buffer()).equals(Buffer.from('{"test": "value"}\n')));
+  assert.strictEqual(await jsonClient.get(url, bodyOnly).text(), '{"test":"value"}');
+  assert.ok((await jsonClient.get(url, bodyOnly).buffer()).equals(Buffer.from('{"test":"value"}')));
+  await assert.rejects(client.get('http://localhost:3000/html-error?code=200', bodyOnly).json(), SyntaxError);
+
+  // An empty body is handed back as it is, as got's parser does.
+  assert.strictEqual(await client.head(url).json(), '');
+
+  // `.buffer()` is byte for byte, not text decoded and encoded again - got's way to download a file.
+  const png = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+
+  assert.ok((await client.get('http://localhost:3000/binary').buffer()).equals(png));
+  assert.ok((await client('http://localhost:3000/binary').buffer()).equals(png));
+
+  // Each shortcut's result has the shortcuts too, and reads the same response, as got's does.
+  assert.deepStrictEqual(await client.get(url).text().json(), {test: 'value'});
+
+  const read = client.get(url).text();
+
+  assert.strictEqual(await read, '{"test": "value"}\n');
+  assert.deepStrictEqual(await read.json(), {test: 'value'});
+
+  // A body that is not JSON is a ParseError, as on a json request.
+  const error = await failure(client.get('http://localhost:3000/html-error?code=200').json());
+
+  assert.ok(error instanceof ParseError, `expected a ParseError, got ${error}`);
+  assert.strictEqual(error.response?.statusCode, 200);
+
+  // And a failed request rejects through the shortcut as it would through the promise.
+  assert.strictEqual((await failure(client.get('http://localhost:3000/status?code=500').json())).name, 'HTTPError');
+});
+
+// got's export takes an options object alone, the url then coming from `prefixUrl`.
+test('the client can be called with an options object alone', async () => {
+  const prefixed = client.extend({prefixUrl: 'http://localhost:3000/echo'});
+  const response = await prefixed({method: 'POST', responseType: 'json'});
+
+  assert.strictEqual((response.body as Echo).url, '/echo/');
   assert.strictEqual((response.body as Echo).method, 'POST');
 });
 
@@ -8954,19 +9315,27 @@ async function typeAssertions() {
   expectType<GotlikeUploadStream>()(await client.delete('u', {isStream: true}));
   expectType<GotlikeUploadStream>()(await client.query('u', {isStream: true}));
   expectType<GotlikeStream | GotlikeUploadStream>()(await client('u', {isStream: true}));
-  expectType<GotlikeStream | GotlikeUploadStream>()(await client({url: 'u', isStream: true}));
+  expectType<GotlikeStream | GotlikeUploadStream>()(await client({isStream: true}));
+  // @ts-expect-error - no `url` in an options object, as in got 16
+  void client({url: 'u'});
 
   // An options object in place of the url types the same way the url form does.
   expectType<Thing>()((await client.post<Thing>({json: {a: 1}})).body);
-  expectType<string>()((await client.get({url: 'u'})).body);
-  expectType<Buffer>()((await client.get({url: 'u', responseType: 'buffer'})).body);
+  expectType<string>()((await client.get({})).body);
+  expectType<Buffer>()((await client.get({responseType: 'buffer'})).body);
   expectType<string>()(await client.put({resolveBodyOnly: true}));
   expectType<unknown>()((await jsonClient.patch({})).body);
   expectType<GotlikeStream>()(await client.get({isStream: true}));
   expectType<GotlikeUploadStream>()(await client.post({isStream: true}));
   expectType<GotlikeUploadStream>()(await client.stream.post({body: 'x'}));
   expectType<GotlikeUploadStream>()(await client.stream({method: 'POST'}));
-  expectType<GotlikeStream>()(await client.stream({url: 'u'}));
+  expectType<GotlikeStream>()(await client.stream({}));
+
+  // got's promise shortcuts, on every verb and on the callable form.
+  expectType<Thing>()(await client.get('u').json<Thing>());
+  expectType<string>()(await client.post('u').text());
+  expectType<Buffer>()(await client('u').buffer());
+  expectType<unknown>()(await jsonClient.get('u').json());
 }
 
 void typeAssertions;

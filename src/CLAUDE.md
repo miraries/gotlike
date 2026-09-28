@@ -67,21 +67,18 @@ Two invariants worth preserving here:
   *replaces* an instance `authorization`. Merging by exact key kept both, undici sent both, and the server
   picked one — usually the stale one. Only the override side is walked on the hot path; the defaults are
   already normalised.
-- **A `url` is given as an argument or as an option, never both.** The argument used to overwrite the option
-  in silence; got refuses the combination too. **Since got 15 a `url` key in an options object is rejected
-  outright** — `assertNoUrlInOptionsObject` in `create.js` throws
+- **A `url` is the first argument, never an option** - as in got 16. **Since got 15 a `url` key in an options
+  object is rejected outright** — `assertNoUrlInOptionsObject` in `create.js` throws
   `TypeError: The \`url\` option is not supported in options objects. Pass it as the first argument instead.`
   for a request's options, for `extend()` and for `paginate()`, with or without an argument beside it. got 12
   and 14 accepted the option and rejected only the combination (measured on 14.6.6). It is `url` as an *input
-  key* that is gone; a hook can still read and write `options.url`, it is simply no longer an own enumerable
-  property. got 15's release notes list this as "`url` removed from public options objects" and describe the
-  hooks half of it; the input rejection is not spelled out there, and got 16's notes and readme do not mention
-  it at all. gotlike keeps the option: the callable `client({url, ...})` form is built on it, and
-  `igd-aggregator-api` is on `got-cjs@12`, where it is ordinary. Both halves of that are pinned in the parity
-  suite. The check sits inside the `url !== undefined` branch and behind `validate`, so the hot path pays
-  one property read for it. The callable form therefore passes its url in the options only - handing it over
-  positionally as well was always redundant, since `formOptions` spreads it in either way, and would now be
-  rejected.
+  key* that is gone; a hook can still read and write `options.url`, and `retryWithMergedOptions({url})` is still
+  how a retry goes somewhere else. `validateOptions` refuses it with got's message on every input route - request,
+  callable, stream, `extend()`, constructor - and lets it through only for a retry (`isRetry`). The type follows:
+  `RequestOptions` has no `url`; `FormedOptions`, `RequestError#options` and the retry's argument do.
+  **This used to be kept for `igd-aggregator-api`, which was on `got-cjs@12`, and that was wrong**: it made a
+  call that works here and throws under got. The target is got 16; a consumer on an older got moves to it.
+  Don't reintroduce an older got's behaviour as a divergence.
 - **Everything that would need deep merging is resolved at create/extend time** (`hooks`, `handlers`, `retry`,
   `agent`). That's what makes a shallow spread sufficient. `formOptions` costs ~46ns; a request costs ~60µs.
 - **`searchParams` and `timeout` are the two exceptions, and both are guarded by a property read.** A per-call
@@ -472,6 +469,14 @@ redirects was ignored where the identical option on the call that triggered it i
 function, so a rule added to one route cannot go missing from the other; the `followRedirect` row in the
 retry/`formOptions` invariant table is what holds it there.
 
+**A retry may hand back the request's own options** — `retry(response.request.options)`, or a spread of them —
+because got documents exactly that. Formed options carry the client's `hooks`, `retry`, `handlers` and the other
+create/extend-only options, so validating them as a per-request call made every such retry a `ValidationError` on
+any client with an `afterResponse` hook, i.e. on every client that could call it. `withoutInheritedClientOptions`
+drops a create/extend-only key whose value is *identical* to the one the request already carries before the check
+runs; a hook naming a different `hooks` or `retry` is still refused. Found by got's own suite
+(`infinite-loop-issue.ts`, and the `reusing request options` rows of `hooks.ts`).
+
 **The retried request runs only the hooks *before* the one that retried** (`afterResponseLimit`, a symbol on the
 options, same trick as `retryDepth`). Re-running the whole array meant a refreshed request re-fired every earlier
 hook and let the retrying hook see its own retry. got does `hooks.afterResponse.slice(0, index)` for the same
@@ -634,6 +639,38 @@ re-derived from it (in got it is not, and the stale length gets the request reje
 with the hook's own message and runs the `beforeError` hooks. It used to reject with the raw error, which meant
 a caller matching on `instanceof RequestError` missed it entirely.
 
+# got's spellings: error classes, codes and the promise shortcuts
+
+All of this came out of running got's own suite (`conformance/`), where each was a mismatch a caller matching
+on got's names would hit. None of it runs on a request that succeeds.
+
+- **`transportFailure`** reports the generic failure: undici's `UND_ERR_SOCKET`/`other side closed` as
+  `ECONNRESET` (what got reports and what callers and retry lists name), an `Invalid URL protocol` as
+  `ERR_UNSUPPORTED_PROTOCOL`/`Unsupported protocol: ftp:`, and a call with no url and no `prefixUrl` (the formed
+  url is `''`) as `Missing \`url\` property`. `timeoutMessage` gives `timeout.request` got's `Timeout awaiting
+  'request' for 5000ms`; a caller's own `AbortSignal.timeout()` keeps its message. `abortMessage` gives got's
+  `This operation was aborted.` - with the period - unless the caller aborted with a reason of their own.
+  `call()` and `toStreamError` both go through them, so the two APIs cannot drift.
+- **`ReadError`** is any failure once the head has arrived (`headArrived` in `call()`, a `response` in
+  `toStreamError`): a reset mid-body, a truncated gzip stream. Code falls back to got's
+  `ERR_READING_RESPONSE_STREAM` when the cause has none.
+- **`MaxRedirectsError`** (`Redirected 10 times. Aborting.`, `ERR_TOO_MANY_REDIRECTS`) replaces the `HTTPError`
+  for the 3xx undici gave up on - decided by the tracker's `redirects.count > maxRedirections`, so a 3xx undici
+  declined for another reason (no `location`, a non-replayable body) is still an `HTTPError`. undici's `Redirect
+  loop detected` gets the same class and code, and keeps its message.
+- **`resumeFailure`**: with retries on, undici resumes a body cut off mid-way with a `Range` request, and a
+  server that ignores it makes undici fail with `server does not support the range header ...`. The error
+  reported is the reset that caused the resume (`retriedBy`, kept by `countAttempts` past the retry that clears
+  `lastError`). got restarts the request instead; resuming is undici's retry handler and stays.
+- **`response.requestUrl`, `redirectUrls`, `statusMessage`** are prototype getters, so a response that never
+  reads them pays nothing. `redirectUrls` comes from the tracker's `urls` (replaced, never truncated, on a
+  retry). `statusMessage` is node's standard phrase: a server's own reaches only a dispatch handler.
+- **`.json()`/`.text()`/`.buffer()`** are attached by `withShortcuts` in `handleInput` - the one entry point
+  the verbs and the callable form share, and skipped for streams. Three shared functions stored on the promise,
+  not closures: measured against a null dispatcher, no difference beyond noise. `.json()` cannot add `accept`
+  the way got's does - the request is already on its way - and hands back an empty body as `''`, as got's parser
+  does. Every verb overload returns `ResponsePromise<X>`; add one and it must too.
+
 # Bodyless responses and parse failures
 
 `hasNoBody()` short-circuits parsing for `204`/`205`/`304` and `HEAD` — the body is `undefined` for `json`,
@@ -772,6 +809,17 @@ bogus hop happened to overwrite it with the attempt's own url; it is cleared ins
 back to the url that was requested, which is where a retry that followed no redirects was in fact answered.
 This works from `countAttempts` because it is composed *outside* the redirect interceptor and so runs before
 the new attempt's first hop, and because the holder is the same object every hop sees.
+
+**The redirect interceptor is gotlike's own (`redirectInterceptor`), wrapping a subclass of undici's
+`RedirectHandler`**, for two differences from got that undici's interceptor has no option for. undici's loop
+check compares urls only and records the current url *before* comparing, so Post/Redirect/Get to the same url
+(`POST /orders` -> 303 -> `GET /orders`) was refused as `Redirect loop detected` every time;
+`GotlikeRedirectHandler` shows the check a same-length history that can match nothing on a hop that turns the
+request into a GET, so the redirect limit still counts it and a same-method loop is still caught. And a
+cross-origin hop now strips `cookie2` as well (via undici's own `stripHeadersOnCrossOriginRedirect`), since got
+strips all four credentials and undici only three. Both found by running got's own suite (`conformance/`). The
+subclass reaches `history` and `opts`, which undici's typings don't declare - if an undici upgrade renames them,
+the PRG test fails rather than anything silently changing.
 
 `beforeRedirect` uses the same shape: `makeRedirectTracker` is composed **inside** undici's redirect
 interceptor, so it is re-entered per hop, and the hop's options are still mutable there — which is what lets
@@ -1039,6 +1087,15 @@ of 1000 and then kills the socket.
 parsed body to hand a hook, and a streamed request cannot be replayed, so `retryWithMergedOptions` would have
 nothing to re-send. got scopes `afterResponse` to its promise API for the same reason. Every other hook does fire
 for streams.
+
+**Two stream behaviours follow got's, both found by its own suite (`conformance/`).** A status `throwHttpErrors`
+refuses emits the `HTTPError` and **no `response` event** (`asStream`'s `statusRefused`, and the pipeline path only
+emits `response` for an accepted status); `stream.response` still resolves with the head. And an **upload's `finish`
+is held until the response head arrives** (`holdFinishForHead`): undici's pipeline duplex finishes once the body is
+buffered, so `pipeline(source, upload)` resolved for an upload whose connection was then refused. It is the event
+that is held, not a `final` added - undici ends the request body on `prefinish`, so a `final` waiting for the head
+would wait on a server waiting for the body. A decompression failure after the head (`isDecompressionError`) is
+also the request's, not the consumer's: it is not an `UndiciError`, so it used to come out raw.
 
 # Timeouts
 

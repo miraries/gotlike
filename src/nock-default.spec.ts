@@ -46,7 +46,7 @@ test('an unmatched request on a mocked origin never falls through to the live ne
   nock(origin).get('/expected').reply(200, 'mocked');
 
   const error = await failure(client.get(`${origin}/misspelled`));
-  assert.strictEqual(error.code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual(error.code, 'ERR_NOCK_NO_MATCH');
   assert.strictEqual(liveHits, 1, 'the unmatched request must not reach the server');
   assert.strictEqual((await client.get(`${origin}/expected`)).body, 'mocked');
 
@@ -60,7 +60,7 @@ test('an unmatched request on a mocked origin never falls through to the live ne
     .reply(200, 'regex mock');
 
   const regexError = await failure(client.get(`${origin}/another-miss`));
-  assert.strictEqual(regexError.code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual(regexError.code, 'ERR_NOCK_NO_MATCH');
   assert.strictEqual(liveHits, 2, 'a regex scope must also prevent a live fallback');
 
   // Regex pools are retained internally across cleans; inactive ones must not keep blocking.
@@ -113,7 +113,7 @@ test('a scope reused after cleanAll still owns its origin', async (t) => {
   scope.get('/expected').reply(200, 'mocked again');
 
   const error = await failure(client.get(`${origin}/misspelled`));
-  assert.strictEqual(error.code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual(error.code, 'ERR_NOCK_NO_MATCH');
   assert.strictEqual(liveHits, 0, 'the unmatched request must not reach the server');
   assert.strictEqual((await client.get(`${origin}/expected`)).body, 'mocked again');
 });
@@ -154,7 +154,7 @@ test('consuming, restoring and persisting mocks never hands an origin back by ac
   // miss, and a miss on an owned origin fails closed rather than reaching the server.
   nock(origin).get('/once').reply(200, 'mocked');
   assert.strictEqual((await client.get(`${origin}/once`)).body, 'mocked');
-  assert.strictEqual((await failure(client.get(`${origin}/once`))).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual((await failure(client.get(`${origin}/once`))).code, 'ERR_NOCK_NO_MATCH');
   assert.strictEqual(liveHits, 0);
 
   // restore() puts the caller's dispatcher back and activate() re-installs the mock; a scope
@@ -164,7 +164,7 @@ test('consuming, restoring and persisting mocks never hands an origin back by ac
   nock.activate();
   nock(origin).get('/again').reply(200, 'mocked again');
   assert.strictEqual((await client.get(`${origin}/again`)).body, 'mocked again');
-  assert.strictEqual((await failure(client.get(`${origin}/typo`))).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual((await failure(client.get(`${origin}/typo`))).code, 'ERR_NOCK_NO_MATCH');
   assert.strictEqual(liveHits, 0);
 
   // A persisted interceptor answers indefinitely, and stops when the scope is cleaned - at
@@ -220,7 +220,7 @@ test('enableNetConnect never reopens an origin that has mocks', async (t) => {
     nock(origin).get('/expected').reply(200, 'mocked');
     assert.strictEqual(
       (await failure(client.get(`${origin}/typo`))).code,
-      'UND_MOCK_ERR_MOCK_NOT_MATCHED',
+      'ERR_NOCK_NO_MATCH',
       `${policy}: a miss on a mocked origin`,
     );
     assert.strictEqual(liveHits, 0, `${policy}: the miss must not reach the server`);
@@ -234,7 +234,7 @@ test('enableNetConnect never reopens an origin that has mocks', async (t) => {
 
   // And disableNetConnect still closes an unmocked origin.
   nock.disableNetConnect();
-  assert.strictEqual((await failure(client.get(`${origin}/live`))).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual((await failure(client.get(`${origin}/live`))).code, 'ENETUNREACH');
   assert.strictEqual(liveHits, 0);
 });
 
@@ -286,7 +286,7 @@ test('a client with its own agent is mocked like any other', async (t) => {
     assert.strictEqual((await tuned.get(`${origin}/expected`)).body, 'mocked', `${shape}: a matching mock`);
     assert.strictEqual(
       (await failure(tuned.get(`${origin}/typo`))).code,
-      'UND_MOCK_ERR_MOCK_NOT_MATCHED',
+      'ERR_NOCK_NO_MATCH',
       `${shape}: a miss on a mocked origin`,
     );
 
@@ -294,7 +294,7 @@ test('a client with its own agent is mocked like any other', async (t) => {
     nock.disableNetConnect();
     assert.strictEqual(
       (await failure(tuned.get(`${origin}/live`))).code,
-      'UND_MOCK_ERR_MOCK_NOT_MATCHED',
+      'ENETUNREACH',
       `${shape}: an unmocked origin under disableNetConnect`,
     );
     assert.strictEqual(liveHits, 0, `${shape}: nothing may reach the server`);
@@ -320,7 +320,7 @@ test('a client with its own agent is mocked like any other', async (t) => {
 
   nock.disableNetConnect();
   nock.enableNetConnect('elsewhere.test');
-  assert.strictEqual((await failure(tuned.get(`${origin}/live`))).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED');
+  assert.strictEqual((await failure(tuned.get(`${origin}/live`))).code, 'ENETUNREACH');
   assert.strictEqual(liveHits, 3);
   assert.strictEqual(ownDispatches, 4);
   nock.enableNetConnect();

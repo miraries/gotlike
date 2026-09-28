@@ -30,20 +30,37 @@ nock.disableNetConnect();
 const json = client.extend({responseType: 'json', throwHttpErrors: false});
 
 /**
- * An unmatched interceptor surfaces as a normal request failure carrying undici's
- * "Mock dispatch not matched" text - on the `RequestError`'s own message as well as on the
- * cause, since a transport failure reports the underlying message rather than a generic
- * label, and the underlying `code` along with it (undici's own for a mock miss, a
- * `MockNotMatchedError`; `ERR_REQUEST_ERROR` only when the failure carries no code).
+ * An unmatched interceptor surfaces as a normal request failure carrying nock's own report - on
+ * the `RequestError`'s message as well as on its cause, since a transport failure reports the
+ * underlying message and code: `ERR_NOCK_NO_MATCH` for a miss on a mocked origin, `ENETUNREACH`
+ * for an unmocked one net connect refuses. undici's `MockNotMatchedError` is kept one level down.
  */
 function assertUnmatched(error: RequestError, why: string) {
-  assert.strictEqual(error.code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED', why);
-  assert.match(error.message, /Mock dispatch not matched|Net connect/, why);
-  assert.match((error.cause as Error).message, /Mock dispatch not matched|Net connect/, why);
+  assert.ok(['ERR_NOCK_NO_MATCH', 'ENETUNREACH'].includes(error.code), `${why}: ${error.code}`);
+  assert.match(error.message, /^Nock: (No match for request|Disallowed net connect)/, why);
+  assert.strictEqual(((error.cause as Error).cause as {code?: string}).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED', why);
 }
 
 test.afterEach(() => {
   nock.cleanAll();
+});
+
+// nock's own spelling, which suites written against nock assert on.
+test('a miss is reported as nock reports it', async () => {
+  nock('http://mock.test').get('/a').reply(200);
+
+  const miss = await failure(client.get('http://mock.test/b'));
+  const refused = await failure(client.get('http://unmocked.test/x'));
+
+  assert.strictEqual(miss.code, 'ERR_NOCK_NO_MATCH');
+  assert.match(
+    miss.message,
+    /^Nock: No match for request \{\n {2}"method": "GET",\n {2}"url": "http:\/\/mock\.test\/b"/,
+  );
+  assert.strictEqual((miss.cause as {statusCode?: number}).statusCode, 404);
+  assert.strictEqual(refused.code, 'ENETUNREACH');
+  assert.strictEqual(refused.message, 'Nock: Disallowed net connect for "unmocked.test:80/x"');
+  assert.strictEqual((refused.cause as Error).name, 'NetConnectNotAllowedError');
 });
 
 test('matches a plain path', async () => {
@@ -69,6 +86,15 @@ test('replies with headers and a status code', async () => {
 
   assert.strictEqual(response.statusCode, 201);
   assert.strictEqual(response.headers['x-custom'], 'yes');
+});
+
+test('a bare reply() is an empty 200, as in nock', async () => {
+  nock('http://mock.test').get('/a').reply();
+
+  const response = await client.get('http://mock.test/a');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.body, '');
 });
 
 /**
@@ -631,6 +657,99 @@ test('matchHeader and reqheaders both constrain matching', async () => {
   const missed = await failure(client.get('http://mock.test/guarded2', {headers: {'x-key': 'wrong'}}));
 
   assertUnmatched(missed, 'a different query should not match');
+});
+
+/*
+ * `nock(host, options)` dropped its options, and three of them fail open when dropped: the
+ * interceptor matched a request nock would have refused, so a test asserting that a credential
+ * was sent passed without it. A table, one row per option, each with a request that must match
+ * and one that must not.
+ */
+test('scope options constrain every interceptor on the scope', async () => {
+  let enabled = false;
+  const rows: [string, Parameters<typeof nock>[1], Record<string, string>, Record<string, string>][] = [
+    ['reqheaders', {reqheaders: {'x-key': 'secret'}}, {'x-key': 'secret'}, {'x-key': 'wrong'}],
+    ['reqheaders, absent', {reqheaders: {'x-key': /./}}, {'x-key': 'anything'}, {}],
+    ['badheaders', {badheaders: ['x-forbidden']}, {}, {'x-forbidden': '1'}],
+    ['conditionally', {conditionally: () => enabled}, {}, {}],
+  ];
+
+  for (const [name, options, matching, missing] of rows) {
+    nock('http://mock.test', options).get('/scoped').reply(200, 'ok');
+
+    enabled = false;
+    const missed = await failure(client.get('http://mock.test/scoped', {headers: missing}));
+
+    assertUnmatched(missed, `${name}: should not match`);
+
+    enabled = true;
+    const matched = await client.get('http://mock.test/scoped', {headers: matching});
+
+    assert.strictEqual(matched.body, 'ok', `${name}: should match`);
+    nock.cleanAll();
+  }
+
+  // An interceptor's own reqheaders still apply on top of the scope's.
+  nock('http://mock.test', {reqheaders: {'x-a': '1'}})
+    .get('/both', undefined, {reqheaders: {'x-b': '2'}})
+    .reply(200, 'ok');
+
+  assertUnmatched(await failure(client.get('http://mock.test/both', {headers: {'x-a': '1'}})), 'both required');
+  assert.strictEqual((await client.get('http://mock.test/both', {headers: {'x-a': '1', 'x-b': '2'}})).body, 'ok');
+});
+
+/*
+ * A header requirement compares the way nock compares: an array header as node joins it, a number
+ * as its text, and a `host` requirement skipped when the request set no `host` of its own.
+ */
+test('a header requirement compares an array, a number and host as nock does', async () => {
+  nock('http://mock.test', {reqheaders: {'x-list': 'a, b', 'x-zero': 0 as never, host: 'mock.test'}})
+    .get('/folded')
+    .reply(200, 'ok');
+
+  const response = await client.get('http://mock.test/folded', {headers: {'x-list': ['a', 'b'], 'x-zero': '0'}});
+
+  assert.strictEqual(response.body, 'ok');
+});
+
+// Accepted and not applied: both fail closed, so a suite written with them still runs.
+test('allowUnmocked and filteringScope are accepted', async () => {
+  nock('http://mock.test', {allowUnmocked: true, filteringScope: () => true})
+    .get('/lenient')
+    .reply(200, 'ok');
+
+  assert.strictEqual((await client.get('http://mock.test/lenient')).body, 'ok');
+});
+
+/*
+ * nock parses a form body before comparing an object matcher with it; only JSON was parsed here,
+ * so every such interceptor missed. Values compare as strings, since that is all a form carries.
+ */
+test('an object body matcher matches an urlencoded form body', async () => {
+  const scope = nock('http://mock.test')
+    .post('/login', {user: 'a', remember: true, tags: ['x', 'y'], code: /^\d+$/})
+    .reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/login', {
+    form: {tags: ['x', 'y'], code: '42', remember: 'true', user: 'a'},
+  });
+
+  assert.strictEqual(response.body, 'matched');
+  assert.strictEqual(scope.isDone(), true);
+
+  nock('http://mock.test').post('/login', {user: 'a'}).reply(200, 'matched');
+
+  assertUnmatched(
+    await failure(client.post('http://mock.test/login', {form: {user: 'a', extra: '1'}})),
+    'a field besides the ones named',
+  );
+});
+
+test('a boolean or number reply body is sent as its text, as nock sends it', async () => {
+  nock('http://mock.test').get('/false').reply(200, false).get('/zero').reply(200, 0);
+
+  assert.strictEqual((await client.get('http://mock.test/false')).body, 'false');
+  assert.strictEqual((await client.get('http://mock.test/zero')).body, '0');
 });
 
 test('body matcher constrains matching', async () => {

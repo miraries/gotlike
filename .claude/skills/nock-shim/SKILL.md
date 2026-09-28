@@ -109,6 +109,34 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   time matches and then stays pending forever. That is why nock's urlencoded case - parse a form body when the
   content-type says so - is not reproduced: the headers never reach the matcher, and stashing the content-type
   around `mockDispatch` (tried) only covers the first call. Pinned as a divergence in `nock-parity.spec.ts`.
+- **`nock(host, options)` applies its options to every interceptor on the scope.** The second argument used to
+  be dropped, and three of nock's scope options fail *open* when dropped - the interceptor matched what nock
+  would refuse. `scopeHeaders` turns them into header matchers undici already knows how to apply:
+  `reqheaders` as they are (an interceptor's own win), `badheaders` as a function that requires the value
+  `undefined` (undici hands a function matcher the absent header as `undefined`), and `conditionally` as a
+  function on a header name no request carries. `allowUnmocked` and `filteringScope` are accepted and not
+  applied - both fail *closed* that way (a miss is refused, not passed through; a scope matches only its own
+  host). Throwing on them was tried and broke suites that only ever made matching requests.
+- **Header matchers compare as nock's do** (`headerMatchers`, every one wrapped in a function before undici sees
+  it). undici runs `re.test(value)` whether or not the header was sent and `/./.test(undefined)` is `true`, so
+  `.matchHeader('x-key', /./)` matched a request with no `x-key` at all; a string or RegExp now only matches a
+  header that is there. An array header is joined as node joins it (`a, b`), a number compared as its text,
+  and a `host` requirement skipped when the request set no `host` (undici derives it rather than carrying
+  one). The last three surfaced the moment scope-level `reqheaders` stopped being dropped.
+- **An object body matcher also matches an urlencoded form body.** nock parses a form before comparing, so
+  `.post('/login', {user: 'a'})` matches `form: {user: 'a'}`; here only JSON was parsed and every such
+  interceptor missed. When the body is not JSON, `formBody` parses it as a form (repeated keys as arrays) and the
+  matcher's scalar leaves are compared as strings, which is all a form carries. It decides by the body alone,
+  not the content-type as nock does, because a body matcher never sees headers and must answer the same on both
+  of undici's calls (see the function-matcher bullet below). Nested `qs` keys (`a[b]=1`) are not expanded.
+- **A boolean or number reply body is sent as its text** (`replyData`). undici sends a falsy one as an empty
+  body, so `reply(200, false)` answered `''` where nock answers `false`.
+- **A miss is reported in nock's words** (`asNockError`, applied by `NockErrorHandler` around every dispatch).
+  undici's `MockNotMatchedError` (`UND_MOCK_ERR_MOCK_NOT_MATCHED`) becomes nock's `Nock: No match for request {...}`
+  with `ERR_NOCK_NO_MATCH` on a mocked origin, and `NetConnectNotAllowedError` / `ENETUNREACH` / `Nock: Disallowed
+  net connect for "host:port/path"` on an unmocked one net connect refuses - the spellings suites written against
+  nock assert on. undici's error stays on `cause`. It has to be the handler, not a `try` around `dispatch()`:
+  undici's dispatcher catches the mock pool's throw and delivers it to the handler.
 - **An object reply body is labelled `application/json`** (`replyOptions`). nock sets that header; undici's
   MockAgent serialises the body but sets no content-type at all, so anything under test that branches on the
   response's content-type behaved differently against the mock than against the real server — which is the one

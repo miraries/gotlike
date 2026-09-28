@@ -1,0 +1,15 @@
+{
+  "name": "gotlike-conformance",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Runs got's and nock's own test suites against gotlike and its nock shim",
+  "license": "MIT",
+  "author": "Ivan Kotlaja",
+  "type": "module",
+  "scripts": {
+    "got": "npm --prefix .. run build && node run.ts got",
+    "nock": "npm --prefix .. run build && node run.ts nock",
+    "all": "npm --prefix .. run build && node run.ts got && node run.ts nock",
+    "update": "npm --prefix .. run build && node run.ts got --update && node run.ts nock --update"
+  }
+}
