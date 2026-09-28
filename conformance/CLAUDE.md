@@ -72,6 +72,18 @@ marked handled (got throws a bad call synchronously where gotlike rejects, and a
 awaits the rejection), and a stream error nobody listens for ends the stand-in quietly instead of crashing the
 file. `with-server.ts` gets the same `next()` guard, as a string patch that fails loudly if it stops applying.
 
+## Test servers
+
+got's http, https and raw test servers take their port from `got/free-port.ts` (copied into `test/helpers` and
+wired in by string patches) instead of `listen(0)`. On macOS another process may hold `127.0.0.1:P` or `[::1]:P`
+beside a test server's wildcard `[::]:P`, and wins for loopback traffic: with a `kubectl port-forward` on the
+same port, every request to the test server - `localhost` included - reached the forwarded service instead. That
+was two failures seen about once in three full runs (a `hooks.ts` retry answered 200 by the wrong server, a
+`post.ts` `other side closed`), each passing in isolation. The helper picks a port free on both loopback addresses.
+Linux refuses that overlap, so CI was never exposed; the patch makes local runs trustworthy. **If a test fails in a
+full run and passes alone, suspect the environment before gotlike** - `lsof -iTCP -sTCP:LISTEN -P -n` shows what
+else is listening on loopback.
+
 ## The nock runner
 
 `index.js` of the nock clone becomes `require('gotlike/nock').nock`, `got_client.js` becomes gotlike's default

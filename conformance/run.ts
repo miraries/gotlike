@@ -213,6 +213,32 @@ const gotSuite: Suite = {
       }
     }
 
+    // got's test servers take a port free on both loopback addresses rather than `listen(0)`'s,
+    // which another process on macOS can shadow - see got/free-port.ts.
+    const helpers = join(clone, 'test', 'helpers');
+    const importFreePort = "import {freeLoopbackPort} from './free-port.js';\n";
+
+    writeFileSync(join(helpers, 'free-port.ts'), readFileSync(join(here, 'got', 'free-port.ts')));
+    replaceIn(
+      join(helpers, 'create-http-test-server.ts'),
+      "\tserver.set('etag', false);\n",
+      "\tserver.set('etag', false);\n\tconst port = await freeLoopbackPort();\n",
+    );
+    replaceIn(join(helpers, 'create-http-test-server.ts'), 'server.http.listen(0, ', 'server.http.listen(port, ');
+    replaceIn(join(helpers, 'create-http-test-server.ts'), /^/, importFreePort);
+    replaceIn(
+      join(helpers, 'create-https-test-server.ts'),
+      'await pify(server.https.listen.bind(server.https))();',
+      'await pify(server.https.listen.bind(server.https))(await freeLoopbackPort());',
+    );
+    replaceIn(join(helpers, 'create-https-test-server.ts'), /^/, importFreePort);
+    replaceIn(
+      join(helpers, 'server-tools.ts'),
+      '\tawait listen();',
+      '\tawait (listen as unknown as (port: number) => Promise<void>)(await freeLoopbackPort());',
+    );
+    replaceIn(join(helpers, 'server-tools.ts'), /^/, importFreePort);
+
     // got's handler `next()` returns its event-emitting promise; gotlike's is a plain one, and
     // this helper wraps every test in a handler that subscribes to it.
     replaceIn(
