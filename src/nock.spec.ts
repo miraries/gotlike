@@ -107,12 +107,47 @@ test('a bare reply() is an empty 200, as in nock', async () => {
   assert.strictEqual(response.body, '');
 });
 
+for (const [name, options] of [
+  ['the global dispatcher', {}],
+  ['its own agent', {connections: 4}],
+] as const) {
+  test(`a dnsCache client on ${name} reaches its mocks, with no lookup`, async () => {
+    let lookups = 0;
+    const cached = client.extend({
+      ...options,
+      dnsCache: {
+        lookup(_origin, _options, callback) {
+          lookups++;
+          callback(null, [{address: '192.0.2.1', family: 4, ttl: 1000}]);
+        },
+      },
+    });
+
+    nock('http://mock.test').get('/dns').reply(200, 'ok');
+
+    const response = await cached.get('http://mock.test/dns');
+
+    assert.strictEqual(response.body, 'ok');
+    assert.strictEqual(lookups, 0);
+  });
+}
+
 test("nock.Scope, nock.Interceptor and nock.Options name the shim's types, as in nock", () => {
   const options: nock.Options = {allowUnmocked: true, badheaders: ['x-a']};
   const scope: nock.Scope = nock('http://types.test', options);
   const interceptor: nock.Interceptor = scope.get('/');
+  const bodyMatcher: nock.RequestBodyMatcher = {a: 1};
+  const headerMatcher: nock.RequestHeaderMatcher = /x/;
+  const body: nock.Body = {a: 1};
+  const replyBody: nock.ReplyBody = {a: 1};
+  const headerValue: nock.ReplyHeaderValue = ['a', 'b'];
+  const replyHeaders: nock.ReplyHeaders = {'x-a': headerValue};
+  const status: nock.StatusCode = 200;
+  const reply: nock.ReplyFnResult = [status, replyBody, replyHeaders];
 
   assert.strictEqual(typeof interceptor.reply, 'function');
+  assert.deepStrictEqual([bodyMatcher, body, reply[0]], [{a: 1}, {a: 1}, 200]);
+  assert.ok(headerMatcher instanceof RegExp);
 });
 
 /**

@@ -1818,6 +1818,8 @@ const nockExport = nock as NockApi;
 type ScopeInstance = Scope;
 type InterceptorInstance = Interceptor;
 type ScopeWideOptions = ScopeOptions;
+type ReplyBodyType = ReplyBody;
+type ReplyHeadersType = ReplyHeaders;
 
 // `nock.Scope` and friends as types, which is how nock's own typings spell them. Types only,
 // so it merges with the const above and erases.
@@ -1826,6 +1828,16 @@ declare namespace nockExport {
   export type Interceptor = InterceptorInstance;
   // oxlint-disable-next-line no-shadow
   export type Options = ScopeWideOptions;
+  export type RequestBodyMatcher = BodyMatcher;
+  export type RequestHeaderMatcher = HeaderMatcher;
+  export type Body = string | Record<string, any>;
+  // oxlint-disable-next-line no-shadow
+  export type ReplyBody = ReplyBodyType;
+  export type ReplyHeaderValue = string | string[];
+  // oxlint-disable-next-line no-shadow
+  export type ReplyHeaders = ReplyHeadersType;
+  export type StatusCode = number;
+  export type ReplyFnResult = ReplyFunctionResult;
 }
 
 export default nockExport;

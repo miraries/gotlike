@@ -49,6 +49,9 @@ The shim is a translation layer over `MockAgent`, and the translations that are 
   spread `pendingInterceptors()` copies it with. `optionally()` is a second symbol, which `pendingDispatches`
   leaves out. Both are read from each pool's own list rather than `pendingInterceptors()`, which repeats a regex
   origin's dispatches once per concrete origin undici derived from it.
+- **`dnsCache` is left out of a client's chain while the shim is the global dispatcher** (`routeOwnAgent in global`,
+  in `Gotlike#agent`). The dns interceptor composes ahead of the mock and rewrites the origin to an address, so a mocked
+  host was looked up for real and missed its interceptor. A request net connect lets through just goes uncached.
 - **`enableNetConnect()`/`disableNetConnect()` only govern *unmocked* hosts.** An origin with a scope fails closed
   on a miss whatever they say, as in nock. Both used to switch the per-origin check off for the rest of the
   process, so after the ordinary teardown `nock.enableNetConnect()` a typo'd path on a mocked host became a live

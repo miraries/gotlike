@@ -3735,10 +3735,17 @@ test('dnsCache resolves through a cached lookup', async () => {
     },
   });
 
-  for (let i = 0; i < 3; i++) {
-    const response = await extClient.get<{test: string}>('http://localhost:3000/json');
+  // Out from under the shim imported above, which is the one place the cache is left out.
+  nock.restore();
 
-    assert.strictEqual(response.body.test, 'value');
+  try {
+    for (let i = 0; i < 3; i++) {
+      const response = await extClient.get<{test: string}>('http://localhost:3000/json');
+
+      assert.strictEqual(response.body.test, 'value');
+    }
+  } finally {
+    nock.activate();
   }
 
   assert.strictEqual(lookups, 1, `expected one lookup for three requests, saw ${lookups}`);

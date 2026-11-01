@@ -83,7 +83,8 @@ wired in by string patches) instead of `listen(0)`. On macOS another process may
 beside a test server's wildcard `[::]:P`, and wins for loopback traffic: with a `kubectl port-forward` on the
 same port, every request to the test server - `localhost` included - reached the forwarded service instead. That
 was two failures seen about once in three full runs (a `hooks.ts` retry answered 200 by the wrong server, a
-`post.ts` `other side closed`), each passing in isolation. The helper picks a port free on both loopback addresses.
+`post.ts` `other side closed`), each passing in isolation. The helper picks a port free on both loopback addresses and the wildcard, since the
+overlap also hides another worker's `[::]:P` from a loopback probe.
 Linux refuses that overlap, so there the helper returns 0 and the servers `listen(0)` as upstream wrote them: picking a
 port on CI failed a random test or so per run with `EADDRINUSE`, when an outgoing connection took it between the probe
 and the `listen`. **If a test fails in a
@@ -97,6 +98,11 @@ client (theirs is `got.extend({retry: 0})`, which gotlike's default already is),
 by `nock/setup.js`, which resets through whichever of nock's teardown calls the shim has. It also wraps
 `http.request`/`get` so a test that drives node's http client directly is reported as `node-http` rather than
 as a finding: the shim replaces undici's global dispatcher and never sees those requests.
+
+## The numbers in the README
+
+The README's Conformance section quotes the summary line each CI run prints (a few got tests only run on Linux, so a
+local run differs slightly), plus the failures by category. They are written by hand, so update them whenever a run changes them: after a fix that clears entries, and after a bump.
 
 ## Bumping upstream
 

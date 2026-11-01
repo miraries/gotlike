@@ -6,6 +6,22 @@ intercept undici.
 
 ESM, node >= 22.19. CommonJS projects can still `require('gotlike')`.
 
+## Conformance
+
+gotlike runs [got](https://github.com/sindresorhus/got)'s and [nock](https://github.com/nock/nock)'s own test suites
+against itself, and CI fails on any result that isn't already listed with a reason (see `conformance/`).
+
+| suite | passing | deliberately not supported | deliberate difference | not about the client | harness |
+| --- | --- | --- | --- | --- | --- |
+| got 16.2.0, against gotlike | **50.6%** (1047 of 2071) | 540 | 420 | 33 | 31 |
+| nock 15.0.5, against `gotlike/nock` | **60.5%** (213 of 352) | 67 | 39 | 32 | 1 |
+
+gotlike covers the common cases rather than all of got, so these numbers are not a target of 100%. Every failure is
+labelled, and none is currently labelled as a bug or an undocumented gap. "Not about the client" is a test of got's own
+internals, or a nock test driving node's `http` module, which the shim never intercepts. "Harness" means the test
+adapter may be the cause rather than gotlike. A further 16 got files and 9 nock files don't run at all, for the same
+kinds of reason, and aren't counted above; nor are 6 got tests and 1 nock test skipped because they crash the runner.
+
 ## Usage
 
 ```ts
@@ -266,7 +282,7 @@ always on because undici does it by default; got's `agent`/`agentkeepalive` setu
 ```ts
 const client = gotlike.extend({
   dnsCache: true,           // caches lookups per origin; or pass { maxTTL, maxItems, ... }
-  connections: 128,         // max sockets per origin (undici's default is 6)
+  connections: 128,         // max sockets per origin (undici's default is unlimited)
   keepAliveTimeout: 10_000, // how long idle sockets stick around
   keepAliveMaxTimeout: 60_000,
   connectTimeout: 5_000,

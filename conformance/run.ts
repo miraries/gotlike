@@ -447,7 +447,8 @@ async function main() {
   }
 
   console.log(
-    `\n${suite.name}@${suite.ref}: ${passed} pass, ${results.size - passed} fail, ` +
+    `\n${suite.name}@${suite.ref}: ${passed} pass, ${results.size - passed} fail ` +
+      `(${((100 * passed) / results.size).toFixed(1)}% passing), ` +
       `${Object.keys(expectations.files).length} files not run`,
   );
   console.log(`expected failures by category: ${[...counts].map(([k, v]) => `${k} ${v}`).join(', ')}`);

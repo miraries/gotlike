@@ -41,18 +41,17 @@ export async function freeLoopbackPort(): Promise<number> {
     // closing and the server listening, and fail with `EADDRINUSE`.
     const port = 20_000 + Math.floor(Math.random() * 20_000);
     const v4 = await bind(port, '127.0.0.1');
-
-    if (v4.server === undefined) {
-      continue;
-    }
-
     const v6 = await bind(port, '::1');
+    // The overlap runs both ways: both probes above bind beside another test server's `[::]:P`,
+    // whose port the server would then fail to listen on.
+    const wildcard = await bind(port, '::');
 
     await close(v4);
     await close(v6);
+    await close(wildcard);
 
     // No IPv6 loopback at all is fine: nothing can hold it either.
-    if (v6.code !== 'EADDRINUSE') {
+    if (v4.server !== undefined && v6.code !== 'EADDRINUSE' && wildcard.code !== 'EADDRINUSE') {
       return port;
     }
   }

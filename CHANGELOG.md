@@ -6,12 +6,20 @@ minor bump is where breaking changes land.
 
 ## Unreleased
 
+### Fixed
+
+- **`dnsCache` under `gotlike/nock`.** The DNS interceptor ran ahead of the mock, so a mocked host was looked up
+  for real and failed with `ENOTFOUND`, or missed its interceptor. It is left out while the shim is installed.
+- **The README and types said undici's default is 6 connections per origin.** It is unlimited.
+
 ### Added
 
 - **An `Options` type**, naming what a handler or `beforeRequest` hook is handed, for code annotated
   with got's.
   It is a type only; got's `Options` class still does not exist.
-- **`nock.Scope`, `nock.Interceptor` and `nock.Options` types** on the shim's default export, as in nock.
+- **nock's type names on the shim's default export**, as in nock: `nock.Scope`, `Interceptor`, `Options`,
+  `RequestBodyMatcher`, `RequestHeaderMatcher`, `Body`, `ReplyBody`, `ReplyHeaderValue`, `ReplyHeaders`,
+  `StatusCode` and `ReplyFnResult`.
 
 ## 0.11.0 - 2026-11-01
 

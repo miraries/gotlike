@@ -3611,7 +3611,7 @@ export type RequestOptions<T = unknown> = {
    */
   dnsCache?: boolean | DnsCacheOptions;
 
-  /** Max connections per origin. undici's default is 6 (`null` for unlimited). */
+  /** Max connections per origin. undici's default is unlimited. */
   connections?: number;
 
   /** How long an idle socket is kept around, in ms. undici's default is 4s. */
@@ -5553,8 +5553,10 @@ export class Gotlike<O extends ClientOptions = ClientOptions> {
       const options = this.baseOptions;
       const chain: Dispatcher.DispatcherComposeInterceptor[] = [];
 
-      // Resolve first, so everything downstream talks to a cached address.
-      if (options.dnsCache) {
+      // Resolve first, so everything downstream talks to a cached address. Not under `./nock`:
+      // this runs ahead of the mock, so a mocked host was looked up for real, failed as
+      // `ENOTFOUND` or had its name replaced by an address no interceptor is registered for.
+      if (options.dnsCache && !(routeOwnAgent in global)) {
         chain.push(interceptors.dns(options.dnsCache === true ? undefined : options.dnsCache));
       }
 
