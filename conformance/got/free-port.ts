@@ -26,9 +26,15 @@ function close(bound: Bound): Promise<void> {
  * `kubectl port-forward` instead, and fail as a test nobody could reproduce (measured: a test
  * server bound `[::]:P` beside a port-forward on `[::1]:P` never saw a request - every one, to
  * `localhost` too, got the forwarded service's 200). Linux refuses that overlap, so there
- * `listen(0)` was already safe, and this costs two probe binds per server.
+ * `listen(0)` is safe and is what this returns. Picking a port there would only add a race: an
+ * outgoing connection can take it between the probe closing and the server listening, which
+ * failed a random test or so per CI run with `EADDRINUSE`.
  */
 export async function freeLoopbackPort(): Promise<number> {
+  if (process.platform !== 'darwin') {
+    return 0;
+  }
+
   for (let attempt = 0; attempt < 20; attempt++) {
     // Below the ephemeral range and picked at random, not `bind(0)`: macOS hands those out in
     // sequence, so a file running beside this one could be given the port between this probe

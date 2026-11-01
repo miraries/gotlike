@@ -84,7 +84,9 @@ beside a test server's wildcard `[::]:P`, and wins for loopback traffic: with a 
 same port, every request to the test server - `localhost` included - reached the forwarded service instead. That
 was two failures seen about once in three full runs (a `hooks.ts` retry answered 200 by the wrong server, a
 `post.ts` `other side closed`), each passing in isolation. The helper picks a port free on both loopback addresses.
-Linux refuses that overlap, so CI was never exposed; the patch makes local runs trustworthy. **If a test fails in a
+Linux refuses that overlap, so there the helper returns 0 and the servers `listen(0)` as upstream wrote them: picking a
+port on CI failed a random test or so per run with `EADDRINUSE`, when an outgoing connection took it between the probe
+and the `listen`. **If a test fails in a
 full run and passes alone, suspect the environment before gotlike** - `lsof -iTCP -sTCP:LISTEN -P -n` shows what
 else is listening on loopback.
 
