@@ -1,17 +1,16 @@
 {
   "name": "gotlike",
-  "version": "0.2.0",
-  "description": "Barebones got-like undici-based commonjs-compatible http client for node.js",
+  "version": "0.10.0",
+  "description": "Barebones got-like undici-based http client for node.js",
   "keywords": [
     "undici",
     "got",
     "fetch",
     "http",
     "https",
-    "axios",
-    "request",
-    "commonjs",
-    "function"
+    "client",
+    "esm",
+    "performance"
   ],
   "author": "Ivan Kotlaja",
   "license": "MIT",
@@ -24,26 +23,51 @@
     "url": "git+https://github.com/miraries/gotlike.git"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19"
   },
   "files": [
-    "dist"
+    "dist",
+    "src/index.ts",
+    "src/nock.ts"
   ],
-  "type": "commonjs",
+  "type": "module",
   "main": "dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "test": "node --test -r ts-node/register ./**/*.spec.ts",
-    "test:watch": "node --test --watch -r ts-node/register ./**/*.spec.ts",
-    "build": "tsc"
+    "test": "node --test \"src/**/*.spec.ts\"",
+    "test:watch": "node --test --watch \"src/**/*.spec.ts\"",
+    "parity": "node --test \"src/parity/**/*.spec.ts\"",
+    "coverage": "node --test --experimental-test-coverage --test-coverage-exclude='src/**/*.spec.ts' --test-coverage-exclude='src/parity/**' --test-coverage-lines=99.8 --test-coverage-branches=96 --test-coverage-functions=98 \"src/**/*.spec.ts\"",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "oxlint --type-aware src && oxlint benchmark conformance",
+    "lint:fix": "oxlint --type-aware --fix src && oxlint --fix benchmark conformance",
+    "fmt": "oxfmt src benchmark conformance",
+    "fmt:check": "oxfmt --check src benchmark conformance",
+    "check": "npm run typecheck && npm run lint && npm run fmt:check && npm run coverage",
+    "prepublishOnly": "npm run check && npm run build"
   },
   "devDependencies": {
-    "@swc/core": "^1.3.96",
-    "@types/node": "^20.8.10",
-    "ts-node": "^10.9.1",
-    "typescript": "^5.2.2"
+    "@types/node": "^26.6.6",
+    "got": "16.2.0",
+    "nock": "15.0.5",
+    "oxfmt": "^0.75.0",
+    "oxlint": "^1.82.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "typescript": "^7.0.2"
   },
   "dependencies": {
-    "undici": "^6"
+    "undici": "8.12.3"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./nock": {
+      "types": "./dist/nock.d.ts",
+      "default": "./dist/nock.js"
+    },
+    "./package.json": "./package.json"
   }
 }

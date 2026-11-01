@@ -1,0 +1,1726 @@
+import test from 'node:test';
+import assert from 'node:assert';
+import {once} from 'node:events';
+import {Readable} from 'node:stream';
+import {text} from 'node:stream/consumers';
+import {getGlobalDispatcher} from 'undici';
+import {parse as parseUrl} from 'node:url';
+import nock, {type ReplyFunctionResult} from './nock.ts';
+import client, {createClient, type RequestError} from './index.ts';
+
+/**
+ * Await something expected to fail and hand back the error.
+ *
+ * `promise.catch(e => e as RequestError)` types as `Response | RequestError`, and quietly
+ * yields a `Response` when the request doesn't fail at all - so a test that stops failing
+ * fails confusingly instead of clearly.
+ */
+async function failure<E extends Error = RequestError>(promise: Promise<unknown>): Promise<E> {
+  try {
+    await promise;
+  } catch (error) {
+    return error as E;
+  }
+
+  throw new assert.AssertionError({message: 'expected the request to fail, but it resolved'});
+}
+
+// Without this an unmatched interceptor falls through to a real DNS lookup, which is both
+// slow and a different failure than "no mock matched".
+nock.disableNetConnect();
+
+const json = client.extend({responseType: 'json', throwHttpErrors: false});
+
+/**
+ * An unmatched interceptor never reaches the network: a miss on a mocked origin is nock 15's 501
+ * carrying its report, which a client that throws on a status reports as an `HTTPError`, and an
+ * unmocked host net connect refuses is `ENETUNREACH`, with undici's error kept one level down.
+ */
+function assertUnmatched(error: RequestError, why: string) {
+  if (error.response) {
+    assert.strictEqual(error.response.statusCode, 501, why);
+    assert.match(String(error.response.body), /"code":"ERR_NOCK_NO_MATCH"/, why);
+
+    return;
+  }
+
+  assert.strictEqual(error.code, 'ENETUNREACH', why);
+  assert.match(error.message, /^Nock: Disallowed net connect/, why);
+  assert.strictEqual(((error.cause as Error).cause as {code?: string}).code, 'UND_MOCK_ERR_MOCK_NOT_MATCHED', why);
+}
+
+test.afterEach(() => {
+  nock.cleanAll();
+});
+
+// nock's own spelling, which suites written against nock assert on.
+test('a miss is reported as nock reports it', async () => {
+  nock('http://mock.test').get('/a').reply(200);
+
+  const miss = await failure(client.get('http://mock.test/b'));
+  const refused = await failure(client.get('http://unmocked.test/x'));
+
+  assert.strictEqual(miss.response?.statusCode, 501);
+  const report = JSON.parse(miss.response.body as string) as {code: string; message: string};
+
+  assert.strictEqual(report.code, 'ERR_NOCK_NO_MATCH');
+  assert.match(
+    report.message,
+    /^Nock: No match for request \{\n {2}"method": "GET",\n {2}"url": "http:\/\/mock\.test\/b"/,
+  );
+  assert.strictEqual(refused.code, 'ENETUNREACH');
+  assert.strictEqual(refused.message, 'Nock: Disallowed net connect for "unmocked.test:80/x"');
+  assert.strictEqual((refused.cause as Error).name, 'NetConnectNotAllowedError');
+});
+
+test('matches a plain path', async () => {
+  nock('http://mock.test').get('/a').reply(200, 'body');
+
+  const response = await client.get('http://mock.test/a');
+
+  assert.strictEqual(response.body, 'body');
+});
+
+test('replies with a json object', async () => {
+  nock('http://mock.test').get('/a').reply(200, {ok: true});
+
+  const response = await json.get<{ok: boolean}>('http://mock.test/a');
+
+  assert.deepStrictEqual(response.body, {ok: true});
+});
+
+test('replies with headers and a status code', async () => {
+  nock('http://mock.test').get('/a').reply(201, 'created', {'x-custom': 'yes'});
+
+  const response = await client.get('http://mock.test/a');
+
+  assert.strictEqual(response.statusCode, 201);
+  assert.strictEqual(response.headers['x-custom'], 'yes');
+});
+
+test('a bare reply() is an empty 200, as in nock', async () => {
+  nock('http://mock.test').get('/a').reply();
+
+  const response = await client.get('http://mock.test/a');
+
+  assert.strictEqual(response.statusCode, 200);
+  assert.strictEqual(response.body, '');
+});
+
+/**
+ * `nock('https://host/base/path')` - the main consumer's mocks do this, and undici's
+ * MockAgent only accepts an origin, so the path has to be folded into every interceptor.
+ */
+test('honours a base path on the scope', async () => {
+  nock('http://mock.test/api/v3').post('/items/latest').reply(200, {itemURL: 'https://example.test/item/1'});
+
+  const response = await json.post<{itemURL: string}>('http://mock.test/api/v3/items/latest');
+
+  assert.strictEqual(response.body.itemURL, 'https://example.test/item/1');
+});
+
+test('a base path does not match a different prefix', async () => {
+  nock('http://mock.test/base').get('/thing').reply(200, 'matched');
+
+  const response = await failure(client.get('http://mock.test/other/thing'));
+
+  assertUnmatched(response, 'a different base path should not match');
+});
+
+test('trailing slashes on the base path are ignored', async () => {
+  nock('http://mock.test/base/').get('/thing').reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/base/thing');
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('matches a regex path, including under a base path', async () => {
+  nock('http://mock.test/api/v3')
+    .post(/\/items\/latest.*/)
+    .reply(200, {error: '0'});
+
+  const response = await json.post<{error: string}>('http://mock.test/api/v3/items/latest?extra=1');
+
+  assert.strictEqual(response.body.error, '0');
+});
+
+/*
+ * A `persist()`ed interceptor reuses the same RegExp for every request it answers. `test()` on
+ * a `/g`/`y` pattern advances `lastIndex` past a match, so a request that matched left the
+ * pattern primed to resume searching from there rather than the start - the next, identical
+ * request missed, and the one after that matched again. Reset before every test, the way the
+ * origin matcher already did.
+ */
+test('a persisted global-flag regex path matches every request, not every other one', async () => {
+  nock('http://mock.test').persist().get(/^\/x/g).reply(200, 'matched');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual((await client.get(`http://mock.test/x${i}`)).body, 'matched', `request ${i}`);
+  }
+});
+
+test('matches a function path', async () => {
+  nock('http://mock.test')
+    .get((path) => path.startsWith('/dynamic'))
+    .reply(200, 'fn');
+
+  const response = await client.get('http://mock.test/dynamic/thing');
+
+  assert.strictEqual(response.body, 'fn');
+});
+
+test('query(true) matches any query string', async () => {
+  nock('http://mock.test').post('/create').query(true).reply(200, {error: 0});
+
+  const response = await json.post<{error: number}>('http://mock.test/create', {
+    searchParams: {anything: 'goes', more: '1'},
+  });
+
+  assert.strictEqual(response.body.error, 0);
+});
+
+test('query(true) also matches a request with no query at all', async () => {
+  nock('http://mock.test').get('/maybe').query(true).reply(200, 'ok');
+
+  const response = await client.get('http://mock.test/maybe');
+
+  assert.strictEqual(response.body, 'ok');
+});
+
+test('query(object) matches only those params', async () => {
+  nock('http://mock.test').get('/exact').query({a: '1'}).reply(200, 'matched');
+
+  const matched = await client.get('http://mock.test/exact', {searchParams: {a: '1'}});
+
+  assert.strictEqual(matched.body, 'matched');
+
+  nock('http://mock.test').get('/exact').query({a: '1'}).reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/exact', {searchParams: {a: '2'}}));
+
+  assertUnmatched(missed, 'a different query should not match');
+});
+
+/**
+ * A non-string path has to be matched by a function, and undici only folds `query` into the
+ * stored path when that path is a string - so the constraint was dropped and the interceptor
+ * matched every query. Same class of bug as the string-path case above.
+ */
+test('query(object) constrains a regex path too', async () => {
+  nock('http://mock.test')
+    .get(/^\/items/)
+    .query({page: '1'})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/items', {searchParams: {page: '99'}}));
+
+  assertUnmatched(missed, 'a different query should not match');
+
+  const matched = await client.get('http://mock.test/items', {searchParams: {page: '1'}});
+
+  assert.strictEqual(matched.body, 'matched');
+});
+
+test('query(object) on a regex path requires every param to line up', async () => {
+  nock('http://mock.test')
+    .get(/^\/items/)
+    .query({page: '1'})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/items', {searchParams: {page: '1', extra: 'x'}}));
+
+  assertUnmatched(missed, 'an extra param should not match');
+});
+
+/*
+ * nock allows a RegExp or a predicate as a query *value*, and an array for a repeated key.
+ * Those were run through `String(value)`, which turned a RegExp into the literal `"/bar/"`
+ * and an array into `"1,2"` - neither of which any real query string can equal, so such an
+ * interceptor silently never matched. A RegExp or predicate value also can't be handed to
+ * undici, which serialises the query into its stored path.
+ */
+test('query accepts a regex value', async () => {
+  nock('http://mock.test').get('/re').query({token: /^abc/}).reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/re', {searchParams: {token: 'abcdef'}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a regex query value still has to match', async () => {
+  nock('http://mock.test').get('/re').query({token: /^abc/}).reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/re', {searchParams: {token: 'zzz'}}));
+
+  assertUnmatched(missed, 'a value the regex rejects should not match');
+});
+
+/*
+ * Same statefulness bug as the path matcher, on the leaf a query *value* is tested with: a
+ * `/g` pattern's `lastIndex` survived from one request to the next on a persisted interceptor.
+ */
+test('a persisted global-flag regex query value matches every request, not every other one', async () => {
+  nock('http://mock.test').persist().get('/re').query({token: /^abc/g}).reply(200, 'matched');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual(
+      (await client.get('http://mock.test/re', {searchParams: {token: 'abcdef'}})).body,
+      'matched',
+      `request ${i}`,
+    );
+  }
+});
+
+test('query accepts a predicate value', async () => {
+  nock('http://mock.test')
+    .get('/fn')
+    .query({page: (value: string) => Number(value) > 10})
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/fn', {searchParams: {page: '42'}});
+
+  assert.strictEqual(response.body, 'matched');
+
+  nock('http://mock.test')
+    .get('/fn')
+    .query({page: (value: string) => Number(value) > 10})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/fn', {searchParams: {page: '2'}}));
+
+  assertUnmatched(missed, 'a value the predicate rejects should not match');
+});
+
+test('query accepts an array value for a repeated key', async () => {
+  nock('http://mock.test')
+    .get('/arr')
+    .query({id: ['1', '2']})
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/arr', {searchParams: {id: ['1', '2']}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('an array query value is not satisfied by a single occurrence', async () => {
+  nock('http://mock.test')
+    .get(/^\/arr/)
+    .query({id: ['1', '2']})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/arr', {searchParams: {id: '1'}}));
+
+  assertUnmatched(missed, 'one value should not satisfy a two-element expectation');
+});
+
+/*
+ * A RegExp or a predicate is legal inside a repeated key too, not just as a bare value.
+ * `String(/news/)` is the literal `"/news/"`, which no query string can equal - and because
+ * only top-level values were checked for one, the expectation was also handed to undici to
+ * fold into its stored path, where it stringified the same way.
+ */
+test('an array query value accepts a regex and a predicate', async () => {
+  nock('http://mock.test')
+    .get('/arr-re')
+    .query({tags: [/^new/, (value: string) => value.endsWith('ates')]})
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/arr-re', {searchParams: {tags: ['news', 'updates']}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a regex inside an array query value still has to match', async () => {
+  nock('http://mock.test')
+    .get('/arr-re')
+    .query({tags: [/^new/, 'updates']})
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/arr-re', {searchParams: {tags: ['olds', 'updates']}}));
+
+  assertUnmatched(missed, 'a value the regex rejects should not match');
+});
+
+/*
+ * nock's `.query(fn)` form: one predicate over the whole parsed query rather than a value at
+ * a time, exactness included. It was accepted and then never consulted - the expectation went
+ * to undici, which serialised a function into its stored path, so nothing ever matched and the
+ * request fell through to the real network.
+ */
+test('query accepts a predicate over the whole query', async () => {
+  const seen: Array<Record<string, string | string[]>> = [];
+
+  nock('http://mock.test')
+    .get('/whole')
+    .query((query) => {
+      seen.push(query);
+
+      return query.page === '1';
+    })
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/whole', {searchParams: {page: '1', extra: 'ignored'}});
+
+  assert.strictEqual(response.body, 'matched');
+  // Handed the whole query, so it can be as strict or as loose as it likes - unlike the
+  // object form, an unnamed `extra` is the predicate's business rather than a mismatch.
+  // undici consults a path matcher more than once per dispatch, so only the first call is
+  // asserted; a nock predicate is expected to be a pure question either way.
+  assert.deepStrictEqual(seen[0], {page: '1', extra: 'ignored'});
+});
+
+test('a query predicate that says no does not match', async () => {
+  nock('http://mock.test')
+    .get('/whole')
+    .query((query) => query.page === '1')
+    .reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/whole', {searchParams: {page: '2'}}));
+
+  assertUnmatched(missed, 'a query the predicate rejects should not match');
+});
+
+test('a query predicate sees a repeated key as an array', async () => {
+  nock('http://mock.test')
+    .get('/whole-arr')
+    .query((query) => Array.isArray(query.id) && query.id.length === 2)
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/whole-arr', {searchParams: {id: ['1', '2']}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a plain path does not match a request carrying a query', async () => {
+  nock('http://mock.test').get('/strict').reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/strict', {searchParams: {a: '1'}}));
+
+  assertUnmatched(missed, 'a different query should not match');
+});
+
+/** The shape the main consumer's specs use to capture what was actually sent. */
+test('reply(function) receives the request as a fetch Request, as nock 15 does', async () => {
+  let captured: Request | undefined;
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/freebets/create')
+    .reply(async (request) => {
+      captured = request;
+      capturedBody = await request.json();
+
+      return [200, {code: 200, message: 'Success'}, {'x-from': 'callback'}];
+    });
+
+  const response = await json.post<{code: number}>('http://mock.test/freebets/create', {
+    json: {amount: 5},
+    headers: {'x-signature': 'abc'},
+  });
+
+  assert.ok(captured instanceof Request);
+  assert.strictEqual(captured.url, 'http://mock.test/freebets/create');
+  assert.strictEqual(captured.method, 'POST');
+  assert.strictEqual(captured.headers.get('x-signature'), 'abc');
+  assert.deepStrictEqual(capturedBody, {amount: 5});
+  assert.strictEqual(response.body.code, 200);
+  assert.strictEqual(response.headers['x-from'], 'callback');
+});
+
+test('reply(function) with a second parameter answers through an error-first callback', async () => {
+  nock('http://mock.test')
+    .get('/done')
+    .reply((_request, done) => {
+      done(null, [201, 'through the callback']);
+    });
+  nock('http://mock.test')
+    .get('/done-body')
+    .reply(202, (_request, done) => {
+      done(null, 'body through the callback');
+    });
+
+  const whole = await client.get('http://mock.test/done');
+  const body = await client.get('http://mock.test/done-body');
+
+  assert.deepStrictEqual([whole.statusCode, whole.body], [201, 'through the callback']);
+  assert.deepStrictEqual([body.statusCode, body.body], [202, 'body through the callback']);
+});
+
+test('reply(function) carries repeated headers, and no body on a GET', async () => {
+  let cookie: string | null | undefined;
+  let body: string | undefined;
+
+  nock('http://mock.test')
+    .get('/bodyless')
+    .reply(async (request) => {
+      cookie = request.headers.get('x-many');
+      body = await request.text();
+
+      return [200, 'ok'];
+    });
+
+  await client.get('http://mock.test/bodyless', {headers: {'x-many': ['a', 'b']}, body: 'ignored'});
+
+  assert.strictEqual(cookie, 'a, b');
+  assert.strictEqual(body, '');
+});
+
+// A `Buffer` body reaches the `Request` as its bytes, so `json()` reads it as it reads a string one.
+test('reply(function) reads a Buffer request body', async () => {
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/buffered')
+    .reply(async (request) => {
+      capturedBody = await request.json();
+
+      return [200, 'ok'];
+    });
+
+  await client.post('http://mock.test/buffered', {
+    body: Buffer.from(JSON.stringify({amount: 5})),
+    headers: {'content-type': 'application/json'},
+  });
+
+  assert.deepStrictEqual(capturedBody, {amount: 5});
+});
+
+test('reply(function) hands back a non-json Buffer body as text', async () => {
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/buffered-text')
+    .reply(async (request) => {
+      capturedBody = await request.text();
+
+      return [200, 'ok'];
+    });
+
+  await client.post('http://mock.test/buffered-text', {
+    body: Buffer.from('plain words'),
+    headers: {'content-type': 'text/plain'},
+  });
+
+  assert.strictEqual(capturedBody, 'plain words');
+});
+
+/*
+ * `gotlike.stream.post()`/`.put()` send the body through `undici.pipeline`'s writable side,
+ * which MockAgent hands the reply callback as the live pipeline `Readable` rather than the
+ * bytes that will eventually flow through it - a plain object as far as the callback or a body
+ * matcher is concerned. `resolveRequestBody` drains it so the callback still sees real content.
+ */
+test('reply(function) sees the actual bytes of a streamed upload, not the pipeline body object', async () => {
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/streamed')
+    .reply(async (request) => {
+      capturedBody = await request.json();
+
+      return [200, 'ok'];
+    });
+
+  const upload = await client.stream.post('http://mock.test/streamed', {
+    headers: {'content-type': 'application/json'},
+  });
+
+  upload.end(JSON.stringify({amount: 5}));
+
+  assert.strictEqual(await text(upload), 'ok');
+  assert.deepStrictEqual(capturedBody, {amount: 5});
+});
+
+/*
+ * The other of the two shapes `resolveRequestBody` has to handle: with no interceptor composed
+ * that implements `onBodySent`/`onRequestSent` (`decompress` does, and is on by default -
+ * `decompress: false` is what turns this shape off), undici calls this reply callback *before*
+ * reading the request body itself, so `opts.body` is still the live, unread `Readable` rather
+ * than the already-drained wrapper the other test exercises.
+ */
+test('reply(function) sees a streamed upload’s bytes on a client with no decompress interceptor either', async () => {
+  const plain = createClient({decompress: false});
+  let capturedBody: unknown;
+
+  nock('http://mock.test')
+    .post('/streamed-plain')
+    .reply(async (request) => {
+      capturedBody = await request.json();
+
+      return [200, 'ok'];
+    });
+
+  const upload = await plain.stream.post('http://mock.test/streamed-plain', {
+    headers: {'content-type': 'application/json'},
+  });
+
+  upload.end(JSON.stringify({amount: 5}));
+
+  assert.strictEqual(await text(upload), 'ok');
+  assert.deepStrictEqual(capturedBody, {amount: 5});
+});
+
+/**
+ * The same shape, but with a body big enough to matter - which is what the two tests above
+ * could never catch.
+ *
+ * The live `Readable` used to be piped into two `PassThrough`s, one to read and one put back
+ * on `opts.body` for a later read by undici that never comes (`dispatchRequestBody` runs
+ * *before* the reply callback and is the only thing that touches the body). Nothing drained
+ * the second one, so past its 16KB high-water mark `pipe` paused the source, the half being
+ * read stopped receiving, and the callback's own await never resolved: measured, a 200KB
+ * upload never settled and the reply callback was never called at all. A few hundred bytes
+ * fits in the buffer and always worked, which is exactly why this needs a real payload.
+ */
+test('reply(function) sees a streamed upload larger than a stream buffer', async () => {
+  const plain = createClient({decompress: false});
+  const payload = 'x'.repeat(200 * 1024);
+  let capturedLength = -1;
+
+  nock('http://mock.test')
+    .post('/streamed-large')
+    .reply(async (request) => {
+      capturedLength = (await request.text()).length;
+
+      return [200, 'ok'];
+    });
+
+  const upload = await plain.stream.post('http://mock.test/streamed-large', {
+    headers: {'content-type': 'text/plain'},
+  });
+
+  upload.end(payload);
+
+  assert.strictEqual(await text(upload), 'ok');
+  assert.strictEqual(capturedLength, payload.length);
+});
+
+// The whole url, base path and query included.
+test('reply(function) url is the full request url, base path and query included', async () => {
+  let capturedUrl: string | undefined;
+
+  nock('http://mock.test/api/v2')
+    .get('/thing')
+    .query(true)
+    .reply((request) => {
+      capturedUrl = request.url;
+
+      return [200, 'ok'];
+    });
+
+  await client.get('http://mock.test/api/v2/thing', {searchParams: {a: '1'}});
+
+  assert.strictEqual(capturedUrl, 'http://mock.test/api/v2/thing?a=1');
+});
+
+test('reply(status, function) computes just the body', async () => {
+  nock('http://mock.test')
+    .post('/compute')
+    .reply(200, async (request) => ({echoed: await request.json()}));
+
+  const response = await json.post<{echoed: {a: number}}>('http://mock.test/compute', {json: {a: 1}});
+
+  assert.deepStrictEqual(response.body.echoed, {a: 1});
+});
+
+test('reply callbacks may be async', async () => {
+  nock('http://mock.test')
+    .get('/async')
+    .reply(async (): Promise<ReplyFunctionResult> => {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+
+      return [200, {done: true}];
+    });
+
+  const response = await json.get<{done: boolean}>('http://mock.test/async');
+
+  assert.deepStrictEqual(response.body, {done: true});
+});
+
+test('a form request body reads back as its text', async () => {
+  let captured: unknown;
+
+  nock('http://mock.test')
+    .post('/form')
+    .reply(200, async (request) => {
+      captured = await request.text();
+
+      return 'ok';
+    });
+
+  await client.post('http://mock.test/form', {form: {a: '1', b: '2'}});
+
+  assert.strictEqual(captured, 'a=1&b=2');
+});
+
+test('a miss carries the request in its report, without its query', async () => {
+  nock('http://mock.test').post('/a').reply(200);
+
+  const response = await json.post<{message: string}>('http://mock.test/b?secret=1', {
+    body: 'the body',
+    headers: {'x-a': ['1', '2']},
+  });
+
+  assert.strictEqual(response.statusCode, 501);
+  assert.strictEqual(response.headers['content-type'], 'application/json');
+
+  const report = JSON.parse(response.body.message.replace('Nock: No match for request ', '')) as Record<string, any>;
+
+  assert.strictEqual(report['url'], 'http://mock.test/b');
+  assert.strictEqual(report['body'], 'the body');
+  assert.strictEqual(report['headers']['x-a'], '1, 2');
+});
+
+// Nothing else reads the body after a miss, so an unread upload would stall whoever writes it.
+test('a miss drains a streamed upload', async () => {
+  nock('http://mock.test').post('/a').reply(200);
+
+  const upload = Readable.from([Buffer.alloc(100_000)]);
+  const response = await json.post('http://mock.test/b', {body: upload});
+
+  assert.strictEqual(response.statusCode, 501);
+  await once(upload, 'close');
+});
+
+// undici's redirect handler leaves the headers as a flat array after the first hop.
+test('a miss after a redirect reports the hop’s headers', async () => {
+  const following = client.extend({followRedirect: true, throwHttpErrors: false, responseType: 'json'});
+
+  nock('http://mock.test').get('/from').reply(302, '', {location: '/to'});
+
+  const response = await following.get<{message: string}>('http://mock.test/from', {headers: {'x-a': '1'}});
+
+  assert.strictEqual(response.statusCode, 501);
+  assert.match(response.body.message, /"x-a": "1"/);
+});
+
+// A consumer walking away from a response aborts through the controller, which has nothing to abort.
+test('a miss survives its consumer destroying the stream', async () => {
+  nock('http://mock.test').get('/a').reply(200);
+
+  const stream = await client.extend({throwHttpErrors: false}).stream('http://mock.test/b');
+
+  // Not `once`, which rejects on the `AbortError` a destroyed stream reports.
+  stream.on('error', () => {});
+
+  const closed = new Promise((resolve) => stream.once('close', resolve));
+
+  stream.destroy();
+  await closed;
+});
+
+test('a literal question mark in a query value is matched', async () => {
+  nock('http://mock.test').get('/q').query({a: 'b?c', d: 'e'}).reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://mock.test/q?a=b?c&d=e')).body, 'matched');
+});
+
+test('delay() refuses anything but a number, as nock 15 does', () => {
+  const interceptor = nock('http://mock.test').get('/');
+
+  assert.throws(() => interceptor.delay({head: 1} as never), /Unexpected input/);
+});
+
+test('times(n) replays the interceptor n times', async () => {
+  nock('http://mock.test').get('/repeat').times(2).reply(200, 'twice');
+
+  assert.strictEqual((await client.get('http://mock.test/repeat')).body, 'twice');
+  assert.strictEqual((await client.get('http://mock.test/repeat')).body, 'twice');
+
+  const third = await failure(client.get('http://mock.test/repeat'));
+
+  assertUnmatched(third, 'the third call should be unmatched');
+});
+
+test('persist() replays indefinitely', async () => {
+  nock('http://mock.test').get('/forever').persist().reply(200, 'always');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual((await client.get('http://mock.test/forever')).body, 'always');
+  }
+});
+
+test('replyWithError rejects the request', async () => {
+  nock('http://mock.test').get('/broken').replyWithError(new Error('boom'));
+
+  const err = await failure<Error>(client.get('http://mock.test/broken'));
+
+  assert.strictEqual(err.name, 'RequestError');
+  assert.strictEqual((err.cause as Error).message, 'boom');
+});
+
+test('matchHeader and reqheaders both constrain matching', async () => {
+  nock('http://mock.test').get('/guarded').matchHeader('x-key', 'secret').reply(200, 'ok');
+
+  const matched = await client.get('http://mock.test/guarded', {headers: {'x-key': 'secret'}});
+
+  assert.strictEqual(matched.body, 'ok');
+
+  nock('http://mock.test')
+    .get('/guarded2', undefined, {reqheaders: {'x-key': 'secret'}})
+    .reply(200, 'ok');
+
+  const missed = await failure(client.get('http://mock.test/guarded2', {headers: {'x-key': 'wrong'}}));
+
+  assertUnmatched(missed, 'a different query should not match');
+});
+
+/*
+ * `nock(host, options)` dropped its options, and three of them fail open when dropped: the
+ * interceptor matched a request nock would have refused, so a test asserting that a credential
+ * was sent passed without it. A table, one row per option, each with a request that must match
+ * and one that must not.
+ */
+test('scope options constrain every interceptor on the scope', async () => {
+  let enabled = false;
+  const rows: [string, Parameters<typeof nock>[1], Record<string, string>, Record<string, string>][] = [
+    ['reqheaders', {reqheaders: {'x-key': 'secret'}}, {'x-key': 'secret'}, {'x-key': 'wrong'}],
+    ['reqheaders, absent', {reqheaders: {'x-key': /./}}, {'x-key': 'anything'}, {}],
+    ['badheaders', {badheaders: ['x-forbidden']}, {}, {'x-forbidden': '1'}],
+    ['conditionally', {conditionally: () => enabled}, {}, {}],
+  ];
+
+  for (const [name, options, matching, missing] of rows) {
+    nock('http://mock.test', options).get('/scoped').reply(200, 'ok');
+
+    enabled = false;
+    const missed = await failure(client.get('http://mock.test/scoped', {headers: missing}));
+
+    assertUnmatched(missed, `${name}: should not match`);
+
+    enabled = true;
+    const matched = await client.get('http://mock.test/scoped', {headers: matching});
+
+    assert.strictEqual(matched.body, 'ok', `${name}: should match`);
+    nock.cleanAll();
+  }
+
+  // An interceptor's own reqheaders still apply on top of the scope's.
+  nock('http://mock.test', {reqheaders: {'x-a': '1'}})
+    .get('/both', undefined, {reqheaders: {'x-b': '2'}})
+    .reply(200, 'ok');
+
+  assertUnmatched(await failure(client.get('http://mock.test/both', {headers: {'x-a': '1'}})), 'both required');
+  assert.strictEqual((await client.get('http://mock.test/both', {headers: {'x-a': '1', 'x-b': '2'}})).body, 'ok');
+});
+
+/*
+ * A header requirement compares the way nock compares: an array header as node joins it, a number
+ * as its text, and a `host` requirement skipped when the request set no `host` of its own.
+ */
+test('a header requirement compares an array, a number and host as nock does', async () => {
+  nock('http://mock.test', {reqheaders: {'x-list': 'a, b', 'x-zero': 0 as never, host: 'mock.test'}})
+    .get('/folded')
+    .reply(200, 'ok');
+
+  const response = await client.get('http://mock.test/folded', {headers: {'x-list': ['a', 'b'], 'x-zero': '0'}});
+
+  assert.strictEqual(response.body, 'ok');
+});
+
+// `filteringScope` is accepted and not applied - it fails closed, so a suite written with it still
+// runs. `allowUnmocked` is applied, and a matched request is still answered by the mock; the
+// fall-through itself is in `nock-default.spec.ts`, since it needs a real server.
+test('allowUnmocked and filteringScope are accepted', async () => {
+  nock('http://mock.test', {allowUnmocked: true, filteringScope: () => true})
+    .get('/lenient')
+    .reply(200, 'ok');
+
+  assert.strictEqual((await client.get('http://mock.test/lenient')).body, 'ok');
+});
+
+/*
+ * nock names its interceptors `METHOD proto://host:port/path`, and suites print or compare those
+ * names - `expect(nock.pendingMocks()).to.deep.equal([...])`. `pendingMocks()` returned undici's
+ * dispatch objects, and `nock.isDone()`/`activeMocks()` did not exist.
+ */
+test('pendingMocks, activeMocks and isDone answer with nock keys, optional interceptors aside', async () => {
+  const scope = nock('http://mock.test/v1')
+    .get('/users')
+    .reply(200, [])
+    .get(/orders\/\d+/)
+    .reply(200, {})
+    .post('/audit?source=test')
+    .optionally()
+    .reply(201)
+    .get('/health')
+    .times(2)
+    .reply(200, 'ok');
+
+  nock('https://secure.test').persist().get('/token').reply(200, 'token');
+
+  assert.deepStrictEqual(nock.pendingMocks(), [
+    'GET http://mock.test:80/v1/users',
+    'GET http://mock.test:80/v1//orders\\/\\d+/',
+    'GET http://mock.test:80/v1/health',
+    'GET https://secure.test:443/token',
+  ]);
+  assert.deepStrictEqual(scope.pendingMocks().length, 3, 'the scope answers for its own origin');
+  assert.strictEqual(nock.activeMocks().length, 5, 'the optional one is active, not pending');
+  assert.strictEqual(nock.isDone(), false);
+
+  await client.get('http://mock.test/v1/users');
+  await client.get('http://mock.test/v1/orders/7');
+  await client.get('http://mock.test/v1/health');
+  await client.get('https://secure.test/token');
+
+  // One of two `times` calls made: still pending. A persisted one, once called, is not.
+  assert.deepStrictEqual(nock.pendingMocks(), ['GET http://mock.test:80/v1/health']);
+
+  await client.get('http://mock.test/v1/health');
+
+  assert.deepStrictEqual(nock.pendingMocks(), []);
+  assert.strictEqual(nock.isDone(), true);
+  assert.strictEqual(scope.isDone(), true);
+  scope.done();
+  // The optional interceptor never ran, and the persisted one never runs out.
+  assert.deepStrictEqual(nock.activeMocks(), [
+    'POST http://mock.test:80/v1/audit',
+    'GET https://secure.test:443/token',
+  ]);
+  assert.throws(
+    () =>
+      nock('http://mock.test')
+        .get('/')
+        .optionally('yes' as never),
+    /argument should be a boolean/,
+  );
+});
+
+test('basicAuth and a scope matchHeader are required, including a scope matcher added later', async () => {
+  const scope = nock('http://mock.test').get('/late').reply(200, 'late');
+
+  // After the interceptor, as nock allows: its matchers are checked on every match.
+  scope.matchHeader('X-Api-Key', 'k1');
+  scope.get('/secured').basicAuth({user: 'user', pass: 'secret'}).reply(200, 'secured');
+
+  assertUnmatched(await failure(client.get('http://mock.test/late')), 'the scope matcher, added after');
+  assert.strictEqual((await client.get('http://mock.test/late', {headers: {'x-api-key': 'k1'}})).body, 'late');
+
+  assertUnmatched(
+    await failure(client.get('http://mock.test/secured', {headers: {'x-api-key': 'k1'}})),
+    'no credentials',
+  );
+  assertUnmatched(
+    await failure(
+      client.get('http://mock.test/secured', {headers: {'x-api-key': 'k1'}, username: 'user', password: 'wrong'}),
+    ),
+    'the wrong password',
+  );
+
+  const response = await client.get('http://mock.test/secured', {
+    headers: {'x-api-key': 'k1'},
+    username: 'user',
+    password: 'secret',
+  });
+
+  assert.strictEqual(response.body, 'secured');
+
+  // `pass` defaults to empty, as in nock.
+  nock('http://mock.test').get('/user-only').basicAuth({user: 'user'}).reply(200, 'user only');
+  assert.strictEqual(
+    (await client.get('http://mock.test/user-only', {headers: {authorization: `Basic ${btoa('user:')}`}})).body,
+    'user only',
+  );
+});
+
+/*
+ * nock parses a form body before comparing an object matcher with it; only JSON was parsed here,
+ * so every such interceptor missed. Values compare as strings, since that is all a form carries.
+ */
+test('an object body matcher matches an urlencoded form body', async () => {
+  const scope = nock('http://mock.test')
+    .post('/login', {user: 'a', remember: true, tags: ['x', 'y'], code: /^\d+$/})
+    .reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/login', {
+    form: {tags: ['x', 'y'], code: '42', remember: 'true', user: 'a'},
+  });
+
+  assert.strictEqual(response.body, 'matched');
+  assert.strictEqual(scope.isDone(), true);
+
+  nock('http://mock.test').post('/login', {user: 'a'}).reply(200, 'matched');
+
+  assertUnmatched(
+    await failure(client.post('http://mock.test/login', {form: {user: 'a', extra: '1'}})),
+    'a field besides the ones named',
+  );
+});
+
+test('a boolean or number reply body is sent as its text, as nock sends it', async () => {
+  nock('http://mock.test').get('/false').reply(200, false).get('/zero').reply(200, 0);
+
+  assert.strictEqual((await client.get('http://mock.test/false')).body, 'false');
+  assert.strictEqual((await client.get('http://mock.test/zero')).body, '0');
+});
+
+test('body matcher constrains matching', async () => {
+  nock('http://mock.test').post('/exact-body', '{"a":1}').reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/exact-body', {json: {a: 1}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+/*
+ * nock JSON-parses the body before handing it to a predicate, and only falls back to the raw
+ * text when it doesn't parse. undici hands the matcher a Buffer (or nothing, for a bodyless
+ * request), so a predicate reading `body.method` - the main consumer's JSON-RPC
+ * mocks - saw `undefined` and never matched.
+ */
+test('a function body matcher is handed the parsed JSON body', async () => {
+  const scope = nock('http://mock.test')
+    .post('/fn-body', (body: {method?: string}) => body?.method === 'items.list')
+    .reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/fn-body', {json: {method: 'items.list'}});
+
+  assert.strictEqual(response.body, 'matched');
+  // undici applies the matcher again to consume the interceptor, after dispatch has returned -
+  // a predicate that answered differently there would match and stay pending.
+  assert.strictEqual(scope.isDone(), true);
+});
+
+test('a function body matcher is handed a non-JSON body as text', async () => {
+  let seen: unknown;
+  nock('http://mock.test')
+    .post('/fn-text', (body: unknown) => {
+      seen = body;
+
+      return true;
+    })
+    .reply(200, 'matched');
+
+  await client.post('http://mock.test/fn-text', {body: 'a=1&b=2'});
+
+  assert.strictEqual(seen, 'a=1&b=2');
+});
+
+test('a function body matcher is handed an empty string for a bodyless request', async () => {
+  let seen: unknown;
+  nock('http://mock.test')
+    .get('/fn-empty', (body: unknown) => {
+      seen = body;
+
+      return true;
+    })
+    .reply(200, 'matched');
+
+  await client.get('http://mock.test/fn-empty');
+
+  assert.strictEqual(seen, '');
+});
+
+/*
+ * Exact means the field has to be *there*, not merely read back the same. `{a: undefined}`
+ * matched a body of `{b: 'foo'}`: the key counts agreed, and `actual.a` was `undefined` for
+ * the same reason any absent property is. An unmatched interceptor falls through to the real
+ * network, so a false positive here is the less dangerous half of the bug - the danger is the
+ * matcher agreeing to something it was never shown.
+ */
+test('an undefined expected field is not satisfied by an absent one', async () => {
+  nock('http://mock.test').post('/undef', {a: undefined}).reply(200, 'matched');
+
+  const missed = await failure(client.post('http://mock.test/undef', {json: {b: 'foo'}}));
+
+  assertUnmatched(missed, 'a body naming none of the expected fields should not match');
+});
+
+test('a Buffer body matcher matches a request sending the same bytes', async () => {
+  nock('http://mock.test').post('/upload', Buffer.from('binary-data')).reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/upload', {body: Buffer.from('binary-data')});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a Buffer body matcher does not match different bytes', async () => {
+  nock('http://mock.test').post('/upload-diff', Buffer.from('binary-data')).reply(200, 'matched');
+
+  const missed = await failure(client.post('http://mock.test/upload-diff', {body: Buffer.from('other-bytes')}));
+
+  assertUnmatched(missed, 'different bytes should not match a Buffer body matcher');
+});
+
+test('a Buffer body matcher does not match a bodyless request', async () => {
+  nock('http://mock.test').post('/upload-nobody', Buffer.from('binary-data')).reply(200, 'matched');
+
+  const missed = await failure(client.post('http://mock.test/upload-nobody'));
+
+  assertUnmatched(missed, 'a request with no body should not match a Buffer body matcher');
+});
+
+test('registering a query-carrying path alongside .query() does not throw', () => {
+  assert.doesNotThrow(() => {
+    nock('http://mock.test').get('/search?type=user').query({q: 'test'}).reply(200, 'matched');
+  });
+});
+
+test('a query-carrying path combined with .query() requires both to be satisfied', async () => {
+  nock('http://mock.test').get('/search?type=user').query({q: 'test'}).reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/search', {searchParams: {type: 'user', q: 'test'}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a query-carrying path combined with .query() rejects a request missing either part', async () => {
+  nock('http://mock.test').get('/search-partial?type=user').query({q: 'test'}).reply(200, 'matched');
+
+  const missed = await failure(client.get('http://mock.test/search-partial', {searchParams: {type: 'user'}}));
+
+  assertUnmatched(missed, "the path's own query param is required alongside .query()'s");
+});
+
+test('a repeated key in a query-carrying path still matches under a chained .query(fn)', async () => {
+  nock('http://mock.test')
+    .get('/search-tags?tag=a&tag=b')
+    .query(() => true)
+    .reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/search-tags', {searchParams: {tag: ['a', 'b']}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('cleanAll removes pending interceptors across origins', async () => {
+  nock('http://mock.test').get('/pending').reply(200, 'never used');
+  nock('http://other.test').get('/pending').reply(200, 'never used');
+
+  assert.ok(nock.pendingMocks().length >= 2);
+
+  nock.cleanAll();
+
+  assert.strictEqual(nock.pendingMocks().length, 0);
+});
+
+test('scopes chain across multiple interceptors', async () => {
+  nock('http://mock.test').get('/one').reply(200, 'first').get('/two').reply(200, 'second');
+
+  assert.strictEqual((await client.get('http://mock.test/one')).body, 'first');
+  assert.strictEqual((await client.get('http://mock.test/two')).body, 'second');
+});
+
+test('interceptors are consumed once by default', async () => {
+  nock('http://mock.test').get('/once').reply(200, 'first');
+
+  assert.strictEqual((await client.get('http://mock.test/once')).body, 'first');
+
+  const second = await failure(client.get('http://mock.test/once'));
+
+  assertUnmatched(second, 'the interceptor should be consumed');
+});
+
+/** nock's `isDone()` answers for its own scope; ours used to answer for every origin at once. */
+test('isDone reports on the scope it was called on', async () => {
+  const mine = nock('http://mine.test');
+  const theirs = nock('http://theirs.test');
+
+  mine.get('/done').reply(200, 'ok');
+  theirs.get('/pending').reply(200, 'never used');
+
+  assert.strictEqual(mine.isDone(), false, 'nothing has been consumed yet');
+
+  await client.get('http://mine.test/done');
+
+  assert.strictEqual(mine.isDone(), true, 'this scope is done');
+  assert.strictEqual(theirs.isDone(), false, 'the other scope is not, and must not say so');
+});
+
+/** `nock(host).persist()` and `scope.done()` are the spellings nock's own docs use. */
+test('persist on the scope applies to every interceptor registered after it', async () => {
+  const scope = nock('http://mock.test').persist();
+
+  scope.get('/always').reply(200, 'always');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual((await client.get('http://mock.test/always')).body, 'always');
+  }
+});
+
+test('done throws while the scope has interceptors left', async () => {
+  const scope = nock('http://mock.test');
+
+  scope.get('/expected').reply(200, 'ok');
+
+  // nock's message, naming what is left.
+  assert.throws(() => scope.done(), /^Error: Mocks not yet satisfied:\nGET http:\/\/mock\.test:80\/expected$/);
+
+  await client.get('http://mock.test/expected');
+
+  scope.done();
+});
+
+test('nock supports the QUERY method with body matching', async () => {
+  nock('http://mock.test')
+    .query('/search', '{"query":"test"}')
+    .reply(200, {results: [1, 2]});
+
+  const response = await json.query<{results: number[]}>('http://mock.test/search', {
+    json: {query: 'test'},
+  });
+
+  assert.deepStrictEqual(response.body, {results: [1, 2]});
+});
+
+test('nock scope.query allows chaining interceptor.query for URL query params', async () => {
+  nock('http://mock.test')
+    .query('/items')
+    .query({filter: 'active'})
+    .reply(200, {items: ['a']});
+
+  const response = await json.query<{items: string[]}>('http://mock.test/items', {
+    searchParams: {filter: 'active'},
+  });
+
+  assert.deepStrictEqual(response.body, {items: ['a']});
+});
+
+/*
+ * nock labels an object reply `application/json`; undici's MockAgent serialises the body but
+ * sets no content-type at all. Anything under test that branches on the response content-type
+ * therefore behaved differently against the mock than against the real server, which is the
+ * one thing a mocking shim must not do.
+ */
+test('an object reply body is labelled application/json', async () => {
+  nock('http://mock.test').get('/j').reply(200, {a: 1});
+
+  const response = await client.get('http://mock.test/j');
+
+  assert.strictEqual(response.headers['content-type'], 'application/json');
+});
+
+test('an array reply body is labelled too', async () => {
+  nock('http://mock.test').get('/arr').reply(200, [1, 2]);
+
+  const response = await client.get('http://mock.test/arr');
+
+  assert.strictEqual(response.headers['content-type'], 'application/json');
+});
+
+test('an explicit content-type on an object reply is left alone', async () => {
+  nock('http://mock.test').get('/custom').reply(200, {a: 1}, {'Content-Type': 'application/problem+json'});
+
+  const response = await client.get('http://mock.test/custom');
+
+  assert.strictEqual(response.headers['content-type'], 'application/problem+json');
+});
+
+test('a string reply body is not labelled json', async () => {
+  nock('http://mock.test').get('/s').reply(200, 'plain');
+
+  const response = await client.get('http://mock.test/s');
+
+  assert.strictEqual(response.headers['content-type'], undefined);
+});
+
+test('a reply callback returning an object is labelled json as well', async () => {
+  nock('http://mock.test')
+    .get('/cb')
+    .reply((): ReplyFunctionResult => [200, {a: 1}]);
+
+  const response = await client.get('http://mock.test/cb');
+
+  assert.strictEqual(response.headers['content-type'], 'application/json');
+});
+
+/*
+ * undici compares a non-RegExp, non-function body matcher with `===`, so nock's object form -
+ * `nock(host).post('/p', {a: 1})`, its most common shape - never matched anything at all.
+ */
+test('an object body matcher matches the parsed request body', async () => {
+  nock('http://mock.test').post('/p', {a: 1, b: 'two'}).reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/p', {json: {a: 1, b: 'two'}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('an object body matcher does not match a different body', async () => {
+  nock('http://mock.test').post('/p', {a: 1}).reply(200, 'matched');
+
+  const error = await failure(client.post('http://mock.test/p', {json: {a: 2}}));
+
+  assertUnmatched(error, 'a body with a different value must not match');
+});
+
+test('an object body matcher requires every field and no extras', async () => {
+  nock('http://mock.test').post('/exact', {a: 1}).reply(200, 'matched');
+
+  const error = await failure(client.post('http://mock.test/exact', {json: {a: 1, extra: true}}));
+
+  assertUnmatched(error, 'an extra field must not match');
+});
+
+test('an object body matcher accepts a regex and a predicate leaf', async () => {
+  nock('http://mock.test')
+    .post('/leaves', {id: /^ord-\d+$/, amount: (value: unknown) => typeof value === 'number' && value > 10})
+    .reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/leaves', {json: {id: 'ord-42', amount: 99}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a nested object body matcher compares nested fields', async () => {
+  nock('http://mock.test')
+    .post('/nested', {outer: {inner: [1, 2]}})
+    .reply(200, 'matched');
+
+  const response = await client.post('http://mock.test/nested', {json: {outer: {inner: [1, 2]}}});
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a body that is not json at all does not match an object matcher', async () => {
+  nock('http://mock.test').post('/notjson', {a: 1}).reply(200, 'matched');
+
+  const error = await failure(client.post('http://mock.test/notjson', {body: 'plain text'}));
+
+  assertUnmatched(error, 'an unparseable body must not match');
+});
+
+// `Object.fromEntries` keeps only the last of a repeated key, so this silently became
+// `{a: '2'}` and matched requests it should not have.
+test('query(URLSearchParams) keeps repeated keys', async () => {
+  nock('http://mock.test').get('/rep').query(new URLSearchParams('a=1&a=2')).reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/rep?a=1&a=2');
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('query(URLSearchParams) with repeated keys rejects a single occurrence', async () => {
+  nock('http://mock.test').get('/rep').query(new URLSearchParams('a=1&a=2')).reply(200, 'matched');
+
+  const error = await failure(client.get('http://mock.test/rep?a=1'));
+
+  assertUnmatched(error, 'one value must not satisfy a two-value expectation');
+});
+
+// nock accepts a bare host; `new URL` does not, so this threw ERR_INVALID_URL.
+test('accepts an origin without a scheme and defaults to http', async () => {
+  nock('mock.test').get('/bare').reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/bare');
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+test('a scheme-less origin keeps its base path', async () => {
+  nock('mock.test/base').get('/under').reply(200, 'matched');
+
+  const response = await client.get('http://mock.test/base/under');
+
+  assert.strictEqual(response.body, 'matched');
+});
+
+// `body ?? ''` turned an explicit null reply into an empty body, which then failed to parse.
+test('replies with a json null', async () => {
+  nock('http://mock.test').get('/null').reply(200, null);
+
+  const response = await json.get('http://mock.test/null');
+
+  assert.strictEqual(response.body, null);
+});
+
+/**
+ * `deactivate()` alone makes the mock pass requests through, which looks like a restore until
+ * the caller had set a dispatcher of their own - a proxy agent, or a pool tuned for their
+ * workload. That one stayed replaced for the lifetime of the process, with nothing to put it
+ * back, because the dispatcher that was global before the import was never kept.
+ */
+test('restore() puts the previous global dispatcher back, and activate() re-installs the mock', () => {
+  const mocked = getGlobalDispatcher();
+
+  nock.restore();
+
+  try {
+    assert.notStrictEqual(getGlobalDispatcher(), mocked, 'restore() should hand the global dispatcher back');
+    assert.strictEqual(nock.isActive(), false);
+  } finally {
+    nock.activate();
+  }
+
+  assert.strictEqual(getGlobalDispatcher(), mocked);
+  assert.strictEqual(nock.isActive(), true);
+});
+
+/*
+ * A regex origin, which nock allows and undici keys by object identity. The pool map was keyed
+ * on the origin itself, so a second `nock(/host/)` - a different RegExp object with the same
+ * pattern - missed the map and registered a *second* mock pool. undici resolves a request's
+ * origin against the first regex pool it finds and caches the dispatch list that pool was
+ * holding, so everything registered on the second scope was invisible: with `disableNetConnect`
+ * off, those requests went out to the real network. Real nock matches both; measured against
+ * nock 14.
+ */
+test('two scopes with the same regex origin both match', async () => {
+  nock(/two-scopes\.test/)
+    .get('/one')
+    .reply(200, {n: 1});
+  nock(/two-scopes\.test/)
+    .get('/two')
+    .reply(200, {n: 2});
+
+  assert.deepStrictEqual((await json.get<{n: number}>('http://two-scopes.test/one')).body, {n: 1});
+  assert.deepStrictEqual((await json.get<{n: number}>('http://two-scopes.test/two')).body, {n: 2});
+});
+
+test('a regex origin matches every host it covers', async () => {
+  nock(/covered\.test$/)
+    .persist()
+    .get('/ping')
+    .reply(200, {ok: true});
+
+  assert.deepStrictEqual((await json.get<{ok: boolean}>('http://a.covered.test/ping')).body, {ok: true});
+  assert.deepStrictEqual((await json.get<{ok: boolean}>('http://b.covered.test/ping')).body, {ok: true});
+});
+
+/*
+ * `cleanAll()` used to leave a regex origin working exactly once per host per process: the
+ * concrete-origin pool undici derives from a regex one holds the dispatch array it had at
+ * derivation time, and `cleanMocks()` hands the regex pool a *new* array rather than emptying
+ * the shared one - so everything registered afterwards landed somewhere nothing was reading,
+ * and the request fell through to the network. Measured: the second test to mock the same host
+ * by pattern matched nothing at all.
+ */
+test('a regex origin still matches after a cleanAll', async () => {
+  nock(/recycled\.test/)
+    .get('/first')
+    .reply(200, 'first');
+
+  assert.strictEqual((await client.get('http://recycled.test/first')).body, 'first');
+
+  nock.cleanAll();
+
+  nock(/recycled\.test/)
+    .get('/second')
+    .reply(200, 'second');
+
+  assert.strictEqual((await client.get('http://recycled.test/second')).body, 'second');
+});
+
+test('cleanAll clears a regex origin too', async () => {
+  nock(/cleaned\.test/)
+    .get('/warm')
+    .reply(200, 'warm');
+
+  // Consumed first, so undici has derived its concrete-origin pool from the regex one before
+  // anything is cleaned - which is the arrangement that used to leak.
+  assert.strictEqual((await client.get('http://cleaned.test/warm')).body, 'warm');
+
+  nock(/cleaned\.test/)
+    .get('/gone')
+    .reply(200, 'gone');
+
+  nock.cleanAll();
+
+  assertUnmatched(await failure(client.get('http://cleaned.test/gone')), 'the interceptor was cleaned');
+});
+
+/*
+ * Each scope answers for itself, as in nock - regex origin or string. A pending interceptor used to
+ * report only the origin it was registered under, so two scopes on one origin shared an answer and
+ * `mine.isDone()` stayed false until *theirs* was consumed too. Each scope now keeps the dispatches
+ * it registered.
+ */
+test('isDone and pendingMocks answer per scope, on a regex origin or a string one', async () => {
+  for (const origin of [/answered\.test/, 'http://answered.test']) {
+    const mine = nock(origin).get('/mine').reply(200, 'mine');
+    const theirs = nock(origin).get('/theirs').reply(200, 'theirs');
+
+    assert.strictEqual(mine.isDone(), false, 'nothing has been consumed yet');
+
+    await client.get('http://answered.test/mine');
+
+    assert.strictEqual(mine.isDone(), true, 'the other scope on this origin does not count');
+    assert.strictEqual(theirs.isDone(), false);
+    assert.deepStrictEqual(theirs.pendingMocks().length, 1);
+
+    await client.get('http://answered.test/theirs');
+
+    assert.strictEqual(theirs.isDone(), true);
+    nock.cleanAll();
+  }
+});
+
+/*
+ * nock applies `persist()` to the interceptors already on the scope - `nock(host).get('/').reply(200)
+ * .persist()` is a common spelling - and the shim applied it only to ones added afterwards, so the
+ * interceptor answered once and the next request was a miss.
+ */
+test('persist after reply persists the interceptors already registered', async () => {
+  const scope = nock('http://mock.test').get('/again').reply(200, 'again').persist();
+
+  assert.strictEqual((await client.get('http://mock.test/again')).body, 'again');
+  assert.strictEqual((await client.get('http://mock.test/again')).body, 'again');
+  assert.deepStrictEqual(nock.activeMocks(), ['GET http://mock.test:80/again']);
+  assert.strictEqual(scope.isDone(), true, 'a persisted interceptor that ran is done');
+  assert.throws(() => scope.persist('yes' as never), /argument should be a boolean/);
+
+  // `persist(false)` turns it off again, for what is registered and what comes after.
+  scope.persist(false);
+  assert.strictEqual((await client.get('http://mock.test/again')).body, 'again');
+  assertUnmatched(await failure(client.get('http://mock.test/again')), 'no longer persisted');
+});
+
+// An unrelated origin's pending mocks must not be counted, regex or not.
+test('isDone on a regex origin ignores another origin', async () => {
+  const mine = nock(/isolated\.test/)
+    .get('/mine')
+    .reply(200, 'mine');
+
+  nock('http://elsewhere.test').get('/theirs').reply(200, 'theirs');
+
+  await client.get('http://isolated.test/mine');
+
+  assert.strictEqual(mine.isDone(), true, 'another origin must not hold this scope open');
+});
+
+/*
+ * Coverage-driven tests.
+ *
+ * Most of what follows is public shim API that had no test at all - the repeat counts, the
+ * delay, and five of the eight verbs. A consumer migrating from nock reaches for these by
+ * name, and nothing here checked they worked.
+ */
+
+test('once, twice and thrice set the repeat count', async () => {
+  nock('http://repeats.test').get('/once').once().reply(200, 'a');
+  nock('http://repeats.test').get('/twice').twice().reply(200, 'b');
+  nock('http://repeats.test').get('/thrice').thrice().reply(200, 'c');
+
+  assert.strictEqual((await client.get('http://repeats.test/once')).body, 'a');
+  assertUnmatched(
+    await failure(client.get('http://repeats.test/once')),
+    'a `once` interceptor must be consumed after one request',
+  );
+
+  for (let i = 0; i < 2; i++) {
+    assert.strictEqual((await client.get('http://repeats.test/twice')).body, 'b');
+  }
+
+  assertUnmatched(await failure(client.get('http://repeats.test/twice')), 'twice means twice');
+
+  for (let i = 0; i < 3; i++) {
+    assert.strictEqual((await client.get('http://repeats.test/thrice')).body, 'c');
+  }
+
+  assertUnmatched(await failure(client.get('http://repeats.test/thrice')), 'thrice means thrice');
+});
+
+test('delay holds the reply back', async () => {
+  nock('http://delayed.test').get('/slow').delay(60).reply(200, 'late');
+
+  const started = Date.now();
+  const response = await client.get('http://delayed.test/slow');
+
+  assert.strictEqual(response.body, 'late');
+  assert.ok(Date.now() - started >= 50, `expected the reply to be held back, took ${Date.now() - started}ms`);
+});
+
+// Five of the eight verbs had no test. `#verb` is shared, but nothing checked each passes the
+// method it names - a copy-paste slip there is invisible until a consumer hits it.
+test('every verb registers under its own method', async () => {
+  const scope = nock('http://verbs.test');
+
+  scope.put('/p').reply(200, 'put');
+  scope.patch('/p').reply(200, 'patch');
+  scope.delete('/p').reply(200, 'delete');
+  scope.head('/p').reply(200);
+  scope.options('/p').reply(200, 'options');
+  scope.query('/p').reply(200, 'query');
+
+  assert.strictEqual((await client.put('http://verbs.test/p')).body, 'put');
+  assert.strictEqual((await client.patch('http://verbs.test/p')).body, 'patch');
+  assert.strictEqual((await client.delete('http://verbs.test/p')).body, 'delete');
+  assert.strictEqual((await client('http://verbs.test/p', {method: 'HEAD'})).statusCode, 200);
+  assert.strictEqual((await client('http://verbs.test/p', {method: 'OPTIONS'})).body, 'options');
+  assert.strictEqual((await client.query('http://verbs.test/p')).body, 'query');
+});
+
+/* ----------------------------------------------------------------------- matcher branches */
+
+// An object body matcher against a body that parsed to something else entirely.
+test('an object body matcher does not match a non-object body', async () => {
+  nock('http://bodyshape.test').post('/p', {a: 1}).reply(200, 'matched');
+
+  const error = await failure(client.post('http://bodyshape.test/p', {json: [1, 2, 3]}));
+
+  assertUnmatched(error, 'an array body must not satisfy an object matcher');
+});
+
+// A base path constrains the path: anything outside it is simply not this scope's.
+test('a base path does not match a request outside it', async () => {
+  nock('http://based.test/base').get('/inside').reply(200, 'in');
+
+  assert.strictEqual((await client.get('http://based.test/base/inside')).body, 'in');
+
+  nock('http://based.test/base').get('/inside').reply(200, 'in');
+
+  assertUnmatched(
+    await failure(client.get('http://based.test/elsewhere/inside')),
+    'a path outside the base path must not match',
+  );
+});
+
+// A literal query on the path with no `.query()` chained after it.
+test('a literal query on the path is matched on its own', async () => {
+  nock('http://literal.test').get('/p?a=1').reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://literal.test/p?a=1')).body, 'matched');
+
+  nock('http://literal.test').get('/p?a=1').reply(200, 'matched');
+
+  assertUnmatched(await failure(client.get('http://literal.test/p?a=2')), 'a different query must not match');
+});
+
+// Three occurrences of one key: the second appends to the array the first two produced.
+test('a query key repeated three times is collected as one array', async () => {
+  nock('http://thrice-query.test')
+    .get('/p')
+    .query({a: ['1', '2', '3']})
+    .reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://thrice-query.test/p?a=1&a=2&a=3')).body, 'matched');
+});
+
+/* --------------------------------------------------------------------------- entry points */
+
+test('a URL instance is accepted as an origin', async () => {
+  nock(new URL('http://urlobject.test/base')).get('/p').reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://urlobject.test/base/p')).body, 'matched');
+});
+
+test('enableNetConnect with no argument allows everything again', () => {
+  // Re-disabled immediately: the rest of the suite depends on net connect being off, and the
+  // assertion here is only that neither overload throws.
+  assert.doesNotThrow(() => nock.enableNetConnect());
+  assert.doesNotThrow(() => nock.enableNetConnect('allowed.test'));
+
+  nock.disableNetConnect();
+});
+
+/*
+ * A literal query on the path *and* a chained `.query()`. An object query is folded into
+ * undici's stored path, so the two are merged there; a predicate cannot be, and the literal's
+ * own values are compared one by one in the shim instead. Both forms are checked, since only
+ * the second reaches that comparison.
+ */
+test('a literal path query and a chained object query are both applied', async () => {
+  nock('http://folded.test').get('/p?a=1').query({b: '2'}).reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://folded.test/p?a=1&b=2')).body, 'matched');
+
+  nock('http://folded.test').get('/p?a=1').query({b: '2'}).reply(200, 'matched');
+
+  assertUnmatched(
+    await failure(client.get('http://folded.test/p?a=9&b=2')),
+    'the path’s own literal query must still have to match',
+  );
+});
+
+test('a literal path query is still applied alongside a query predicate', async () => {
+  const predicate = (query: Record<string, string | string[]>) => query['b'] === '2';
+
+  nock('http://foldedfn.test').get('/p?a=1').query(predicate).reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://foldedfn.test/p?a=1&b=2')).body, 'matched');
+
+  nock('http://foldedfn.test').get('/p?a=1').query(predicate).reply(200, 'matched');
+
+  assertUnmatched(
+    await failure(client.get('http://foldedfn.test/p?a=9&b=2')),
+    'the predicate passing must not excuse the path’s own literal query',
+  );
+});
+
+// `Object.fromEntries` would keep only the last; three occurrences exercise the append that
+// two do not, since the second is what creates the array.
+test('a URLSearchParams query keeps a key repeated three times', async () => {
+  nock('http://triple.test').get('/p').query(new URLSearchParams('a=1&a=2&a=3')).reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://triple.test/p?a=1&a=2&a=3')).body, 'matched');
+});
+
+// A base path with a query-ignoring matcher over it: the matcher is a function here, so the
+// base path is checked in the shim rather than folded into undici's stored path.
+test('a base path with query(true) still rejects a path outside it', async () => {
+  nock('http://basedq.test/base').get('/inside').query(true).reply(200, 'in');
+
+  assert.strictEqual((await client.get('http://basedq.test/base/inside?anything=1')).body, 'in');
+
+  nock('http://basedq.test/base').get('/inside').query(true).reply(200, 'in');
+
+  assertUnmatched(
+    await failure(client.get('http://basedq.test/outside/inside?anything=1')),
+    'a path outside the base path must not match even with query(true)',
+  );
+});
+
+// nock takes node's legacy `Url` object as well as a string or a `URL`.
+test('a legacy Url object is accepted as an origin', async () => {
+  // `url.parse` is deprecated, which is precisely why this is worth a test: nock's signature
+  // accepts the legacy `Url` object and consumers still pass one.
+  // oxlint-disable-next-line typescript/no-deprecated
+  nock(parseUrl('http://legacyurl.test/base')).get('/p').reply(200, 'matched');
+
+  assert.strictEqual((await client.get('http://legacyurl.test/base/p')).body, 'matched');
+});
+
+test('abortPendingRequests drops every registered interceptor', async () => {
+  nock('http://aborted.test').get('/p').reply(200, 'never');
+
+  nock.abortPendingRequests();
+
+  assertUnmatched(
+    await failure(client.get('http://aborted.test/p')),
+    'abortPendingRequests must leave nothing registered',
+  );
+});
+
+/*
+ * `abortPendingRequests` used to be `cleanAll()` alone, which removes interceptors nothing has
+ * matched yet but does nothing for a request that already matched one and is only waiting on
+ * its `.delay()` - that request went on to complete normally. Real nock's own
+ * `abortPendingRequests` (`common.removeAllTimers`) does not deliver an abort error either: it
+ * just makes sure the timer holding the reply back never fires, leaving the request hanging.
+ * This asserts the same "never settles" outcome, which is what `awaitDelay`'s own timer being
+ * cancelled produces here.
+ */
+test('abortPendingRequests aborts a request already waiting on delay()', async () => {
+  nock('http://aborted.test').get('/slow').delay(150).reply(200, 'late');
+
+  let settled = false;
+
+  client.get('http://aborted.test/slow').then(
+    () => (settled = true),
+    () => (settled = true),
+  );
+
+  // Give the request time to reach the mock, match the interceptor and start waiting on the
+  // delay - well before the delay itself would fire.
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  nock.abortPendingRequests();
+
+  // Comfortably past the original 150ms delay, so a request that had not in fact been aborted
+  // would have settled by now.
+  await new Promise((resolve) => setTimeout(resolve, 250));
+
+  assert.strictEqual(settled, false, 'a request aborted mid-delay must never settle');
+});
+
+test('reply(function) is not shown a content-type a string body was never sent with', async () => {
+  nock('http://nock-no-type.test')
+    .post('/')
+    .reply(200, async (request) => ({type: request.headers.get('content-type'), body: await request.text()}));
+
+  const response = await json.post('http://nock-no-type.test/', {body: 'hello'});
+
+  assert.deepStrictEqual(response.body, {type: null, body: 'hello'});
+});

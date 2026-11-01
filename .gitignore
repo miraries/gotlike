@@ -6,3 +6,17 @@ package-lock.json
 yarn.lock
 dist
 node_modules
+.claude/worktrees/
+
+# stray tsc output - declarations belong in dist/
+src/*.d.ts
+
+# profile.ts output - regenerate with `npm run profile` in benchmark/
+benchmark/*.cpuprofile
+
+# conformance/run.ts clones the upstream suites here
+conformance/.upstream/
+conformance/results/
+
+# local-only notes, naming what the public repo must not
+CLAUDE.local.md

@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "./dist",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "noEmit": false,
+    "allowImportingTsExtensions": false
+  },
+  "include": ["src"],
+  /* The parity harness imports `got`, which is a devDependency - it must never reach `dist/`. */
+  "exclude": ["**/*.spec.ts", "src/parity/**"]
+}

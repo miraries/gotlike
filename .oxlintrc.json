@@ -1,0 +1,71 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "typescript",
+    "unicorn",
+    "oxc"
+  ],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "pedantic": "warn"
+  },
+  "env": {
+    "builtin": true,
+    "node": true,
+    "es2024": true
+  },
+  "rules": {
+    "no-inline-comments": "off",
+    "require-unicode-regexp": "off",
+    "max-lines": "off",
+    "max-lines-per-function": "off",
+    "max-classes-per-file": "off",
+    "no-warning-comments": "off",
+    "require-await": "off",
+    "unicorn/no-negated-condition": "off",
+    "unicorn/consistent-function-scoping": "off",
+    "unicorn/prefer-code-point": "off",
+    "unicorn/no-array-callback-reference": "off",
+    "unicorn/no-useless-undefined": "off",
+    "unicorn/no-array-sort": "off",
+    "unicorn/prefer-top-level-await": "off",
+    "no-promise-executor-return": "off",
+    "no-underscore-dangle": "off",
+    "unicorn/escape-case": "off",
+    "unicorn/no-hex-escape": "off",
+    "max-depth": "off",
+    "typescript/no-floating-promises": [
+      "error",
+      {
+        "allowForKnownSafeCalls": [
+          {
+            "from": "package",
+            "package": "node:test",
+            "name": ["test", "describe", "it", "suite", "before", "after", "beforeEach", "afterEach"]
+          }
+        ]
+      }
+    ],
+    "typescript/prefer-readonly-parameter-types": "off",
+    "typescript/no-unsafe-type-assertion": "off",
+    "typescript/no-unsafe-assignment": "off",
+    "typescript/no-unsafe-member-access": "off",
+    "typescript/no-unsafe-call": "off",
+    "typescript/no-unsafe-argument": "off",
+    "typescript/no-unsafe-return": "off",
+    "typescript/strict-boolean-expressions": "off",
+    "typescript/no-unnecessary-type-conversion": "off",
+    "typescript/no-confusing-void-expression": "off",
+    "typescript/strict-void-return": "off",
+    "typescript/prefer-nullish-coalescing": "off",
+    "typescript/prefer-promise-reject-errors": "off",
+    "typescript/no-unnecessary-type-arguments": "off",
+    "typescript/no-unnecessary-type-parameters": "off",
+    "typescript/require-await": "off"
+  },
+  "ignorePatterns": [
+    "**/dist/**",
+    "**/node_modules/**"
+  ]
+}
