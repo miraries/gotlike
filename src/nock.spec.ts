@@ -107,6 +107,14 @@ test('a bare reply() is an empty 200, as in nock', async () => {
   assert.strictEqual(response.body, '');
 });
 
+test("nock.Scope, nock.Interceptor and nock.Options name the shim's types, as in nock", () => {
+  const options: nock.Options = {allowUnmocked: true, badheaders: ['x-a']};
+  const scope: nock.Scope = nock('http://types.test', options);
+  const interceptor: nock.Interceptor = scope.get('/');
+
+  assert.strictEqual(typeof interceptor.reply, 'function');
+});
+
 /**
  * `nock('https://host/base/path')` - the main consumer's mocks do this, and undici's
  * MockAgent only accepts an origin, so the path has to be folded into every interceptor.

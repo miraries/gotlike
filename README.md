@@ -165,7 +165,8 @@ comes from running got's own test suite against gotlike (see `conformance/`), no
 - **Writing through `client.defaults.options`**: it reads the client's options back, but a write is a
   `ValidationError` - use `merge()`. It reports options as they were given (`dnsCache: false` stays
   `false`) where got normalises some. `extend()` takes one options object, not several, and not
-  another client to merge; got's `Options` class and `got.mergeOptions` do not exist.
+  another client to merge; got's `Options` class and `got.mergeOptions` do not exist. `Options` is
+  exported as a type only, naming what a handler or `beforeRequest` hook is handed.
 - **`CacheError`**, and an error's `request` (got's request stream).
 - **On the response**: `ip`, `isFromCache`, `rawHeaders`, and any timing but `timings.phases.total`.
   `statusMessage` is node's standard phrase for the status, not a server's own non-standard one, and

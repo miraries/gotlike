@@ -1810,10 +1810,24 @@ type NockApi = typeof nock & {
   abortPendingRequests(): void;
 };
 
-export default nock as NockApi;
-
 // Also named, so plain CommonJS `require('gotlike/nock').nock` works - a bare
 // `require()` of an ESM module yields the namespace, not the default export.
+// oxlint-disable-next-line no-redeclare
 const nockExport = nock as NockApi;
+
+type ScopeInstance = Scope;
+type InterceptorInstance = Interceptor;
+type ScopeWideOptions = ScopeOptions;
+
+// `nock.Scope` and friends as types, which is how nock's own typings spell them. Types only,
+// so it merges with the const above and erases.
+declare namespace nockExport {
+  export type Scope = ScopeInstance;
+  export type Interceptor = InterceptorInstance;
+  // oxlint-disable-next-line no-shadow
+  export type Options = ScopeWideOptions;
+}
+
+export default nockExport;
 
 export {nockExport as nock, mockAgent, Scope, Interceptor};

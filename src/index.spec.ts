@@ -32,6 +32,7 @@ import client, {
   SchemaValidationError,
   type HttpsOptions,
   type InitHook,
+  type Options,
   type ResponseLike,
   type RequestOptions,
   type Response as GotlikeResponse,
@@ -9536,6 +9537,10 @@ async function typeAssertions() {
   // ...and it survives another extend.
   expectType<unknown>()((await jsonClient.extend({prefixUrl: 'p'}).get('u')).body);
   expectType<string>()((await jsonClient.extend({responseType: 'text'}).get('u')).body);
+
+  // Code annotated with got's `Options` type names what a handler is handed.
+  const annotatedHandler: HandlerFunction = (options: Options, next) => next(options);
+  void annotatedHandler;
 
   // A `Got`-typed field takes any callable client, whatever its `responseType` - the main consumer
   // types its provider clients that way. CLAUDE.md claimed this held and nothing checked it: a

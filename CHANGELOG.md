@@ -4,6 +4,15 @@ All notable changes to this project are documented here. This project adheres to
 [semantic versioning](https://semver.org/spec/v2.0.0.html); while the major version is `0`, a
 minor bump is where breaking changes land.
 
+## Unreleased
+
+### Added
+
+- **An `Options` type**, naming what a handler or `beforeRequest` hook is handed, for code annotated
+  with got's.
+  It is a type only; got's `Options` class still does not exist.
+- **`nock.Scope`, `nock.Interceptor` and `nock.Options` types** on the shim's default export, as in nock.
+
 ## 0.11.0 - 2026-11-01
 
 ### Added

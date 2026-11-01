@@ -7852,3 +7852,5 @@ export const got = defaultClient;
  */
 export type Got<O extends ClientOptions = ClientOptions> = CallableClient<O>;
 export type ExtendOptions = RequestOptions;
+/** What a handler or `beforeRequest` hook is handed. A type, for code annotated with got's `Options`, not got's class. */
+export type Options = FormedOptions;
